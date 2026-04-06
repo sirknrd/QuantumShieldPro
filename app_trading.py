@@ -6,81 +6,83 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # --- 1. CONFIGURACIÓN ---
-st.set_page_config(page_title="Quantum Shield | Selector Pro", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Quantum Shield Pro | Bollinger Edition", page_icon="🛡️", layout="wide")
 
-# --- 2. LÓGICA DE RECOMENDACIÓN (6 Capas) ---
-def obtener_recomendacion(last):
+# --- 2. LÓGICA DE CONFLUENCIA (Modo Institucional) ---
+def calcular_señal_pro(last):
     try:
-        score = 0
-        close, ema200 = float(last['Close']), float(last['EMA_200'])
-        rsi, mfi, adx = float(last['RSI']), float(last['MFI']), float(last['ADX_14'])
+        puntos = 0
+        close = float(last['Close'])
+        ema200 = float(last['EMA_200'])
+        bb_up = float(last['BBU_20_2.0'])
+        bb_low = float(last['BBL_20_2.0'])
         
-        # Confluencia técnica
-        if close > ema200: score += 1
-        else: score -= 1
-        if rsi > 55: score += 1
-        elif rsi < 45: score -= 1
-        if mfi > 55: score += 1
-        elif mfi < 45: score -= 1
-        if adx > 25: score += 1
+        # Test 1: Filtro de Tendencia (EMA 200)
+        if close > ema200: puntos += 1
+        else: puntos -= 1
         
-        m_h_col = [c for c in last.index if 'MACDh' in str(c)][0]
-        if float(last[m_h_col]) > 0: score += 1
-        else: score -= 1
+        # Test 2: Bollinger Rejection (Sobrecompra/Sobreventa)
+        if close > bb_up: puntos -= 1  # Riesgo de caída (muy caro)
+        if close < bb_low: puntos += 1 # Oportunidad de rebote (muy barato)
+        
+        # Test 3: Momentum (RSI)
+        if 50 < float(last['RSI']) < 70: puntos += 1
+        
+        # Test 4: Fuerza (ADX)
+        if float(last['ADX_14']) > 25: puntos += 1
 
-        if score >= 3: return "COMPRA FUERTE 🚀", "#00FFA3", "rgba(0, 255, 163, 0.1)"
-        elif score <= -3: return "VENTA FUERTE 📉", "#FF4B4B", "rgba(255, 75, 75, 0.1)"
+        if puntos >= 2: return "COMPRA CONFIRMADA ✅", "#00FFA3", "rgba(0, 255, 163, 0.1)"
+        elif puntos <= -2: return "VENTA / TOMA GANANCIA ⚠️", "#FF4B4B", "rgba(255, 75, 75, 0.1)"
         else: return "MANTENER / NEUTRAL ⚖️", "#FFA500", "rgba(255, 165, 0, 0.1)"
-    except: return "ESPERANDO DATOS...", "#8B949E", "transparent"
+    except: return "ESPERANDO...", "#8B949E", "transparent"
 
-# --- 3. BARRA LATERAL (TU SELECTOR) ---
-st.sidebar.title("🛡️ Selector de Activos")
-st.sidebar.markdown("---")
+# --- 3. INTERFAZ ---
+st.sidebar.title("🛡️ Quantum Pro")
+ticker_input = st.sidebar.text_input("Activo", value="BTC").upper()
 
-# Buscador manual
-ticker_input = st.sidebar.text_input("Escribe el Símbolo (Ej: NVDA, BTC, SQM-B.SN)", value="AAPL").upper()
+# Limpieza de Símbolo
+if len(ticker_input) <= 4 and "-" not in ticker_input and "." not in ticker_input:
+    ticker = f"{ticker_input}-USD" if ticker_input in ["BTC", "ETH", "SOL"] else ticker_input
+else: ticker = ticker_input
 
-# Sugerencias rápidas (Botones)
-st.sidebar.subheader("Favoritos Rápidos")
-if st.sidebar.button("NVIDIA (IA)"): ticker_input = "NVDA"
-if st.sidebar.button("BITCOIN"): ticker_input = "BTC-USD"
-if st.sidebar.button("APPLE"): ticker_input = "AAPL"
-if st.sidebar.button("BANCO CHILE"): ticker_input = "CHILE.SN"
+df = yf.download(ticker, period="365d", interval="1d", auto_adjust=True)
 
-# Temporalidad
-tf = st.sidebar.selectbox("Temporalidad del Análisis", ["1h", "4h", "1d"], index=2)
-
-# --- 4. MOTOR DE ANÁLISIS ---
-# Limpieza automática de nombres para Cripto
-ticker = f"{ticker_input}-USD" if ticker_input in ["BTC", "ETH", "SOL", "DOT"] else ticker_input
-
-df_raw = yf.download(ticker, period="365d", interval=tf, auto_adjust=True)
-
-if not df_raw.empty:
-    df = df_raw.copy()
+if not df.empty:
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-
-    # Indicadores
+    
+    # INDICADORES DE ALTA CONFIANZA
     df['EMA_200'] = ta.ema(df['Close'], length=200)
     df['RSI'] = ta.rsi(df['Close'], length=14)
-    df['MFI'] = ta.mfi(df['High'], df['Low'], df['Close'], df['Volume'], length=14)
     df['ADX_14'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
-    df = pd.concat([df, ta.macd(df['Close'])], axis=1).fillna(0)
+    
+    # Bandas de Bollinger (20 periodos, 2 desviaciones)
+    bbands = ta.bbands(df['Close'], length=20, std=2)
+    df = pd.concat([df, bbands], axis=1).fillna(0)
     
     last = df.iloc[-1]
-    rec, color, bg = obtener_recomendacion(last)
+    rec, color, bg = calcular_señal_pro(last)
 
-    # --- 5. INTERFAZ ---
-    st.markdown(f"""<div style="background-color: {bg}; border: 2px solid {color}; padding: 20px; border-radius: 15px; text-align: center;">
-        <h3 style="color: white; margin:0;">ACTIVO SELECCIONADO: {ticker}</h3>
-        <h1 style="color: {color}; margin: 10px 0; font-size: 45px;">{rec}</h1>
-    </div>""", unsafe_allow_html=True)
+    # PANEL DE CONTROL
+    st.markdown(f"""
+        <div style="background-color: {bg}; border: 3px solid {color}; padding: 25px; border-radius: 20px; text-align: center;">
+            <h1 style="color: {color}; font-size: 45px; margin: 0;">{rec}</h1>
+            <p style="color: white; font-size: 18px;">Estrategia: EMA 200 + Bollinger + RSI</p>
+        </div>
+    """, unsafe_allow_html=True)
 
-    # Gráfico interactivo
-    fig = go.Figure(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Market"))
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], name="Institucional (EMA 200)", line=dict(color='red', width=2)))
-    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=550)
+    # GRÁFICO PRO
+    fig = go.Figure()
+    # Velas
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Precio"))
+    
+    # Bandas de Bollinger (Sombreadas)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], line=dict(color='rgba(173, 216, 230, 0.4)'), name="Bollinger Sup"))
+    fig.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], fill='tonexty', fillcolor='rgba(173, 216, 230, 0.05)', line=dict(color='rgba(173, 216, 230, 0.4)'), name="Bollinger Inf"))
+    
+    # EMA 200 Mejorada (Roja y Gruesa)
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], line=dict(color='#FF0000', width=3), name="Institucional (EMA 200)"))
+
+    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=650)
     st.plotly_chart(fig, use_container_width=True)
 
-else:
-    st.error(f"No se encontraron datos para '{ticker}'. Verifica el símbolo en Yahoo Finance.")
+else: st.error("Símbolo no encontrado.")
