@@ -74,7 +74,14 @@ if df is not None and not df.empty:
     # --- LÓGICA DE SEÑALES (CONFLUENCIA) ---
     # Compra: Precio > EMA50 Y RSI > 45 Y MACD Histograma > 0
     # Venta: Precio < EMA50 Y RSI < 55 Y MACD Histograma < 0
-    macd_hist = df['MACDh_12_26_9'].iloc[-1]
+    macd_cols = [col for col in df.columns if 'MACDh' in col]
+
+if macd_cols:
+    macd_hist = df[macd_cols[0]].iloc[-1]
+    macd_val = df[[c for c in df.columns if 'MACD_' in col and 's' not in col][0]].iloc[-1]
+else:
+    st.warning("Indicadores MACD en proceso de cálculo...")
+    macd_hist = 0
     
     if precio_actual > ema50_actual and rsi_actual > 45 and macd_hist > 0:
         signal_text = "COMPRA FUERTE"
