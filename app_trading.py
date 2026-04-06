@@ -77,13 +77,14 @@ if df is not None and not df.empty:
     macd_cols = [col for col in df.columns if 'MACDh' in col]
 
     if len(macd_cols) > 0:
-    # Estas líneas TIENEN que tener 4 espacios al inicio
-    macd_hist = df[macd_cols[0]].iloc[-1]
-    st.success(f"MACD detectado: {macd_hist:.2f}")
+        # Estas líneas TIENEN que tener 4 espacios al inicio
+        macd_hist = df[macd_cols[0]].iloc[-1]
+        st.success(f"MACD detectado: {macd_hist:.2f}")
+    
     else:
-    # Esta línea también tiene 4 espacios de sangría
-    macd_hist = 0
-    st.warning("Calculando indicadores técnicos...")
+        # Esta línea también tiene 4 espacios de sangría
+        macd_hist = 0
+        st.warning("Calculando indicadores técnicos...")
     
     if precio_actual > ema50_actual and rsi_actual > 45 and macd_hist > 0:
         signal_text = "COMPRA FUERTE"
