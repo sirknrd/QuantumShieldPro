@@ -1,0 +1,11 @@
+# --- Librerías Base ---
+streamlit==1.32.0
+pandas==2.2.1
+numpy==1.26.4
+
+# --- Análisis Técnico y Finanzas ---
+yfinance==0.2.37
+pandas_ta==0.3.14b0
+
+# --- Visualización de Datos ---
+plotly==5.19.0
