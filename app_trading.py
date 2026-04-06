@@ -3,141 +3,91 @@ import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(
-    page_title="Quantum Shield Pro | Terminal",
-    page_icon="🛡️",
-    layout="wide"
-)
+# --- 1. CONFIGURACIÓN ---
+st.set_page_config(page_title="Quantum Shield Pro | Terminal", page_icon="🛡️", layout="wide")
 
-# Estilo CSS personalizado para mejorar la legibilidad
-st.markdown("""
-    <style>
-    .main { background-color: #0E1117; }
-    .stMetric { background-color: #161B22; padding: 15px; border-radius: 10px; border: 1px solid #262730; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- SIDEBAR (Panel de Control) ---
-st.sidebar.title("🛡️ Configuración")
-ticker = st.sidebar.text_input("Símbolo del Activo", value="BTC-USD").upper()
-temporalidad = st.sidebar.selectbox("Temporalidad", ["1h", "4h", "1d", "1wk"], index=2)
-periodo = st.sidebar.slider("Días de historial", min_value=10, max_value=730, value=180)
-
-# --- FUNCIONES DE DATOS ---
-@st.cache_data(ttl=300) # Caché de 5 minutos
-def descargar_datos(symbol, days, interval):
-    try:
-        fin = datetime.now()
-        inicio = fin - timedelta(days=days)
-        data = yf.download(symbol, start=inicio, end=fin, interval=interval)
-        return data
-    except Exception as e:
-        return None
-
-# --- MOTOR DE INDICADORES ---
-def calcular_indicadores(df):
-    # Tendencia
-    df['EMA_20'] = ta.ema(df['Close'], length=20)
-    df['EMA_50'] = ta.ema(df['Close'], length=50)
+# --- 2. MOTOR DE RECOMENDACIÓN ---
+def obtener_recomendacion(last):
+    score = 0
+    # Usamos comparaciones seguras de un solo valor
+    if float(last['Close']) > float(last['EMA_200']): score += 1
+    else: score -= 1
     
-    # Momentum & Volatilidad
+    if float(last['RSI']) > 55: score += 1
+    elif float(last['RSI']) < 45: score -= 1
+    
+    if float(last['MFI']) > 55: score += 1
+    elif float(last['MFI']) < 45: score -= 1
+    
+    if float(last['ADX_14']) > 25: score += 1
+    
+    m_h_col = [c for c in last.index if 'MACDh' in c][0]
+    if float(last[m_h_col]) > 0: score += 1
+    else: score -= 1
+
+    if score >= 3: return "COMPRA FUERTE 🚀", "#00FFA3", "rgba(0, 255, 163, 0.1)"
+    elif score <= -3: return "VENTA FUERTE 📉", "#FF4B4B", "rgba(255, 75, 75, 0.1)"
+    else: return "MANTENER / NEUTRAL ⚖️", "#FFA500", "rgba(255, 165, 0, 0.1)"
+
+# --- 3. SIDEBAR INTELIGENTE (CRYPTO + STOCKS) ---
+st.sidebar.title("🛡️ Quantum Finder")
+raw_ticker = st.sidebar.text_input("Activo (Ej: BTC, ETH, AAPL, SQM-B.SN)", value="BTC").upper()
+
+# Auto-corrección para Cripto
+if len(raw_ticker) <= 4 and "-" not in raw_ticker and ".SN" not in raw_ticker:
+    ticker = f"{raw_ticker}-USD"
+else:
+    ticker = raw_ticker
+
+tf = st.sidebar.selectbox("Temporalidad", ["1h", "4h", "1d"], index=1)
+
+# --- 4. EJECUCIÓN ---
+df_raw = yf.download(ticker, period="365d", interval=tf)
+
+if not df_raw.empty:
+    df = df_raw.copy()
+    
+    # Limpieza de MultiIndex (Para evitar el ValueError)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # Indicadores
+    df['EMA_200'] = ta.ema(df['Close'], length=200)
     df['RSI'] = ta.rsi(df['Close'], length=14)
-    df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-    
-    # MACD
-    macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
+    df['MFI'] = ta.mfi(df['High'], df['Low'], df['Close'], df['Volume'], length=14)
+    df['ADX_14'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
+    macd = ta.macd(df['Close'])
     df = pd.concat([df, macd], axis=1)
     
-    # Bandas de Bollinger
-    bbands = ta.bbands(df['Close'], length=20, std=2)
-    df = pd.concat([df, bbands], axis=1)
+    # Asegurar que no hay NaNs en la última fila para la lógica
+    df = df.fillna(0)
+    last = df.iloc[-1]
     
-    return df
+    rec, color, bg = obtener_recomendacion(last)
 
-# --- EJECUCIÓN PRINCIPAL ---
-st.title(f"📊 Terminal Quantum Shield Pro: {ticker}")
+    # PANEL VISUAL
+    st.markdown(f"""
+        <div style="background-color: {bg}; border: 2px solid {color}; padding: 25px; border-radius: 15px; text-align: center; margin-bottom: 20px;">
+            <h3 style="color: white; margin: 0;">ACTIVO: {ticker}</h3>
+            <h1 style="color: {color}; margin: 10px 0; font-size: 40px;">{rec}</h1>
+            <p style="color: gray;">Basado en confluencia técnica institucional</p>
+        </div>
+    """, unsafe_allow_html=True)
 
-df = descargar_datos(ticker, periodo, temporalidad)
+    # MÉTRICAS
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Precio", f"${float(last['Close']):,.2f}")
+    c2.metric("RSI", f"{float(last['RSI']):.1f}")
+    c3.metric("MFI (Flujo)", f"{float(last['MFI']):.1f}")
+    c4.metric("ADX (Fuerza)", f"{float(last['ADX_14']):.1f}")
 
-if df is not None and not df.empty:
-    df = calcular_indicadores(df)
-    
-    # Valores actuales para el tablero
-    precio_actual = df['Close'].iloc[-1]
-    rsi_actual = df['RSI'].iloc[-1]
-    ema50_actual = df['EMA_50'].iloc[-1]
-    atr_actual = df['ATR'].iloc[-1]
-    
-    # --- LÓGICA DE SEÑALES (CONFLUENCIA) ---
-    # Compra: Precio > EMA50 Y RSI > 45 Y MACD Histograma > 0
-    # Venta: Precio < EMA50 Y RSI < 55 Y MACD Histograma < 0
-    macd_cols = [col for col in df.columns if 'MACDh' in col]
-
-    if len(macd_cols) > 0:
-        # Estas líneas TIENEN que tener 4 espacios al inicio
-        macd_hist = df[macd_cols[0]].iloc[-1]
-        st.success(f"MACD detectado: {macd_hist:.2f}")
-    
-    else:
-        # Esta línea también tiene 4 espacios de sangría
-        macd_hist = 0
-        st.warning("Calculando indicadores técnicos...")
-    
-    if precio_actual > ema50_actual and rsi_actual > 45 and macd_hist > 0:
-        signal_text = "COMPRA FUERTE"
-        signal_color = "#00FFA3"
-    elif precio_actual < ema50_actual and rsi_actual < 55 and macd_hist < 0:
-        signal_text = "VENTA FUERTE"
-        signal_color = "#FF4B4B"
-    else:
-        signal_text = "NEUTRAL / ESPERAR"
-        signal_color = "#FFA500"
-
-    # --- MÉTRICAS SUPERIORES ---
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Precio Actual", f"${precio_actual:,.2f}")
-    col2.markdown(f"<div class='stMetric'><b>SEÑAL IA:</b><br><span style='color:{signal_color}; font-size:20px;'>{signal_text}</span></div>", unsafe_allow_html=True)
-    col3.metric("RSI (14)", f"{rsi_actual:.2f}")
-    col4.metric("Volatilidad (ATR)", f"{atr_actual:.2f}")
-
-    # --- GESTIÓN DE RIESGO ---
-    st.subheader("🛡️ Plan de Gestión de Riesgo")
-    sl = precio_actual - (atr_actual * 2) if signal_text == "COMPRA FUERTE" else precio_actual + (atr_actual * 2)
-    tp = precio_actual + (atr_actual * 4) if signal_text == "COMPRA FUERTE" else precio_actual - (atr_actual * 4)
-    
-    r_col1, r_col2 = st.columns(2)
-    r_col1.warning(f"**STOP LOSS SUGERIDO:** ${sl:,.2f}")
-    r_col2.success(f"**TAKE PROFIT SUGERIDO:** ${tp:,.2f}")
-
-    # --- GRÁFICO INTERACTIVO ---
-    st.subheader("📈 Análisis Técnico en Vivo")
-    fig = go.Figure()
-
-    # Velas Japonesas
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-        name="Precio", increasing_line_color='#00FFA3', decreasing_line_color='#FF4B4B'
-    ))
-
-    # Medias Móviles y Bandas
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_50'], name="Trend (EMA 50)", line=dict(color='white', width=1.5)))
-    fig.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], name="Bollinger Sup", line=dict(color='rgba(173, 216, 230, 0.2)', dash='dot')))
-    fig.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], name="Bollinger Inf", line=dict(color='rgba(173, 216, 230, 0.2)', dash='dot'), fill='tonexty'))
-
-    fig.update_layout(
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        height=700,
-        margin=dict(l=10, r=10, t=10, b=10)
-    )
+    # GRÁFICO
+    fig = go.Figure(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Market"))
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], name="EMA 200", line=dict(color='red')))
+    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=500)
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- TABLA DE DATOS ---
-    with st.expander("Ver Datos Históricos"):
-        st.dataframe(df.tail(20), use_container_width=True)
-
 else:
-    st.error("No se pudo cargar el activo. Verifica que el símbolo sea correcto (ej: BTC-USD o AAPL).")
+    st.error(f"No se encontraron datos para {ticker}. Revisa el símbolo.")
