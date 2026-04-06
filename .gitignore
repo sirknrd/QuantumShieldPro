@@ -1,0 +1,22 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.env
+
+# --- Streamlit ---
+.streamlit/static
+.streamlit/component_sources
+
+# --- Datos y Logs ---
+*.csv
+*.log
+.DS_Store
+Thumbs.db
+
+# --- IDEs ---
+.vscode/
+.idea/
