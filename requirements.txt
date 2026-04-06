@@ -1,5 +1,5 @@
 pandas
 numpy
 yfinance
-pandas_ta==0.3.14b0
+pandas-ta
 plotly
