@@ -6,90 +6,94 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # --- 1. CONFIGURACIÓN ---
-st.set_page_config(page_title="Quantum Shield Pro | Ultra", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Quantum Shield | Ichimoku Pro", page_icon="🛡️", layout="wide")
 
-# --- 2. MOTOR DE RECOMENDACIÓN (Scoring Pro) ---
-def calcular_señal(last, df_cols):
+# --- 2. MOTOR DE RECOMENDACIÓN ---
+def calcular_señal_maestra(last, df_cols):
     try:
         puntos = 0
         close = float(last['Close'])
-        ema200 = float(last['EMA_200'])
+        # Datos Ichimoku
+        span_a = float(last['ISA_9'])
+        span_b = float(last['ISB_26'])
         
-        # Buscar columnas de Bollinger dinámicamente
-        bbu_col = [c for c in df_cols if 'BBU' in str(c)][0]
-        bbl_col = [c for c in df_cols if 'BBL' in str(c)][0]
+        # Test 1: Proyección Ichimoku (Precio vs Nube)
+        if close > span_a and close > span_b: puntos += 2  # Tendencia alcista clara
+        elif close < span_a and close < span_b: puntos -= 2 # Tendencia bajista clara
         
-        # Regla 1: Tendencia Institucional
-        if close > ema200: puntos += 1
-        else: puntos -= 1
-        
-        # Regla 2: Bandas de Bollinger (Sobrecompra/Sobreventa)
-        if close > float(last[bbu_col]): puntos -= 1 # Muy caro
-        if close < float(last[bbl_col]): puntos += 1 # Muy barato
-        
-        # Regla 3: RSI (Fuerza de precio)
+        # Test 2: RSI
         if 50 < float(last['RSI']) < 70: puntos += 1
         
-        if puntos >= 1: return "COMPRA CONFIRMADA ✅", "#00FFA3", "rgba(0, 255, 163, 0.1)"
-        elif puntos <= -1: return "VENTA / PRECAUCIÓN ⚠️", "#FF4B4B", "rgba(255, 75, 75, 0.1)"
-        else: return "MANTENER / NEUTRAL ⚖️", "#FFA500", "rgba(255, 165, 0, 0.1)"
-    except:
-        return "ANALIZANDO...", "#8B949E", "transparent"
+        if puntos >= 2: return "COMPRA FUERTE", "#00FFA3"
+        elif puntos <= -2: return "VENTA / ALERTA", "#FF4B4B"
+        else: return "NEUTRAL / ESPERAR", "#FFA500"
+    except: return "ANALIZANDO", "#8B949E"
 
 # --- 3. BARRA LATERAL ---
 st.sidebar.title("🛡️ Quantum Pro")
-ticker_input = st.sidebar.text_input("Activo (Ej: BTC, AAPL, SQM-B.SN)", value="BTC").upper()
+ticker_input = st.sidebar.text_input("Activo", value="BTC").upper()
 
-# Limpieza de Símbolo (Crypto + Stocks)
 if len(ticker_input) <= 4 and "-" not in ticker_input and "." not in ticker_input:
-    ticker = f"{ticker_input}-USD" if ticker_input in ["BTC", "ETH", "SOL", "DOT"] else ticker_input
+    ticker = f"{ticker_input}-USD" if ticker_input in ["BTC", "ETH", "SOL"] else ticker_input
 else: ticker = ticker_input
 
-# --- 4. DESCARGA Y CÁLCULOS ---
-df_raw = yf.download(ticker, period="365d", interval="1d", auto_adjust=True)
+# --- 4. DATOS Y CÁLCULOS ---
+df_raw = yf.download(ticker, period="400d", interval="1d", auto_adjust=True)
 
 if not df_raw.empty:
     df = df_raw.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     
-    # Indicadores
+    # Indicadores Clave
     df['EMA_200'] = ta.ema(df['Close'], length=200)
     df['RSI'] = ta.rsi(df['Close'], length=14)
-    df['ADX_14'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
     
     # Bandas de Bollinger
     bb = ta.bbands(df['Close'], length=20, std=2)
-    df = pd.concat([df, bb], axis=1).fillna(0)
+    # Ichimoku (Incluye la proyección futura)
+    ichi = ta.ichimoku(df['High'], df['Low'], df['Close'])[0]
     
-    # Identificar columnas de Bollinger para el gráfico
-    bbu_name = [c for c in df.columns if 'BBU' in str(c)][0]
-    bbl_name = [c for c in df.columns if 'BBL' in str(c)][0]
+    df = pd.concat([df, bb, ichi], axis=1).fillna(method='ffill')
+    
+    # Nombres de columnas dinámicos
+    bbu = [c for c in df.columns if 'BBU' in str(c)][0]
+    bbl = [c for c in df.columns if 'BBL' in str(c)][0]
+    isa = [c for c in df.columns if 'ISA' in str(c)][0]
+    isb = [c for c in df.columns if 'ISB' in str(c)][0]
     
     last = df.iloc[-1]
-    rec, color, bg = calcular_señal(last, df.columns)
+    rec, color = calcular_señal_maestra(last, df.columns)
 
-    # --- 5. INTERFAZ ---
+    # --- 5. INTERFAZ (Texto en Negro) ---
     st.markdown(f"""
-        <div style="background-color: {bg}; border: 3px solid {color}; padding: 20px; border-radius: 15px; text-align: center; margin-bottom: 20px;">
-            <h1 style="color: {color}; margin: 0; font-size: 40px;">{rec}</h1>
-            <p style="color: white; font-size: 16px;">Activo: {ticker} | Estrategia de Alta Confianza</p>
+        <div style="background-color: {color}; border-radius: 15px; padding: 25px; text-align: center; margin-bottom: 25px;">
+            <h1 style="color: #000000; margin: 0; font-weight: 900; font-size: 50px;">{rec}</h1>
+            <p style="color: #000000; margin: 0; font-weight: 600;">PROYECCIÓN TÉCNICA: {ticker}</p>
         </div>
     """, unsafe_allow_html=True)
 
-    # Gráfico Profesional
+    # GRÁFICO CON NUBE ICHIMOKU
     fig = go.Figure()
+    
+    # Nube Ichimoku (Sombreado de proyección futura)
+    fig.add_trace(go.Scatter(x=df.index, y=df[isa], line=dict(color='rgba(0, 255, 163, 0.2)'), name="Senkou Span A"))
+    fig.add_trace(go.Scatter(x=df.index, y=df[isb], line=dict(color='rgba(255, 75, 75, 0.2)'), fill='tonexty', name="Nube (Kumo)"))
+    
     # Velas
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Precio"))
     
-    # Bandas de Bollinger (Sombreado)
-    fig.add_trace(go.Scatter(x=df.index, y=df[bbu_name], line=dict(color='rgba(173, 216, 230, 0.3)'), name="B. Superior"))
-    fig.add_trace(go.Scatter(x=df.index, y=df[bbl_name], fill='tonexty', fillcolor='rgba(173, 216, 230, 0.05)', line=dict(color='rgba(173, 216, 230, 0.3)'), name="B. Inferior"))
+    # EMA 200 (Línea Roja Fuerte)
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], line=dict(color='#FF0000', width=3), name="EMA 200"))
     
-    # EMA 200 (Línea Roja Institucional)
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], line=dict(color='#FF0000', width=3), name="EMA 200 (Muro)"))
+    # Bandas de Bollinger
+    fig.add_trace(go.Scatter(x=df.index, y=df[bbu], line=dict(color='rgba(255,255,255,0.3)', dash='dot'), name="Bollinger Sup"))
+    fig.add_trace(go.Scatter(x=df.index, y=df[bbl], line=dict(color='rgba(255,255,255,0.3)', dash='dot'), name="Bollinger Inf"))
 
-    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=600)
+    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=700,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig, use_container_width=True)
 
-else: st.error("No se encontraron datos para este símbolo.")
+    st.subheader("🔭 Proyección Ichimoku")
+    st.write("Si el precio está **sobre la nube**, la proyección es alcista. Si está **dentro de la nube**, el mercado está en duda (rango).")
+
+else: st.error("Error al obtener datos.")
