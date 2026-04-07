@@ -4,52 +4,45 @@ import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
 
-# --- 1. CONFIGURACIÓN ---
-st.set_page_config(page_title="Quantum Pattern Expert", page_icon="🛡️", layout="wide")
+# --- 1. DICCIONARIO DE CONOCIMIENTO (Interpretación de Patrones) ---
+DICCIONARIO_PATRONES = {
+    "doji": {
+        "titulo": "Doji (Indecisión) ⚖️",
+        "significado": "El precio de apertura y cierre fue casi igual. Indica que ni compradores ni vendedores tienen el control.",
+        "accion": "Espera a la siguiente vela. Si la siguiente rompe arriba, es alcista; si rompe abajo, es bajista."
+    },
+    "hammer": {
+        "titulo": "Martillo (Hammer) 🔨",
+        "significado": "Vela con cuerpo pequeño y mecha larga inferior. Indica que los compradores rechazaron precios bajos.",
+        "accion": "Señal de rebote alcista. Ideal si aparece cerca de la EMA 200 o la Banda Inferior."
+    },
+    "engulfing": {
+        "titulo": "Envolvente (Engulfing) 🌊",
+        "significado": "La vela actual 'se traga' por completo a la anterior.",
+        "accion": "Si es verde, es una señal de compra fuerte. Si es roja, es una señal de venta inmediata."
+    },
+    "morningstar": {
+        "titulo": "Estrella del Amanecer 🌅",
+        "significado": "Patrón de 3 velas que marca el fin de una caída.",
+        "accion": "Alta probabilidad de cambio de tendencia a alcista. Excelente señal de entrada."
+    },
+    "eveningstar": {
+        "titulo": "Estrella del Atardecer 🌇",
+        "significado": "Patrón de 3 velas que marca el fin de una subida.",
+        "accion": "Precaución: El precio está agotado. Considera tomar ganancias o salir."
+    }
+}
 
-# Ocultar elementos de Streamlit para que parezca App Nativa
-st.markdown("""
-    <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    [data-testid="stMetricValue"] { font-size: 1.6rem !important; font-weight: 700; }
-    </style>
-""", unsafe_allow_html=True)
+# --- 2. CONFIGURACIÓN ---
+st.set_page_config(page_title="Quantum Expert Guide", page_icon="🛡️", layout="wide")
 
-# --- 2. MOTOR DE DETECCIÓN DE PATRONES ---
-def detectar_patrones(df):
-    # Usamos pandas_ta para reconocer patrones de velas
-    # Retorna 100 para alcista, -100 para bajista, 0 para nada
+# --- 3. LÓGICA TÉCNICA ---
+def detectar_y_explicar(df):
+    # Detectamos los 5 patrones más confiables
     patrones = df.ta.cdl_pattern(name=["doji", "engulfing", "hammer", "morningstar", "eveningstar"])
     return patrones
 
-# --- 3. LÓGICA DE DECISIÓN MEJORADA ---
-def calcular_señal_expert(last, df_cols, patrones_last):
-    try:
-        puntos = 0
-        close = float(last['Close'])
-        adx = float(last['ADX_14'])
-        ema200 = float(last['EMA_200'])
-        
-        # Filtro de Tendencia/Rango
-        if adx > 25:
-            if close > ema200: puntos += 2
-            else: puntos -= 2
-        
-        # SUMAR PUNTOS POR PATRONES DE VELAS
-        # Buscamos cualquier patrón activo en la última vela
-        for col in patrones_last.index:
-            val = patrones_last[col]
-            if val > 0: puntos += 2  # Patrón Alcista detectado
-            if val < 0: puntos -= 2  # Patrón Bajista detectado
-
-        if puntos >= 2: return "COMPRA CONFIRMADA ✅", "#00FFA3"
-        elif puntos <= -2: return "VENTA / SALIDA ⚠️", "#FF4B4B"
-        return "ESPERAR / NEUTRAL ⚖️", "#FFA500"
-    except: return "ANALIZANDO...", "#8B949E"
-
-# --- 4. INTERFAZ Y DATOS ---
+# --- 4. INTERFAZ ---
 st.sidebar.title("🛡️ Quantum Shield")
 ticker_input = st.sidebar.text_input("Activo", value="BTC").upper()
 tf = st.sidebar.selectbox("Temporalidad", ["1h", "4h", "1d"], index=2)
@@ -61,65 +54,50 @@ df = yf.download(ticker, period="350d", interval=tf, auto_adjust=True)
 if not df.empty:
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     
-    # Cálculo de Indicadores
+    # Indicadores Base
     df['EMA_200'] = ta.ema(df['Close'], length=200)
     df['RSI'] = ta.rsi(df['Close'], length=14)
     df['ADX_14'] = ta.adx(df['High'], df['Low'], df['Close'])['ADX_14']
     
-    # Bandas y Nube
-    df = pd.concat([df, ta.bbands(df['Close']), ta.ichimoku(df['High'], df['Low'], df['Close'])[0]], axis=1).ffill()
+    # Patrones
+    df_patrones = detectar_y_explicar(df)
+    last_p = df_patrones.iloc[-1]
     
-    # Detección de Patrones
-    df_patrones = detectar_patrones(df)
-    
-    last = df.iloc[-1]
-    last_patron = df_patrones.iloc[-1]
-    rec, color = calcular_señal_expert(last, df.columns, last_patron)
+    # Determinación de Señal
+    close = float(df['Close'].iloc[-1])
+    ema = float(df['EMA_200'].iloc[-1])
+    color = "#00FFA3" if close > ema else "#FF4B4B"
+    estado = "COMPRA" if close > ema else "VENTA / PRECAUCIÓN"
 
-    # --- 5. VISUALIZACIÓN ---
+    # --- VISUALIZACIÓN ---
     st.markdown(f"""
-        <div style="background-color: {color}; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 15px;">
-            <h1 style="color: #000000 !important; margin: 0; font-weight: 850; font-size: 35px;">{rec}</h1>
+        <div style="background-color: {color}; border-radius: 10px; padding: 15px; text-align: center; margin-bottom: 10px;">
+            <h1 style="color: #000000 !important; margin: 0; font-size: 30px;">{estado}</h1>
         </div>
     """, unsafe_allow_html=True)
 
-    # Métricas Críticas
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Precio", f"${float(last['Close']):,.2f}")
-    c2.metric("RSI", f"{float(last['RSI']):.1f}")
-    c3.metric("ADX", f"{float(last['ADX_14']):.1f}")
+    # Gráfico
+    fig = go.Figure(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Precio"))
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], line=dict(color='red', width=2), name="EMA 200"))
+    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=400, margin=dict(l=0,r=0,t=0,b=0))
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Lista de Patrones Detectados hoy
-    patrones_activos = [col for col, val in last_patron.items() if val != 0]
-    if patrones_activos:
-        st.info(f"📊 **Patrones Detectados:** {', '.join(patrones_activos).replace('CDL_', '')}")
-
-    # --- 6. GRÁFICO CON ANOTACIONES ---
-    fig = go.Figure()
+    # --- NUEVA SECCIÓN: EXPLICACIÓN DE PATRONES ---
+    st.subheader("📊 Análisis de Velas Actual")
     
-    # Nube Ichimoku
-    isa = [c for c in df.columns if 'ISA' in str(c)][0]
-    isb = [c for c in df.columns if 'ISB' in str(c)][0]
-    fig.add_trace(go.Scatter(x=df.index, y=df[isa], line=dict(color='rgba(0, 255, 163, 0.1)'), name="Cloud"))
-    fig.add_trace(go.Scatter(x=df.index, y=df[isb], line=dict(color='rgba(255, 75, 75, 0.1)'), fill='tonexty'))
+    encontrado = False
+    for col in last_p.index:
+        if last_p[col] != 0:
+            nombre_clave = col.replace("CDL_", "").lower()
+            if nombre_clave in DICCIONARIO_PATRONES:
+                info = DICCIONARIO_PATRONES[nombre_clave]
+                st.success(f"**{info['titulo']}**")
+                st.write(f"**¿Qué significa?** {info['significado']}")
+                st.info(f"**Acción Sugerida:** {info['accion']}")
+                encontrado = True
     
-    # Velas
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Market"))
-    
-    # EMA 200
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], line=dict(color='#FF0000', width=2), name="EMA200"))
-
-    # Marcar donde hubo patrones en el pasado (puntos sobre las velas)
-    for col in df_patrones.columns:
-        hits = df_patrones[df_patrones[col] != 0]
-        if not hits.empty:
-            fig.add_trace(go.Scatter(x=hits.index, y=df.loc[hits.index, 'High'] * 1.02, 
-                                     mode='markers', marker=dict(symbol='diamond', size=8), 
-                                     name=col.replace('CDL_', '')))
-
-    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, height=500, 
-                      margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    if not encontrado:
+        st.write("No se detectan patrones de giro claros en la vela actual. Sigue la tendencia de la EMA 200.")
 
 else:
-    st.error("Activo no encontrado")
+    st.error("Error al cargar datos.")
