@@ -4,136 +4,129 @@ import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
 
-# --- 1. CONFIGURACIÓN VISUAL (MODO DARK PRO) ---
-st.set_page_config(page_title="Quantum Shield | Terminal Completa", layout="wide")
+# --- 1. CONFIGURACIÓN DE INTERFAZ ELITE ---
+st.set_page_config(page_title="Quantum Shield Ultra", layout="wide")
 
 st.markdown("""
     <style>
     .main { background-color: #050505; }
-    [data-testid="stTable"] { background-color: #111111; border-radius: 10px; color: #FFFFFF !important; }
-    td { color: #FFFFFF !important; font-size: 1rem; }
-    th { color: #8b949e !important; }
-    .stMetric { background-color: #111111; border: 1px solid #222222; padding: 15px; border-radius: 12px; }
+    [data-testid="stTable"] { background-color: #0c0c0c; border: 1px solid #222; color: #FFF !important; }
+    td { color: #FFFFFF !important; font-size: 0.95rem; border-bottom: 1px solid #222 !important; }
+    th { background-color: #111 !important; color: #8b949e !important; text-transform: uppercase; font-size: 0.8rem; }
+    .stMetric { background-color: #111; border: 1px solid #333; padding: 15px; border-radius: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. DICCIONARIO DE PATRONES (RECUPERADO) ---
-INFO_PATRONES = {
-    "doji": "⚖️ Doji: Indecisión total. El mercado no sabe hacia dónde ir. Espera confirmación.",
-    "hammer": "🔨 Martillo: Rechazo de precios bajos. Posible rebote alcista inminente.",
-    "engulfing": "🌊 Envolvente: Cambio de fuerza. La tendencia actual ha sido superada.",
-    "morningstar": "🌅 Estrella: Patrón de giro alcista de alta fiabilidad.",
-    "eveningstar": "🌇 Estrella: Patrón de giro bajista. Agotamiento de la subida."
-}
-
-# --- 3. MOTORES DE CÁLCULO ---
-def procesar_datos_completos(ticker_name, t_frame="1d"):
+# --- 2. MOTOR DE ANÁLISIS TÉCNICO AVANZADO ---
+def realizar_escaneo_pro(ticker_name):
     try:
-        d = yf.download(ticker_name, period="300d", interval=t_frame, progress=False, auto_adjust=True)
-        if d.empty: return None
-        if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
-        
-        df = d.copy()
-        # Indicadores
-        df['EMA_200'] = ta.ema(df['Close'], length=200)
-        df['EMA_50'] = ta.ema(df['Close'], length=50)
+        df = yf.download(ticker_name, period="2y", interval="1d", progress=False, auto_adjust=True)
+        if df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+
+        # Medias Móviles (Igual al reporte que enviaste)
+        for n in [5, 10, 20, 50, 100, 200]:
+            df[f'SMA_{n}'] = ta.sma(df['Close'], length=n)
+            df[f'EMA_{n}'] = ta.ema(df['Close'], length=n)
+
+        # Indicadores Osciladores
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['ADX'] = ta.adx(df['High'], df['Low'], df['Close'])['ADX_14']
-        
-        # Pivotes y Volumen
+        macd = ta.macd(df['Close'])
+        df = pd.concat([df, macd], axis=1)
+
+        # Puntos Pivote Clásicos
         h, l, c = df['High'].shift(1), df['Low'].shift(1), df['Close'].shift(1)
         df['PP'] = (h + l + c) / 3
         df['R1'] = (2 * df['PP']) - l
         df['S1'] = (2 * df['PP']) - h
-        df['Vol_Avg'] = ta.sma(df['Volume'], length=20)
-        
-        # Patrones de Velas
-        df_pat = ta.cdl_pattern(df['Open'], df['High'], df['Low'], df['Close'], name=["doji", "hammer", "engulfing", "morningstar", "eveningstar"])
-        
-        return pd.concat([df, df_pat], axis=1).ffill()
+        df['R2'] = df['PP'] + (h - l)
+        df['S2'] = df['PP'] - (h - l)
+
+        return df.ffill()
     except: return None
 
-# --- 4. INTERFAZ LATERAL ---
-st.sidebar.title("🛡️ Quantum Shield Pro")
-ticker_main = st.sidebar.text_input("Activo a Graficar", value="BTC-USD").upper()
-intervalo = st.sidebar.selectbox("Frecuencia", ["1h", "4h", "1d"], index=2)
-radar_input = st.sidebar.text_area("Radar (Separar por Comas)", value="ETH-USD, SOL-USD, NVDA, SQM-B.SN, CHILE.SN, AAPL")
-watch_list = [x.strip().upper() for x in radar_input.split(",")]
+# --- 3. LOGICA DE DECISIÓN (RESUMEN TÉCNICO) ---
+def obtener_resumen(last):
+    buy, sell = 0, 0
+    # Medias Móviles
+    for n in [5, 10, 20, 50, 100, 200]:
+        if last['Close'] > last[f'SMA_{n}']: buy += 1
+        else: sell += 1
+    # Osciladores
+    if last['RSI'] < 30: buy += 1
+    elif last['RSI'] > 70: sell += 1
+    if last['ADX'] > 25 and last['Close'] > last['SMA_50']: buy += 1
+    
+    if sell >= 10: return "VENTA FUERTE 🔴", "#FF4B4B"
+    if sell > buy: return "VENTA 🟠", "#FF8C00"
+    if buy >= 10: return "COMPRA FUERTE 🟢", "#00FF88"
+    if buy > sell: return "COMPRA 🔵", "#00BFFF"
+    return "NEUTRAL ⚪", "#888888"
 
-# --- 5. PANEL DE ANÁLISIS PRINCIPAL ---
-df = procesar_datos_completos(ticker_main, intervalo)
+# --- 4. INTERFAZ ---
+st.sidebar.title("🛡️ Quantum Ultra v5")
+ticker_input = st.sidebar.text_input("Activo", value="CHILE.SN").upper()
+watch_list_input = st.sidebar.text_area("Radar", value="CHILE.SN, SQM-B.SN, COPEC.SN, AAPL, BTC-USD")
+watch_list = [x.strip() for x in watch_list_input.split(",")]
+
+df = realizar_escaneo_pro(ticker_input)
 
 if df is not None:
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    # Determinar Etiqueta
-    score = 0
-    if last['Close'] > last['EMA_200']: score += 50
-    if 40 < last['RSI'] < 65: score += 50
-    label = "COMPRAR ✅" if score >= 70 else "MANTENER ⚖️" if score >= 45 else "VENDER ⚠️"
-    color_main = "#00FF88" if "COMPRAR" in label else "#FFC107" if "MANTENER" in label else "#FF4B4B"
+    resumen, color_res = obtener_resumen(last)
 
-    # Cartel Principal
+    # BANNER DE DECISIÓN (IGUAL A INVESTING)
     st.markdown(f"""
-        <div style="background-color: {color_main}; padding: 25px; border-radius: 15px; text-align: center; margin-bottom: 15px;">
-            <h1 style="color: #000 !important; margin: 0; font-size: 3.5rem; font-weight: 900;">{label}</h1>
-            <p style="color: #000; margin: 0; font-weight: 700;">{ticker_main} | SCORE: {score}%</p>
+        <div style="background-color: {color_res}; padding: 20px; border-radius: 12px; text-align: center; margin-bottom: 20px;">
+            <p style="color: #000; margin: 0; font-weight: 800; opacity: 0.7;">RESUMEN TÉCNICO DIARIO</p>
+            <h1 style="color: #000 !important; margin: 0; font-size: 3rem; font-weight: 900;">{resumen}</h1>
         </div>
     """, unsafe_allow_html=True)
 
-    # Métricas
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Precio", f"${last['Close']:,.2f}", f"{(last['Close']/prev['Close']-1)*100:.2f}%")
-    c2.metric("RSI", f"{last['RSI']:.1f}")
-    c3.metric("Fuerza ADX", f"{last['ADX']:.0f}")
-    c4.metric("Vol. Rel.", f"{last['Volume']/last['Vol_Avg']:.1f}x")
+    # MÉTRICAS CLAVE
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Precio Actual", f"${last['Close']:,.2f}")
+    m2.metric("RSI (14)", f"{last['RSI']:.2f}")
+    m3.metric("ADX (Tendencia)", f"{last['ADX']:.2f}")
+    m4.metric("Punto Pivote", f"${last['PP']:.2f}")
 
-    # Gráfico con Pivotes
-    fig = go.Figure(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close']))
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], line=dict(color='red', width=2), name="EMA 200"))
-    fig.add_hline(y=last['R1'], line_dash="dot", line_color="#555", annotation_text="Resistencia")
-    fig.add_hline(y=last['S1'], line_dash="dot", line_color="#555", annotation_text="Soporte")
+    # GRÁFICO
+    fig = go.Figure(go.Candlestick(x=df.index[-100:], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close']))
+    fig.add_trace(go.Scatter(x=df.index[-100:], y=df['SMA_50'][-100:], line=dict(color='#00FF88'), name="SMA 50"))
+    fig.add_trace(go.Scatter(x=df.index[-100:], y=df['SMA_200'][-100:], line=dict(color='#FF4B4B'), name="SMA 200"))
     fig.update_layout(template="plotly_dark", height=500, xaxis_rangeslider_visible=False, margin=dict(l=0,r=0,t=0,b=0))
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- EXPLICACIÓN DE PATRONES DETECTADOS ---
-    cols_pat = [c for c in df.columns if "CDL_" in c]
-    patrones_hoy = [c for c in cols_pat if last[c] != 0]
-    if patrones_hoy:
-        st.subheader("🔍 Patrones de Velas Detectados")
-        for p in patrones_hoy:
-            key = p.replace("CDL_", "").lower()
-            if key in INFO_PATRONES: st.info(INFO_PATRONES[key])
+    # TABLAS DE DETALLE (Pivotes y Medias)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("📍 Puntos Pivote (Clásico)")
+        pivots = {
+            "Nivel": ["S2", "S1", "Punto Pivote", "R1", "R2"],
+            "Precio": [f"{last['S2']:.2f}", f"{last['S1']:.2f}", f"{last['PP']:.2f}", f"{last['R1']:.2f}", f"{last['R2']:.2f}"]
+        }
+        st.table(pd.DataFrame(pivots))
 
-# --- 6. RADAR DE OPORTUNIDADES CON TEXTO BLANCO ---
+    with col2:
+        st.subheader("📈 Medias Móviles")
+        medias = {
+            "Periodo": ["MA5", "MA20", "MA50", "MA200"],
+            "Simple (SMA)": [f"{last['SMA_5']:.2f}", f"{last['SMA_20']:.2f}", f"{last['SMA_50']:.2f}", f"{last['SMA_200']:.2f}"],
+            "Exponencial (EMA)": [f"{last['EMA_5']:.2f}", f"{last['EMA_20']:.2f}", f"{last['EMA_50']:.2f}", f"{last['EMA_200']:.2f}"]
+        }
+        st.table(pd.DataFrame(medias))
+
+# RADAR DE OPORTUNIDADES
 st.write("---")
-st.subheader("🚀 Radar de Oportunidades 🔥")
+st.subheader("🚀 Radar Multimercado (Letras Blancas)")
+results = []
+for t in watch_list:
+    d_r = realizar_escaneo_pro(t)
+    if d_r is not None:
+        l_r = d_r.iloc[-1]
+        res, col = obtener_resumen(l_r)
+        results.append({"Activo": t, "Precio": f"${l_r['Close']:,.2f}", "Sugerencia": res, "RSI": f"{l_r['RSI']:.1f}"})
 
-with st.spinner("Escaneando mercado..."):
-    results = []
-    for t in watch_list:
-        d_r = procesar_datos_completos(t, "1d")
-        if d_r is not None:
-            l_r = d_r.iloc[-1]
-            fuego = l_r['Volume'] > (l_r['Vol_Avg'] * 1.5)
-            s_r = 50 if l_r['Close'] > l_r['EMA_200'] else 0
-            s_r += 50 if 40 < l_r['RSI'] < 65 else 0
-            
-            results.append({
-                "Activo": f"{t} 🔥" if fuego else t,
-                "Puntaje": f"{s_r}%",
-                "Sugerencia": "COMPRA" if s_r >= 70 else "MANTENER" if s_r >= 50 else "VENTA",
-                "Stop Loss": f"${d_r['Low'].iloc[-3:].min():,.2f}"
-            })
-    
-    reporte_df = pd.DataFrame(results)
-
-def style_white_table(df):
-    styled = df.style.set_properties(**{'color': 'white'})
-    def color_stat(val):
-        color = '#00FF88' if val == "COMPRA" else '#FF4B4B' if val == "VENTA" else '#FFC107'
-        return f'color: {color}; font-weight: bold'
-    return styled.map(color_stat, subset=['Sugerencia'])
-
-st.table(style_white_table(reporte_df))
+res_df = pd.DataFrame(results)
+st.table(res_df.style.set_properties(**{'color': 'white'}).map(lambda x: f"color: {color_res}; font-weight: bold" if "COMPRA" in str(x) else "", subset=['Sugerencia']))
