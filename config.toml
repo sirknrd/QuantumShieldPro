@@ -1,25 +1,14 @@
 [theme]
-# El color principal para botones, sliders y resaltados (Verde Esmeralda)
-primaryColor = "#00FFA3"
-
-# Color de fondo de la aplicación (Gris casi negro)
-backgroundColor = "#0E1117"
-
-# Color de fondo de la barra lateral (Sidebar)
-secondaryBackgroundColor = "#161B22"
-
-# Color del texto principal (Blanco puro para legibilidad)
-textColor = "#FFFFFF"
-
-# Fuente del sistema para un aspecto técnico
+primaryColor = "#2F81F7"
+backgroundColor = "#0B0F14"
+secondaryBackgroundColor = "#0F1722"
+textColor = "#E6EDF3"
 font = "sans serif"
 
 [server]
-# Configuración para despliegue en la nube (GitHub/Streamlit Cloud)
 headless = true
 enableCORS = false
-enableXsrfProtection = false
+enableXsrfProtection = true
 
 [browser]
-# Ocultar el menú lateral de opciones de Streamlit por defecto
 gatherUsageStats = false
