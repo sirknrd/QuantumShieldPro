@@ -245,7 +245,8 @@ def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame]:
 
     adx = last.get("ADX14")
     adx_v = float(adx) if adx is not None and not pd.isna(adx) else 0.0
-    trending = adx_v >= 20.0
+    # ADX regime: >=25 is a more conservative "trend" threshold
+    trending = adx_v >= 25.0
 
     trend_s, trend_d = _signal_trend(last)
     mom_s, mom_d = _signal_momentum(last)
@@ -302,6 +303,18 @@ def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame]:
     details = pd.DataFrame(detail_rows).sort_values("Indicador")
 
     return rec, expl, details, trending, adx_v
+
+
+def regime_label(adx_v: float) -> str:
+    if not adx_v:
+        return "—"
+    if adx_v >= 35:
+        return "Tendencia fuerte"
+    if adx_v >= 25:
+        return "Tendencia"
+    if adx_v >= 15:
+        return "Mixto"
+    return "Rango"
 
 
 def format_price(x: float) -> str:
@@ -461,7 +474,7 @@ def main() -> None:
         st.caption("Momentum")
     with k3:
         st.metric("ADX (14)", f"{adx_v:.1f}" if adx_v else "—")
-        st.caption("Régimen: Tendencia" if trending else "Régimen: Rango/mixto")
+        st.caption(f"Régimen: {regime_label(adx_v)}")
     with k4:
         atr = last.get("ATR14")
         atrp = float(atr) / float(last["Close"]) * 100.0 if atr is not None and not pd.isna(atr) and float(last["Close"]) != 0 else np.nan
@@ -564,7 +577,7 @@ def main() -> None:
                         "Score": f"{r.score:+.0f}",
                         "Confianza": f"{r.confidence}%",
                         "ADX": f"{ax:.1f}" if ax else "—",
-                        "Régimen": "Tendencia" if tr else "Rango/mixto",
+                        "Régimen": regime_label(ax),
                         "RelVol": f"{float(l0.get('REL_VOL', np.nan)):.2f}x" if not pd.isna(l0.get("REL_VOL")) else "—",
                     }
                 )
