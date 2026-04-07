@@ -372,12 +372,24 @@ def main() -> None:
     st.markdown(
         """
 <style>
-  .qsp-header {display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px;
-              border:1px solid rgba(139,148,158,0.20); border-radius:12px; background: rgba(15,23,34,0.55);}
-  .qsp-title {font-size:18px; font-weight:700; letter-spacing:0.2px;}
-  .qsp-sub {font-size:12px; color: rgba(230,237,243,0.75);}
-  .qsp-pill {padding:6px 10px; border-radius:999px; font-weight:700; font-size:12px; border:1px solid rgba(139,148,158,0.25);}
-  .qsp-kpi {border:1px solid rgba(139,148,158,0.18); border-radius:12px; padding:12px; background: rgba(15,23,34,0.35);}
+  /* Reduce chances of overlap: avoid structural HTML wrappers around Streamlit widgets. */
+  [data-testid="stAppViewContainer"] { overflow-x: hidden; }
+  .qsp-title {font-size:18px; font-weight:700; letter-spacing:0.2px; margin: 0;}
+  .qsp-sub {font-size:12px; color: rgba(230,237,243,0.75); margin: 0;}
+  .qsp-pill {padding:6px 10px; border-radius:999px; font-weight:700; font-size:12px; border:1px solid rgba(139,148,158,0.25); display:inline-block;}
+
+  /* KPI cards (Streamlit-native components) */
+  div[data-testid="stMetric"] {
+    background: rgba(15,23,34,0.35);
+    border: 1px solid rgba(139,148,158,0.18);
+    border-radius: 12px;
+    padding: 12px 12px 10px 12px;
+  }
+  div[data-testid="stMetric"] > label { margin-bottom: 4px; }
+
+  /* Compact spacing so rows don't collide on small widths */
+  div[data-testid="stVerticalBlock"] { gap: 0.75rem; }
+  .block-container { padding-top: 1.0rem; }
 </style>
         """,
         unsafe_allow_html=True,
@@ -409,19 +421,14 @@ def main() -> None:
         )
         radar_items = [x.strip().upper() for x in radar_raw.split(",") if x.strip()]
 
-    # Header
+    # Header (Streamlit layout; no raw HTML containers)
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    st.markdown(
-        f"""
-<div class="qsp-header">
-  <div>
-    <div class="qsp-title">{ticker} <span class="qsp-sub">• {APP_TITLE}</span></div>
-    <div class="qsp-sub">Actualizado: {now} • Fuente: Yahoo Finance</div>
-  </div>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
+    hL, hR = st.columns([0.78, 0.22], vertical_alignment="center")
+    with hL:
+        st.markdown(f"<div class='qsp-title'>{ticker} <span class='qsp-sub'>• {APP_TITLE}</span></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='qsp-sub'>Actualizado: {now} • Fuente: Yahoo Finance</div>", unsafe_allow_html=True)
+    with hR:
+        st.empty()
 
     df = load_ohlcv(ticker, period=period, interval=interval)
     if df.empty:
@@ -438,35 +445,25 @@ def main() -> None:
     # KPI row (Investing-like)
     k1, k2, k3, k4, k5 = st.columns([1.2, 1, 1, 1, 1.2])
     with k1:
-        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
         st.metric("Último", format_price(float(last["Close"])))
         st.caption(f"Cambio: {chg:.2f}%" if not pd.isna(chg) else "Cambio: —")
-        st.markdown("</div>", unsafe_allow_html=True)
     with k2:
-        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
         st.metric("RSI (14)", f"{float(last.get('RSI14', np.nan)):.1f}" if not pd.isna(last.get("RSI14")) else "—")
         st.caption("Momentum")
-        st.markdown("</div>", unsafe_allow_html=True)
     with k3:
-        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
         st.metric("ADX (14)", f"{adx_v:.1f}" if adx_v else "—")
         st.caption("Régimen: Tendencia" if trending else "Régimen: Rango/mixto")
-        st.markdown("</div>", unsafe_allow_html=True)
     with k4:
         atr = last.get("ATR14")
         atrp = float(atr) / float(last["Close"]) * 100.0 if atr is not None and not pd.isna(atr) and float(last["Close"]) != 0 else np.nan
-        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
         st.metric("ATR% (14)", f"{atrp:.2f}%" if not pd.isna(atrp) else "—")
         st.caption("Volatilidad/Riesgo")
-        st.markdown("</div>", unsafe_allow_html=True)
     with k5:
-        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
         st.markdown(
             f'<span class="qsp-pill" style="color:{rec.color}; border-color:{rec.color};">{rec.label}</span>',
             unsafe_allow_html=True,
         )
         st.caption(f"Score: {rec.score:+.0f}/100 • Confianza: {rec.confidence}%")
-        st.markdown("</div>", unsafe_allow_html=True)
 
     t_overview, t_chart, t_tech, t_radar = st.tabs(["Resumen", "Gráfico", "Técnicos", "Radar"])
 
