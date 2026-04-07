@@ -1,150 +1,556 @@
-import streamlit as st
-import yfinance as yf
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Iterable
+
+import numpy as np
 import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
-from datetime import datetime
+import streamlit as st
+import yfinance as yf
 
-# --- 1. CONFIGURACIÓN DE UI (TERMINAL BLACK ULTRA) ---
-st.set_page_config(page_title="Quantum Shield Ultra v6.2", layout="wide", initial_sidebar_state="collapsed")
 
-st.markdown("""
-    <style>
-    .main { background-color: #000000; }
-    .block-container { padding-top: 1rem; }
-    [data-testid="stMetric"] { background-color: #0a0a0a; border: 1px solid #222; border-radius: 8px; padding: 10px; }
-    [data-testid="stTable"] { background-color: #000000; color: #ffffff !important; }
-    table { border: 1px solid #333 !important; color: #ffffff !important; width: 100%; }
-    thead tr th { background-color: #111 !important; color: #8b949e !important; text-align: left; }
-    td { color: #ffffff !important; border-bottom: 1px solid #222 !important; padding: 8px !important; }
-    h1, h2, h3, p, span { color: #ffffff !important; font-family: 'Segoe UI', sans-serif; }
-    </style>
-""", unsafe_allow_html=True)
+APP_TITLE = "QuantumShield Pro — Trading Terminal"
 
-# --- 2. MOTOR DE CÁLCULO PROFESIONAL ---
-def obtener_datos_completos(ticker):
-    try:
-        # Descarga de datos extendida para indicadores de largo plazo
-        df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
 
-        # Cálculo Sincronizado de Medias
-        per = [5, 20, 50, 200]
-        for n in per:
-            df[f'SMA{n}'] = ta.sma(df['Close'], length=n)
-            df[f'EMA{n}'] = ta.ema(df['Close'], length=n)
+@dataclass(frozen=True)
+class Recommendation:
+    label: str
+    color: str
+    score: float  # -100..+100
+    confidence: int  # 0..100
 
-        # Indicadores de Fuerza y Momentum
-        df['RSI'] = ta.rsi(df['Close'], length=14)
-        adx_data = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-        df['ADX'] = adx_data.iloc[:, 0]
-        
-        # Puntos Pivote Diarios
-        h, l, c = df['High'].shift(1), df['Low'].shift(1), df['Close'].shift(1)
-        df['PP'] = (h + l + c) / 3
-        df['R1'], df['S1'] = (2 * df['PP']) - l, (2 * df['PP']) - h
-        df['R2'], df['S2'] = df['PP'] + (h - l), df['PP'] - (h - l)
-        
-        # Volumen Relativo
-        df['Vol_Avg'] = ta.sma(df['Volume'], length=20)
-        df['Rel_Vol'] = df['Volume'] / df['Vol_Avg']
-        
-        return df.ffill()
-    except: return None
 
-# --- 3. LÓGICA DE SENTIMIENTO (VOTACIÓN TÉCNICA) ---
-def calcular_sentimiento_pro(last):
-    buy_v, sell_v = 0, 0
-    # Evaluación vs Medias
-    for n in [5, 20, 50, 200]:
-        if last['Close'] > last[f'SMA{n}']: buy_v += 1
-        else: sell_v += 1
-    
-    # Evaluación Osciladores
-    if last['RSI'] > 55: buy_v += 1
-    if last['RSI'] < 45: sell_v += 1
-    
-    if sell_v > buy_v: return "VENTA FUERTE 🔴", "#FF4B4B"
-    if buy_v > sell_v: return "COMPRA FUERTE 🟢", "#00FF88"
-    return "NEUTRAL ⚖️", "#888888"
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-# --- 4. DASHBOARD DE MANDO ---
-st.sidebar.title("🛡️ QUANTUM V6.2")
-ticker_target = st.sidebar.text_input("ACTIVO", value="CHILE.SN").upper()
-lista_radar = st.sidebar.text_area("RADAR", value="CHILE.SN, SQM-B.SN, COPEC.SN, AAPL, BTC-USD")
-radar_items = [x.strip().upper() for x in lista_radar.split(",")]
 
-df_main = obtener_datos_completos(ticker_target)
+def _safe_pct(a: float, b: float) -> float:
+    if b == 0 or (isinstance(b, float) and (math.isnan(b) or math.isinf(b))):
+        return float("nan")
+    return (a / b - 1.0) * 100.0
 
-if df_main is not None:
-    last_row = df_main.iloc[-1]
-    status_msg, status_hex = calcular_sentimiento_pro(last_row)
-    
-    # BANNER DE ESTADO
-    st.markdown(f"""
-        <div style="border-left: 10px solid {status_hex}; background-color: #0a0a0a; padding: 25px; border-radius: 10px; margin-bottom: 20px;">
-            <h1 style="margin:0; font-size: 3rem;">{ticker_target}: {status_msg}</h1>
-            <p style="margin:0; opacity: 0.7; font-weight: bold;">Quantum Terminal | {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
-        </div>
-    """, unsafe_allow_html=True)
 
-    # MÉTRICAS TIPO BLOOMBERG
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("ÚLTIMO PRECIO", f"${last_row['Close']:,.2f}")
-    c2.metric("RSI (14D)", f"{last_row['RSI']:.1f}")
-    c3.metric("ADX (FUERZA)", f"{last_row['ADX']:.1f}")
-    c4.metric("VOL. RELATIVO", f"{last_row['Rel_Vol']:.1f}x")
+@st.cache_data(ttl=60 * 5, show_spinner=False)
+def load_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(
+        ticker,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
+        threads=True,
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-    # GRÁFICO PROFESIONAL
-    fig_pro = go.Figure()
-    fig_pro.add_trace(go.Candlestick(x=df_main.index[-100:], open=df_main['Open'], high=df_main['High'], low=df_main['Low'], close=df_main['Close'], name="Candles"))
-    fig_pro.add_trace(go.Scatter(x=df_main.index[-100:], y=df_main['SMA50'][-100:], line=dict(color='#00BFFF', width=1), name="SMA 50"))
-    fig_pro.add_trace(go.Scatter(x=df_main.index[-100:], y=df_main['SMA200'][-100:], line=dict(color='#FF4B4B', width=2), name="SMA 200"))
-    fig_pro.update_layout(template="plotly_dark", height=550, xaxis_rangeslider_visible=False, margin=dict(l=0,r=0,t=0,b=0), paper_bgcolor='black', plot_bgcolor='black')
-    st.plotly_chart(fig_pro, use_container_width=True)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    # --- TABLAS DE ANÁLISIS ---
-    st.write("---")
-    t_left, t_right = st.columns(2)
-    
-    with t_left:
-        st.subheader("📈 Resumen de Medias")
-        # Generación de tabla blindada contra NameErrors
-        m_data = {
-            "Periodo": ["5 (Corta)", "20 (Media)", "50 (Tendencia)", "200 (Institucional)"],
-            "SMA": [f"{last_row[f'SMA{n}']:,.2f}" for n in [5, 20, 50, 200]],
-            "EMA": [f"{last_row[f'EMA{n}']:,.2f}" for n in [5, 20, 50, 200]]
-        }
-        st.table(pd.DataFrame(m_data))
+    keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+    df = df[keep].copy()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"], how="any")
+    df.index = pd.to_datetime(df.index)
+    return df
 
-    with t_right:
-        st.subheader("📍 Pivotes de Acción")
-        piv_data = {
-            "Nivel": ["R2 (Techo)", "R1 (Resistencia)", "Punto Pivote (PP)", "S1 (Soporte)", "S2 (Suelo)"],
-            "Precio": [f"{last_row['R2']:,.2f}", f"{last_row['R1']:,.2f}", f"{last_row['PP']:,.2f}", f"{last_row['S1']:,.2f}", f"{last_row['S2']:,.2f}"]
-        }
-        st.table(pd.DataFrame(piv_data))
 
-    # RADAR GLOBAL
-    st.write("---")
-    st.subheader("🚀 Radar de Seguimiento")
-    radar_final = []
-    for item in radar_items:
-        d_radar = obtener_datos_completos(item)
-        if d_radar is not None:
-            l_radar = d_radar.iloc[-1]
-            txt_res, _ = calcular_sentimiento_pro(l_radar)
-            fuego_icon = "🔥" if l_radar['Rel_Vol'] > 1.5 else ""
-            radar_final.append({
-                "Activo": f"{item} {fuego_icon}", 
-                "Precio": f"${l_radar['Close']:,.2f}", 
-                "Señal": txt_res,
-                "Stop sugerido": f"${d_radar['Low'].iloc[-3:].min():,.2f}"
-            })
-    
-    if radar_final:
-        st.table(pd.DataFrame(radar_final).style.set_properties(**{'color': 'white'}))
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
 
-else:
-    st.error("No se pudo conectar con el mercado. Verifica el Ticker o la conexión.")
+    close = out["Close"]
+    high = out["High"]
+    low = out["Low"]
+    vol = out["Volume"] if "Volume" in out.columns else pd.Series(index=out.index, dtype="float64")
+
+    for n in (10, 20, 50, 100, 200):
+        out[f"SMA{n}"] = ta.sma(close, length=n)
+        out[f"EMA{n}"] = ta.ema(close, length=n)
+
+    out["RSI14"] = ta.rsi(close, length=14)
+    macd = ta.macd(close, fast=12, slow=26, signal=9)
+    if macd is not None and not macd.empty:
+        out["MACD"] = macd.iloc[:, 0]
+        out["MACD_SIGNAL"] = macd.iloc[:, 1]
+        out["MACD_HIST"] = macd.iloc[:, 2]
+
+    adx = ta.adx(high, low, close, length=14)
+    if adx is not None and not adx.empty:
+        out["ADX14"] = adx.iloc[:, 0]
+        out["DMP14"] = adx.iloc[:, 1]
+        out["DMN14"] = adx.iloc[:, 2]
+
+    bb = ta.bbands(close, length=20, std=2.0)
+    if bb is not None and not bb.empty:
+        out["BBL"] = bb.iloc[:, 0]
+        out["BBM"] = bb.iloc[:, 1]
+        out["BBU"] = bb.iloc[:, 2]
+        out["BBP"] = bb.iloc[:, 3]
+        out["BBW"] = bb.iloc[:, 4]
+
+    out["ATR14"] = ta.atr(high, low, close, length=14)
+
+    stochrsi = ta.stochrsi(close, length=14, rsi_length=14, k=3, d=3)
+    if stochrsi is not None and not stochrsi.empty:
+        out["STOCHRSI_K"] = stochrsi.iloc[:, 0]
+        out["STOCHRSI_D"] = stochrsi.iloc[:, 1]
+
+    sup = ta.supertrend(high, low, close, length=10, multiplier=3.0)
+    if sup is not None and not sup.empty:
+        # pandas_ta names are like SUPERT_10_3.0, SUPERTd_10_3.0
+        for c in sup.columns:
+            out[c] = sup[c]
+
+    ichi = ta.ichimoku(high, low, close)
+    if isinstance(ichi, tuple) and len(ichi) >= 1:
+        ichi_df = ichi[0]
+        if ichi_df is not None and not ichi_df.empty:
+            for c in ichi_df.columns:
+                out[c] = ichi_df[c]
+
+    out["VOL_SMA20"] = ta.sma(vol, length=20) if not vol.empty else np.nan
+    out["REL_VOL"] = out["Volume"] / out["VOL_SMA20"] if "Volume" in out.columns else np.nan
+
+    return out.ffill()
+
+
+def _signal_trend(last: pd.Series) -> tuple[float, dict[str, float]]:
+    """Return score contribution (-1..+1) and detail signals."""
+    details: dict[str, float] = {}
+
+    def gt(a: str, b: str) -> float:
+        if pd.isna(last.get(a)) or pd.isna(last.get(b)):
+            return 0.0
+        return 1.0 if last[a] > last[b] else -1.0
+
+    def above(a: str, b: str) -> float:
+        if pd.isna(last.get(a)) or pd.isna(last.get(b)):
+            return 0.0
+        return 1.0 if last[a] > last[b] else -1.0
+
+    details["Price vs EMA200"] = above("Close", "EMA200")
+    details["EMA50 vs EMA200"] = gt("EMA50", "EMA200")
+    details["Price vs EMA50"] = above("Close", "EMA50")
+
+    # Supertrend direction column (SUPERTd_10_3.0) is usually 1/-1
+    st_dir = 0.0
+    for k in last.index:
+        if str(k).startswith("SUPERTd_"):
+            v = last.get(k)
+            if pd.isna(v):
+                st_dir = 0.0
+            else:
+                st_dir = 1.0 if float(v) > 0 else -1.0
+            break
+    details["Supertrend"] = st_dir
+
+    # Ichimoku cloud (if available): close above cloud bullish, below bearish
+    ichi_score = 0.0
+    span_a = last.get("ISA_9") if "ISA_9" in last.index else last.get("ICHISA_9")
+    span_b = last.get("ISB_26") if "ISB_26" in last.index else last.get("ICHISB_26")
+    if span_a is not None and span_b is not None and not (pd.isna(span_a) or pd.isna(span_b)):
+        top = max(float(span_a), float(span_b))
+        bot = min(float(span_a), float(span_b))
+        if not pd.isna(last.get("Close")):
+            if float(last["Close"]) > top:
+                ichi_score = 1.0
+            elif float(last["Close"]) < bot:
+                ichi_score = -1.0
+            else:
+                ichi_score = 0.0
+    details["Ichimoku Cloud"] = ichi_score
+
+    vals = np.array(list(details.values()), dtype="float64")
+    if vals.size == 0:
+        return 0.0, details
+    return float(np.nanmean(vals)), details
+
+
+def _signal_momentum(last: pd.Series) -> tuple[float, dict[str, float]]:
+    details: dict[str, float] = {}
+    rsi = last.get("RSI14")
+    if rsi is not None and not pd.isna(rsi):
+        r = float(rsi)
+        # map 30..70 to -1..+1 (oversold->bullish, overbought->bearish)
+        details["RSI14"] = _clamp((r - 50.0) / 20.0, -1.0, 1.0)
+    else:
+        details["RSI14"] = 0.0
+
+    macd_hist = last.get("MACD_HIST")
+    if macd_hist is not None and not pd.isna(macd_hist):
+        details["MACD_HIST"] = float(np.tanh(float(macd_hist) * 5.0))
+    else:
+        details["MACD_HIST"] = 0.0
+
+    k = last.get("STOCHRSI_K")
+    if k is not None and not pd.isna(k):
+        kk = float(k)
+        details["StochRSI"] = _clamp((kk - 50.0) / 25.0, -1.0, 1.0)
+    else:
+        details["StochRSI"] = 0.0
+
+    vals = np.array(list(details.values()), dtype="float64")
+    return float(np.nanmean(vals)), details
+
+
+def _signal_volatility(last: pd.Series) -> tuple[float, dict[str, float]]:
+    details: dict[str, float] = {}
+    atr = last.get("ATR14")
+    close = last.get("Close")
+    atrp = np.nan
+    if atr is not None and close is not None and not (pd.isna(atr) or pd.isna(close)) and float(close) != 0:
+        atrp = float(atr) / float(close) * 100.0
+
+    # lower ATR% -> better risk-adjusted entries, but too low can mean chop; keep neutral band
+    if not pd.isna(atrp):
+        if atrp < 1.0:
+            details["ATR%"] = 0.2
+        elif atrp < 2.5:
+            details["ATR%"] = 0.0
+        else:
+            details["ATR%"] = -0.2
+    else:
+        details["ATR%"] = 0.0
+
+    bbp = last.get("BBP")
+    if bbp is not None and not pd.isna(bbp):
+        # BBP ~0 -> near lower band (potential bounce), ~1 near upper band
+        b = float(bbp)
+        details["BB%"] = _clamp((b - 0.5) * 2.0, -1.0, 1.0)
+    else:
+        details["BB%"] = 0.0
+
+    vals = np.array(list(details.values()), dtype="float64")
+    return float(np.nanmean(vals)), details
+
+
+def _signal_volume(last: pd.Series) -> tuple[float, dict[str, float]]:
+    details: dict[str, float] = {}
+    rv = last.get("REL_VOL")
+    if rv is None or pd.isna(rv):
+        details["RelVol"] = 0.0
+    else:
+        # >1 supports breakout/trend continuation; cap effect
+        details["RelVol"] = _clamp((float(rv) - 1.0) / 1.0, -0.5, 0.8)
+    return float(np.nanmean(list(details.values()))), details
+
+
+def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame]:
+    last = df.iloc[-1]
+
+    adx = last.get("ADX14")
+    adx_v = float(adx) if adx is not None and not pd.isna(adx) else 0.0
+    trending = adx_v >= 20.0
+
+    trend_s, trend_d = _signal_trend(last)
+    mom_s, mom_d = _signal_momentum(last)
+    vol_s, vol_d = _signal_volatility(last)
+    v_s, v_d = _signal_volume(last)
+
+    # Weights depending on regime
+    if trending:
+        w = {"Trend": 0.45, "Momentum": 0.30, "Volatility": 0.10, "Volume": 0.15}
+    else:
+        w = {"Trend": 0.30, "Momentum": 0.35, "Volatility": 0.20, "Volume": 0.15}
+
+    comp = {
+        "Trend": float(trend_s),
+        "Momentum": float(mom_s),
+        "Volatility": float(vol_s),
+        "Volume": float(v_s),
+    }
+    raw = sum(w[k] * comp[k] for k in comp.keys())
+    score = _clamp(raw * 100.0, -100.0, 100.0)
+
+    # Confidence combines regime strength + signal alignment
+    alignment = float(np.mean([abs(trend_s), abs(mom_s), abs(vol_s), abs(v_s)]))
+    regime = _clamp((adx_v - 10.0) / 25.0, 0.0, 1.0)
+    confidence = int(round(_clamp((0.55 * alignment + 0.45 * regime) * 100.0, 0.0, 100.0)))
+
+    if score >= 60:
+        rec = Recommendation("COMPRA FUERTE", "#00D18F", score, confidence)
+    elif score >= 20:
+        rec = Recommendation("COMPRA", "#2F81F7", score, confidence)
+    elif score <= -60:
+        rec = Recommendation("VENTA FUERTE", "#FF4B4B", score, confidence)
+    elif score <= -20:
+        rec = Recommendation("VENTA", "#FFA657", score, confidence)
+    else:
+        rec = Recommendation("NEUTRAL", "#8B949E", score, confidence)
+
+    rows = []
+    for group, weight in w.items():
+        rows.append(
+            {
+                "Grupo": group,
+                "Peso": weight,
+                "Score (-1..+1)": comp[group],
+                "Contribución": weight * comp[group],
+            }
+        )
+    expl = pd.DataFrame(rows)
+
+    # Add indicator-level details as a second table-like block
+    detail_rows = []
+    for name, val in {**trend_d, **mom_d, **vol_d, **v_d}.items():
+        detail_rows.append({"Indicador": name, "Señal (-1..+1)": float(val)})
+    details = pd.DataFrame(detail_rows).sort_values("Indicador")
+
+    return rec, expl, details, trending, adx_v
+
+
+def format_price(x: float) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return "—"
+    if abs(float(x)) >= 1000:
+        return f"{float(x):,.2f}"
+    return f"{float(x):.4f}".rstrip("0").rstrip(".")
+
+
+def build_chart(df: pd.DataFrame, overlays: Iterable[str]) -> go.Figure:
+    view = df.tail(220).copy()
+    x = view.index
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=x,
+            open=view["Open"],
+            high=view["High"],
+            low=view["Low"],
+            close=view["Close"],
+            name="Precio",
+            increasing_line_color="#00D18F",
+            decreasing_line_color="#FF4B4B",
+        )
+    )
+
+    if "Volumen" in overlays and "Volume" in view.columns:
+        fig.add_trace(
+            go.Bar(
+                x=x,
+                y=view["Volume"],
+                name="Volumen",
+                marker_color="rgba(139,148,158,0.35)",
+                yaxis="y2",
+            )
+        )
+
+    if "EMA 50/200" in overlays:
+        for n, col, w in [(50, "#2F81F7", 1), (200, "#FFA657", 2)]:
+            k = f"EMA{n}"
+            if k in view.columns:
+                fig.add_trace(go.Scatter(x=x, y=view[k], name=f"EMA {n}", line=dict(color=col, width=w)))
+
+    if "Bandas Bollinger" in overlays and all(k in view.columns for k in ("BBL", "BBM", "BBU")):
+        fig.add_trace(go.Scatter(x=x, y=view["BBU"], name="BB Upper", line=dict(color="rgba(139,148,158,0.45)", width=1)))
+        fig.add_trace(go.Scatter(x=x, y=view["BBM"], name="BB Mid", line=dict(color="rgba(139,148,158,0.30)", width=1)))
+        fig.add_trace(go.Scatter(x=x, y=view["BBL"], name="BB Lower", line=dict(color="rgba(139,148,158,0.45)", width=1)))
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=620,
+        margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis=dict(title="Precio"),
+        yaxis2=dict(title="Vol", overlaying="y", side="right", showgrid=False, rangemode="tozero"),
+    )
+    return fig
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+    st.markdown(
+        """
+<style>
+  .qsp-header {display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px;
+              border:1px solid rgba(139,148,158,0.20); border-radius:12px; background: rgba(15,23,34,0.55);}
+  .qsp-title {font-size:18px; font-weight:700; letter-spacing:0.2px;}
+  .qsp-sub {font-size:12px; color: rgba(230,237,243,0.75);}
+  .qsp-pill {padding:6px 10px; border-radius:999px; font-weight:700; font-size:12px; border:1px solid rgba(139,148,158,0.25);}
+  .qsp-kpi {border:1px solid rgba(139,148,158,0.18); border-radius:12px; padding:12px; background: rgba(15,23,34,0.35);}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.markdown("### Terminal")
+        ticker = st.text_input("Activo (Ticker)", value="AAPL").strip().upper()
+        colp = st.columns(2)
+        with colp[0]:
+            period = st.selectbox("Periodo", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
+        with colp[1]:
+            interval = st.selectbox("Intervalo", ["1d", "1h", "30m", "15m"], index=0)
+
+        st.markdown("---")
+        st.markdown("### Gráfico")
+        overlays = st.multiselect(
+            "Overlays",
+            ["Volumen", "EMA 50/200", "Bandas Bollinger"],
+            default=["Volumen", "EMA 50/200"],
+        )
+
+        st.markdown("---")
+        st.markdown("### Radar")
+        radar_raw = st.text_area(
+            "Lista (coma)",
+            value="AAPL, MSFT, NVDA, TSLA, BTC-USD",
+            height=90,
+        )
+        radar_items = [x.strip().upper() for x in radar_raw.split(",") if x.strip()]
+
+    # Header
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+    st.markdown(
+        f"""
+<div class="qsp-header">
+  <div>
+    <div class="qsp-title">{ticker} <span class="qsp-sub">• {APP_TITLE}</span></div>
+    <div class="qsp-sub">Actualizado: {now} • Fuente: Yahoo Finance</div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    df = load_ohlcv(ticker, period=period, interval=interval)
+    if df.empty:
+        st.error("No pude descargar datos. Revisa el ticker o tu conexión.")
+        return
+
+    dfi = compute_indicators(df)
+    last = dfi.iloc[-1]
+    prev_close = dfi["Close"].iloc[-2] if len(dfi) >= 2 else float("nan")
+    chg = _safe_pct(float(last["Close"]), float(prev_close)) if not pd.isna(prev_close) else float("nan")
+
+    rec, expl, details, trending, adx_v = recommend(dfi)
+
+    # KPI row (Investing-like)
+    k1, k2, k3, k4, k5 = st.columns([1.2, 1, 1, 1, 1.2])
+    with k1:
+        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
+        st.metric("Último", format_price(float(last["Close"])))
+        st.caption(f"Cambio: {chg:.2f}%" if not pd.isna(chg) else "Cambio: —")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with k2:
+        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
+        st.metric("RSI (14)", f"{float(last.get('RSI14', np.nan)):.1f}" if not pd.isna(last.get("RSI14")) else "—")
+        st.caption("Momentum")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with k3:
+        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
+        st.metric("ADX (14)", f"{adx_v:.1f}" if adx_v else "—")
+        st.caption("Régimen: Tendencia" if trending else "Régimen: Rango/mixto")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with k4:
+        atr = last.get("ATR14")
+        atrp = float(atr) / float(last["Close"]) * 100.0 if atr is not None and not pd.isna(atr) and float(last["Close"]) != 0 else np.nan
+        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
+        st.metric("ATR% (14)", f"{atrp:.2f}%" if not pd.isna(atrp) else "—")
+        st.caption("Volatilidad/Riesgo")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with k5:
+        st.markdown('<div class="qsp-kpi">', unsafe_allow_html=True)
+        st.markdown(
+            f'<span class="qsp-pill" style="color:{rec.color}; border-color:{rec.color};">{rec.label}</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f"Score: {rec.score:+.0f}/100 • Confianza: {rec.confidence}%")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    t_overview, t_chart, t_tech, t_radar = st.tabs(["Resumen", "Gráfico", "Técnicos", "Radar"])
+
+    with t_overview:
+        cL, cR = st.columns([1.05, 0.95])
+        with cL:
+            st.markdown("### Snapshot")
+            snap = {
+                "Open": last.get("Open"),
+                "High": last.get("High"),
+                "Low": last.get("Low"),
+                "Close": last.get("Close"),
+                "Volumen": last.get("Volume"),
+                "RelVol (20)": last.get("REL_VOL"),
+            }
+            snap_df = pd.DataFrame(
+                [{"Campo": k, "Valor": format_price(float(v)) if v is not None and not pd.isna(v) else "—"} for k, v in snap.items()]
+            )
+            st.dataframe(snap_df, use_container_width=True, hide_index=True)
+
+        with cR:
+            st.markdown("### Explicación del score")
+            st.dataframe(
+                expl.assign(
+                    **{
+                        "Peso": (expl["Peso"] * 100).round(0).astype(int).astype(str) + "%",
+                        "Score (-1..+1)": expl["Score (-1..+1)"].round(3),
+                        "Contribución": (expl["Contribución"] * 100).round(1),
+                    }
+                )[["Grupo", "Peso", "Score (-1..+1)", "Contribución"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption("Contribución está en puntos porcentuales del score total (aprox.).")
+
+    with t_chart:
+        st.markdown("### Gráfico")
+        fig = build_chart(dfi, overlays=overlays)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with t_tech:
+        st.markdown("### Señales por indicador")
+        st.dataframe(
+            details.assign(**{"Señal (-1..+1)": details["Señal (-1..+1)"].round(3)}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Interpretación rápida: +1 bullish, -1 bearish, 0 neutral.")
+
+    with t_radar:
+        st.markdown("### Radar multi-activo")
+        if not radar_items:
+            st.info("Agrega tickers en la barra lateral para ver el radar.")
+        else:
+            rows = []
+            for it in radar_items[:30]:
+                d0 = load_ohlcv(it, period=period, interval=interval)
+                if d0.empty:
+                    continue
+                di = compute_indicators(d0)
+                r, _, _, tr, ax = recommend(di)
+                l0 = di.iloc[-1]
+                p = float(l0["Close"])
+                pc = float(di["Close"].iloc[-2]) if len(di) >= 2 else float("nan")
+                ch = _safe_pct(p, pc) if not pd.isna(pc) else float("nan")
+                rows.append(
+                    {
+                        "Activo": it,
+                        "Precio": format_price(p),
+                        "Cambio %": f"{ch:.2f}%" if not pd.isna(ch) else "—",
+                        "Recomendación": r.label,
+                        "Score": f"{r.score:+.0f}",
+                        "Confianza": f"{r.confidence}%",
+                        "ADX": f"{ax:.1f}" if ax else "—",
+                        "Régimen": "Tendencia" if tr else "Rango/mixto",
+                        "RelVol": f"{float(l0.get('REL_VOL', np.nan)):.2f}x" if not pd.isna(l0.get("REL_VOL")) else "—",
+                    }
+                )
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.warning("No se pudieron cargar activos del radar (tickers inválidos o sin datos).")
+
+
+if __name__ == "__main__":
+    main()
+
