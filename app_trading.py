@@ -5,93 +5,105 @@ import pandas_ta as ta
 import plotly.graph_objects as go
 
 # --- 1. CONFIGURACIÓN Y ESTILO ---
-st.set_page_config(page_title="Quantum Shield | Volume Scanner", layout="wide")
+st.set_page_config(page_title="Quantum Shield | Pro Radar", layout="wide")
 
 st.markdown("""
     <style>
     .main { background-color: #050505; }
-    .stMetric { background-color: #111111; border: 1px solid #222222; padding: 15px; border-radius: 12px; }
-    [data-testid="stTable"] { background-color: #111111; border-radius: 10px; font-size: 1.1rem; }
+    /* Forzar texto blanco en tablas y métricas */
+    [data-testid="stTable"] { 
+        background-color: #111111; 
+        border-radius: 10px; 
+        color: #FFFFFF !important; 
+    }
+    th { color: #8b949e !important; }
+    td { color: #FFFFFF !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. MOTOR DE CÁLCULO AVANZADO ---
-def analizar_mercado(ticker_name):
+# --- 2. MOTOR DE CÁLCULO ---
+def analizar_mercado_pro(ticker_name):
     try:
         d = yf.download(ticker_name, period="250d", interval="1d", progress=False, auto_adjust=True)
-        if d.empty: return 0, "N/A", False
+        if d.empty: return 0, "N/A", False, 0
         if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
         
-        # Datos actuales
         close = d['Close'].iloc[-1]
         vol_hoy = d['Volume'].iloc[-1]
         vol_med = d['Volume'].rolling(20).mean().iloc[-1]
         ema200 = ta.ema(d['Close'], length=200).iloc[-1]
-        rsi = ta.rsi(d['Close'], length=14).iloc[-1]
         
-        # Alerta de Fuego (Volumen > 150% del promedio)
-        volumen_explosivo = vol_hoy > (vol_med * 1.5)
+        # Alerta de Fuego (Volumen > 150%)
+        fuego = vol_hoy > (vol_med * 1.5)
         
-        # Scoring
+        # Stop Loss Sugerido (Mínimo de 3 días)
+        stop_loss = d['Low'].iloc[-3:].min()
+        
+        # Score
         s = 0
         if close > ema200: s += 50
-        if 40 < rsi < 65: s += 30
-        if close > d['Close'].iloc[-10]: s += 20
+        if close > d['Close'].iloc[-10]: s += 50
         
-        status = "COMPRA" if s >= 70 else "MANTENER" if s >= 45 else "VENDER"
-        return s, status, volumen_explosivo
+        status = "COMPRA" if s >= 70 else "MANTENER" if s >= 50 else "VENDER"
+        return s, status, fuego, stop_loss
     except:
-        return 0, "Error", False
+        return 0, "Error", False, 0
 
-# --- 3. BARRA LATERAL ---
-st.sidebar.title("🛡️ Quantum Shield")
+# --- 3. INTERFAZ LATERAL ---
+st.sidebar.title("🛡️ Quantum Pro")
 ticker_principal = st.sidebar.text_input("Activo Principal", value="BTC-USD").upper()
-activos_radar = st.sidebar.text_area("Radar Personalizado (Comas)", 
-                                     value="ETH-USD, SOL-USD, NVDA, AAPL, SQM-B.SN, CHILE.SN, COPEC.SN")
+activos_radar = st.sidebar.text_area("Lista Radar (Comas)", 
+                                     value="ETH-USD, SOL-USD, NVDA, AAPL, SQM-B.SN, CHILE.SN")
 watch_list = [x.strip().upper() for x in activos_radar.split(",")]
 
-# --- 4. PANEL PRINCIPAL ---
-data = yf.download(ticker_principal, period="350d", interval="1d", auto_adjust=True)
-
+# --- 4. PANEL DE CONTROL ---
+data = yf.download(ticker_principal, period="300d", interval="1d", auto_adjust=True)
 if not data.empty:
     if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
     df = data.copy()
     df['EMA_200'] = ta.ema(df['Close'], length=200)
     
-    last = df.iloc[-1]
-    color_banner = "#00FF88" if last['Close'] > last['EMA_200'] else "#FF4B4B"
+    label = "ALCISTA" if df['Close'].iloc[-1] > df['EMA_200'].iloc[-1] else "BAJISTA"
+    color_label = "#00FF88" if label == "ALCISTA" else "#FF4B4B"
 
-    st.markdown(f"""
-        <div style="background-color: {color_banner}; padding: 20px; border-radius: 12px; text-align: center; margin-bottom: 20px;">
-            <h1 style="color: #000; margin: 0; font-size: 2.5rem; font-weight: 900;">{ticker_principal}</h1>
-            <p style="color: #000; margin: 0; font-weight: 600;">Analizando Tendencia Diaria</p>
-        </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f"<h1 style='text-align:center; color:{color_label};'>{ticker_principal} | {label}</h1>", unsafe_allow_html=True)
+    
+    fig = go.Figure(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close']))
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], line=dict(color='red', width=2)))
+    fig.update_layout(template="plotly_dark", height=400, xaxis_rangeslider_visible=False, margin=dict(l=0,r=0,t=0,b=0))
+    st.plotly_chart(fig, use_container_width=True)
 
-    fig = go.Figure(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Precio"))
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_200'], line=dict(color='red', width=2), name="EMA 200"))
-    fig.update_layout(template="plotly_dark", height=450, xaxis_rangeslider_visible=False, margin=dict(l=0,r=0,t=0,b=0))
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
-
-# --- 5. SECCIÓN: RADAR CON INDICADOR DE FUEGO 🔥 ---
+# --- 5. TABLA DE OPORTUNIDADES (TEXTO BLANCO) ---
 st.write("---")
 st.subheader("🚀 Radar de Oportunidades 🔥")
 
-with st.spinner("Escaneando volumen e indicadores..."):
+with st.spinner("Analizando..."):
     results = []
     for t in watch_list:
-        score, status, fuego = analizar_mercado(t)
-        nombre_display = f"{t} 🔥" if fuego else t
-        results.append({"Activo": nombre_display, "Puntaje": score, "Sugerencia": status})
+        score, status, fuego, sl = analizar_mercado_pro(t)
+        nombre = f"{t} 🔥" if fuego else t
+        results.append({
+            "Activo": nombre, 
+            "Puntaje": f"{score}%", 
+            "Sugerencia": status,
+            "Stop Loss": f"${sl:,.2f}"
+        })
     
-    reporte_df = pd.DataFrame(results).sort_values(by="Puntaje", ascending=False)
+    reporte_df = pd.DataFrame(results)
 
-# Estilo de tabla
-def style_status(val):
-    color = '#00FF88' if val == "COMPRA" else '#FF4B4B' if val == "VENDER" else '#FFC107'
-    return f'color: {color}; font-weight: bold'
+# Aplicar estilos: Texto blanco general, color solo en 'Sugerencia'
+def style_results(df):
+    # Crear una copia para aplicar estilos
+    styled = df.style.set_properties(**{'color': 'white'})
+    
+    # Aplicar color solo a la columna de Sugerencia
+    def color_status(val):
+        if val == "COMPRA": return 'color: #00FF88; font-weight: bold'
+        if val == "VENDER": return 'color: #FF4B4B; font-weight: bold'
+        return 'color: #FFC107; font-weight: bold'
+    
+    return styled.map(color_status, subset=['Sugerencia'])
 
-# Usamos .map() para compatibilidad con Pandas 2.0+
-st.table(reporte_df.style.map(style_status, subset=['Sugerencia']))
+st.table(style_results(reporte_df))
 
-st.caption("🔥 = Volumen inusual detectado hoy (Instituciones entrando).")
+st.caption("Nota: El Stop Loss se calcula basado en el mínimo técnico de las últimas 72 horas.")
