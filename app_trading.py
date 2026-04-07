@@ -58,6 +58,91 @@ def load_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def load_sp500_tickers() -> list[str]:
+    """
+    Pull S&P 500 tickers from Wikipedia (cached daily).
+    Falls back to a small static list if the fetch fails.
+    """
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        # First table usually contains Symbol + Security
+        t = tables[0]
+        if "Symbol" not in t.columns:
+            raise ValueError("No Symbol column")
+        tickers = (
+            t["Symbol"]
+            .astype(str)
+            .str.replace(".", "-", regex=False)  # BRK.B -> BRK-B (Yahoo format)
+            .str.strip()
+            .tolist()
+        )
+        tickers = [x for x in tickers if x and x.upper() == x.upper()]
+        return sorted(list(dict.fromkeys(tickers)))
+    except Exception:
+        # Minimal fallback (keeps feature working offline-ish)
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM", "XOM", "UNH"]
+
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
+    """
+    Compute "most active" by dollar volume (Close * Volume) on last daily bar.
+    Downloads in one batch for speed.
+    """
+    tickers = load_sp500_tickers()
+    # Limit to avoid huge payloads if Wikipedia table grows or network is slow.
+    tickers = tickers[:505]
+    if not tickers:
+        return pd.DataFrame()
+
+    df = yf.download(
+        " ".join(tickers),
+        period="5d",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
+        threads=True,
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # When multiple tickers, yfinance returns MultiIndex columns: (Field, Ticker)
+    if not isinstance(df.columns, pd.MultiIndex):
+        return pd.DataFrame()
+
+    last = df.tail(2)  # for change %
+    rows = []
+    for t in tickers:
+        try:
+            close = float(last["Close"][t].iloc[-1])
+            prev = float(last["Close"][t].iloc[-2]) if len(last) >= 2 else float("nan")
+            vol = float(last["Volume"][t].iloc[-1]) if "Volume" in last.columns.get_level_values(0) else float("nan")
+            if math.isnan(close) or math.isnan(vol):
+                continue
+            dol = close * vol
+            chg = _safe_pct(close, prev) if not math.isnan(prev) else float("nan")
+            rows.append(
+                {
+                    "Ticker": t,
+                    "Precio": close,
+                    "Cambio %": chg,
+                    "Volumen": vol,
+                    "$ Volumen": dol,
+                }
+            )
+        except Exception:
+            continue
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out = out.sort_values("$ Volumen", ascending=False).head(int(top_n)).reset_index(drop=True)
+    return out
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -537,6 +622,19 @@ def main() -> None:
                 hide_index=True,
             )
             st.caption("Contribución está en puntos porcentuales del score total (aprox.).")
+
+        st.markdown("---")
+        st.markdown("### Más activas del S&P 500 (por $ volumen)")
+        act = load_most_active_sp500(top_n=15)
+        if act.empty:
+            st.warning("No se pudo cargar el ranking de más activas (sin datos o sin conexión).")
+        else:
+            show = act.copy()
+            show["Precio"] = show["Precio"].map(lambda x: format_price(float(x)))
+            show["Cambio %"] = show["Cambio %"].map(lambda x: f"{float(x):.2f}%" if not pd.isna(x) else "—")
+            show["Volumen"] = show["Volumen"].map(lambda x: f"{float(x):,.0f}")
+            show["$ Volumen"] = show["$ Volumen"].map(lambda x: f"{float(x):,.0f}")
+            st.dataframe(show, use_container_width=True, hide_index=True)
 
     with t_chart:
         st.markdown("### Gráfico")
