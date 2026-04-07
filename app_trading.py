@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
@@ -366,6 +367,56 @@ def build_chart(df: pd.DataFrame, overlays: Iterable[str]) -> go.Figure:
     return fig
 
 
+def _llm_is_configured(provider: str, api_base: str, api_key: str) -> bool:
+    if provider == "Off":
+        return False
+    if provider == "Ollama (local)":
+        return bool(api_base.strip())
+    # OpenAI-compatible
+    return bool(api_base.strip()) and bool(api_key.strip())
+
+
+def llm_generate(provider: str, api_base: str, api_key: str, model: str, system: str, user: str) -> str:
+    """
+    Minimal OpenAI-compatible chat call + Ollama fallback.
+    Returns assistant text or raises Exception.
+    """
+    import json
+    import requests
+
+    api_base = api_base.rstrip("/")
+
+    if provider == "Ollama (local)":
+        # Ollama: POST /api/chat
+        url = f"{api_base}/api/chat"
+        payload = {
+            "model": model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "stream": False,
+        }
+        r = requests.post(url, json=payload, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        msg = data.get("message", {}) if isinstance(data, dict) else {}
+        return (msg.get("content") or "").strip()
+
+    # OpenAI-compatible: POST /v1/chat/completions
+    url = f"{api_base}/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "temperature": 0.2,
+    }
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=45)
+    r.raise_for_status()
+    data = r.json()
+    choices = data.get("choices", [])
+    if not choices:
+        return ""
+    return (choices[0].get("message", {}) or {}).get("content", "").strip()
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -421,6 +472,15 @@ def main() -> None:
         )
         radar_items = [x.strip().upper() for x in radar_raw.split(",") if x.strip()]
 
+        st.markdown("---")
+        st.markdown("### IA (opcional)")
+        provider = st.selectbox("Proveedor", ["Off", "OpenAI-compatible", "Ollama (local)"], index=0)
+        default_base = "http://localhost:11434" if provider == "Ollama (local)" else "https://api.openai.com"
+        api_base = st.text_input("API base", value=os.environ.get("QSP_AI_BASE", default_base))
+        api_key = st.text_input("API key", value=os.environ.get("QSP_AI_KEY", ""), type="password")
+        default_model = "llama3.1" if provider == "Ollama (local)" else "gpt-4o-mini"
+        model = st.text_input("Modelo", value=os.environ.get("QSP_AI_MODEL", default_model))
+
     # Header (Streamlit layout; no raw HTML containers)
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     hL, hR = st.columns([0.78, 0.22], vertical_alignment="center")
@@ -465,7 +525,7 @@ def main() -> None:
         )
         st.caption(f"Score: {rec.score:+.0f}/100 • Confianza: {rec.confidence}%")
 
-    t_overview, t_chart, t_tech, t_radar = st.tabs(["Resumen", "Gráfico", "Técnicos", "Radar"])
+    t_overview, t_chart, t_tech, t_radar, t_ai = st.tabs(["Resumen", "Gráfico", "Técnicos", "Radar", "IA"])
 
     with t_overview:
         cL, cR = st.columns([1.05, 0.95])
@@ -546,6 +606,63 @@ def main() -> None:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
                 st.warning("No se pudieron cargar activos del radar (tickers inválidos o sin datos).")
+
+    with t_ai:
+        st.markdown("### IA — Lectura contextual (no es consejo financiero)")
+        st.caption(
+            "La IA usa los indicadores calculados + el score del terminal para redactar una lectura. "
+            "Si no configuras proveedor, esta pestaña queda desactivada."
+        )
+
+        if not _llm_is_configured(provider, api_base, api_key):
+            st.info(
+                "IA desactivada. Para activarla:\n"
+                "- OpenAI-compatible: define `QSP_AI_BASE`, `QSP_AI_KEY`, `QSP_AI_MODEL`\n"
+                "- Ollama: instala Ollama y usa `API base = http://localhost:11434` y un modelo local"
+            )
+        else:
+            # Build compact context
+            ctx = {
+                "ticker": ticker,
+                "period": period,
+                "interval": interval,
+                "close": float(last.get("Close", np.nan)),
+                "change_pct": float(chg) if not pd.isna(chg) else None,
+                "recommendation": rec.label,
+                "score": float(rec.score),
+                "confidence": int(rec.confidence),
+                "regime": "trend" if trending else "range/mixed",
+                "adx14": float(adx_v) if adx_v else None,
+                "rsi14": float(last.get("RSI14", np.nan)) if not pd.isna(last.get("RSI14")) else None,
+                "macd_hist": float(last.get("MACD_HIST", np.nan)) if not pd.isna(last.get("MACD_HIST")) else None,
+                "atr14": float(last.get("ATR14", np.nan)) if not pd.isna(last.get("ATR14")) else None,
+                "rel_vol": float(last.get("REL_VOL", np.nan)) if not pd.isna(last.get("REL_VOL")) else None,
+                "ema50": float(last.get("EMA50", np.nan)) if not pd.isna(last.get("EMA50")) else None,
+                "ema200": float(last.get("EMA200", np.nan)) if not pd.isna(last.get("EMA200")) else None,
+                "bbp": float(last.get("BBP", np.nan)) if not pd.isna(last.get("BBP")) else None,
+                "stochrsi_k": float(last.get("STOCHRSI_K", np.nan)) if not pd.isna(last.get("STOCHRSI_K")) else None,
+            }
+
+            system = (
+                "Eres un analista técnico. Debes escribir en español, conciso y profesional.\n"
+                "Reglas:\n"
+                "- No inventes datos: usa solo el JSON entregado.\n"
+                "- No des asesoría financiera personalizada. No prometas rentabilidad.\n"
+                "- Entrega: 1) lectura (tendencia/momentum/volatilidad), 2) sesgo (bull/bear/neutral), "
+                "3) 2 escenarios (continuación vs invalidación) con niveles sugeridos aproximados usando EMA/ATR si están.\n"
+            )
+            user = f"Contexto (JSON):\n{ctx}\n\nRedacta el informe."
+
+            if st.button("Generar informe IA", type="primary"):
+                with st.spinner("Generando…"):
+                    try:
+                        txt = llm_generate(provider, api_base, api_key, model, system=system, user=user)
+                        if not txt:
+                            st.warning("La IA respondió vacío.")
+                        else:
+                            st.markdown(txt)
+                    except Exception as e:
+                        st.error(f"Fallo IA: {e}")
 
 
 if __name__ == "__main__":
