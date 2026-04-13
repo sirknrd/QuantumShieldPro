@@ -94,6 +94,7 @@ def load_sp500_tickers() -> list[str]:
             .str.strip()
             .tolist()
         )
+        # Keep only non-empty symbols for resilient fallback behavior.
         tickers = [x for x in tickers if x]
         return sorted(list(dict.fromkeys(tickers)))
     except Exception:
@@ -352,6 +353,7 @@ def _signal_volume(last: pd.Series) -> tuple[float, dict[str, float]]:
 
 
 def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame, pd.DataFrame, bool, float]:
+    """Return recommendation, group explanation table, indicator detail table, trend regime flag and ADX value."""
     if df.empty:
         empty_rec = Recommendation("NEUTRAL", "#8B949E", 0.0, 0)
         return empty_rec, pd.DataFrame(), pd.DataFrame(), False, 0.0
