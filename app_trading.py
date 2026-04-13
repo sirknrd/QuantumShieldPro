@@ -4,7 +4,7 @@ import math
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,14 @@ class Recommendation:
     color: str
     score: float  # -100..+100
     confidence: int  # 0..100
+
+
+class RecommendationResult(NamedTuple):
+    recommendation: Recommendation
+    explanation: pd.DataFrame
+    details: pd.DataFrame
+    trending: bool
+    adx: float
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -100,7 +108,7 @@ def load_sp500_tickers() -> list[str]:
             .str.strip()
             .tolist()
         )
-        # Filter out empty symbols and remove prior redundant uppercase self-check.
+        # Filter out empty ticker symbols.
         tickers = [x for x in tickers if x]
         return sorted(list(dict.fromkeys(tickers)))
     except Exception:
@@ -362,21 +370,17 @@ def _signal_volume(last: pd.Series) -> tuple[float, dict[str, float]]:
     return float(np.nanmean(list(details.values()))), details
 
 
-def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame, pd.DataFrame, bool, float]:
+def recommend(df: pd.DataFrame) -> RecommendationResult:
     """
     Compute final trading recommendation.
 
     Returns:
-        tuple containing:
-        - Recommendation: final recommendation label/color/score/confidence.
-        - pd.DataFrame: group-level explanation table (weights, scores, contribution).
-        - pd.DataFrame: indicator-level signal detail table.
-        - bool: trend regime flag based on ADX threshold.
-        - float: latest ADX numeric value.
+        RecommendationResult with labeled access to recommendation, explanation,
+        details, trend regime flag and latest ADX value.
     """
     if df.empty:
         empty_rec = Recommendation("NEUTRAL", "#8B949E", 0.0, 0)
-        return empty_rec, pd.DataFrame(), pd.DataFrame(), False, 0.0
+        return RecommendationResult(empty_rec, pd.DataFrame(), pd.DataFrame(), False, 0.0)
     last = df.iloc[-1]
 
     adx = last.get("ADX14")
@@ -438,7 +442,7 @@ def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame, pd.DataFr
         detail_rows.append({"Indicador": name, "Señal (-1..+1)": float(val)})
     details = pd.DataFrame(detail_rows).sort_values("Indicador")
 
-    return rec, expl, details, trending, adx_v
+    return RecommendationResult(rec, expl, details, trending, adx_v)
 
 
 def regime_label(adx_v: float) -> str:
