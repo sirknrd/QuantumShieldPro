@@ -94,7 +94,7 @@ def load_sp500_tickers() -> list[str]:
             .str.strip()
             .tolist()
         )
-        # Keep only non-empty symbols for resilient fallback behavior.
+        # Filter out empty ticker symbols.
         tickers = [x for x in tickers if x]
         return sorted(list(dict.fromkeys(tickers)))
     except Exception:
