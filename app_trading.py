@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
@@ -14,6 +15,10 @@ import yfinance as yf
 
 
 APP_TITLE = "QuantumShield Pro — Trading Terminal"
+VALID_PERIODS = {"1mo", "3mo", "6mo", "1y", "2y", "5y"}
+VALID_INTERVALS = {"1d", "1h", "30m", "15m"}
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -29,22 +34,34 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _safe_pct(a: float, b: float) -> float:
-    if b == 0 or (isinstance(b, float) and (math.isnan(b) or math.isinf(b))):
+    try:
+        b_val = float(b)
+    except (TypeError, ValueError):
         return float("nan")
-    return (a / b - 1.0) * 100.0
+    if b_val == 0 or not np.isfinite(b_val):
+        return float("nan")
+    return (float(a) / b_val - 1.0) * 100.0
 
 
 @st.cache_data(ttl=60 * 5, show_spinner=False)
 def load_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.download(
-        ticker,
-        period=period,
-        interval=interval,
-        progress=False,
-        auto_adjust=False,
-        group_by="column",
-        threads=True,
-    )
+    if not ticker:
+        return pd.DataFrame()
+    if period not in VALID_PERIODS or interval not in VALID_INTERVALS:
+        return pd.DataFrame()
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            group_by="column",
+            threads=True,
+        )
+    except Exception:
+        logger.exception("Error downloading OHLCV for ticker=%s period=%s interval=%s", ticker, period, interval)
+        return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -77,7 +94,7 @@ def load_sp500_tickers() -> list[str]:
             .str.strip()
             .tolist()
         )
-        tickers = [x for x in tickers if x and x.upper() == x.upper()]
+        tickers = [x for x in tickers if x]
         return sorted(list(dict.fromkeys(tickers)))
     except Exception:
         # Minimal fallback (keeps feature working offline-ish)
@@ -90,21 +107,27 @@ def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
     Compute "most active" by dollar volume (Close * Volume) on last daily bar.
     Downloads in one batch for speed.
     """
+    if top_n <= 0:
+        return pd.DataFrame()
     tickers = load_sp500_tickers()
     # Limit to avoid huge payloads if Wikipedia table grows or network is slow.
     tickers = tickers[:505]
     if not tickers:
         return pd.DataFrame()
 
-    df = yf.download(
-        " ".join(tickers),
-        period="5d",
-        interval="1d",
-        progress=False,
-        auto_adjust=False,
-        group_by="column",
-        threads=True,
-    )
+    try:
+        df = yf.download(
+            " ".join(tickers),
+            period="5d",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            group_by="column",
+            threads=True,
+        )
+    except Exception:
+        logger.exception("Error downloading S&P 500 activity data")
+        return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -146,6 +169,9 @@ def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+    required_cols = {"Open", "High", "Low", "Close"}
+    if not required_cols.issubset(df.columns):
+        return pd.DataFrame()
     out = df.copy()
 
     close = out["Close"]
@@ -325,7 +351,10 @@ def _signal_volume(last: pd.Series) -> tuple[float, dict[str, float]]:
     return float(np.nanmean(list(details.values()))), details
 
 
-def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame]:
+def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame, pd.DataFrame, bool, float]:
+    if df.empty:
+        empty_rec = Recommendation("NEUTRAL", "#8B949E", 0.0, 0)
+        return empty_rec, pd.DataFrame(), pd.DataFrame(), False, 0.0
     last = df.iloc[-1]
 
     adx = last.get("ADX14")
@@ -687,4 +716,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
