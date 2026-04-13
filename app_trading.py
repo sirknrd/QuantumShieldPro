@@ -59,12 +59,13 @@ def load_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
             group_by="column",
             threads=True,
         )
-    except Exception:
-        logger.exception(
-            "Error downloading OHLCV for ticker=%s period=%s interval=%s, returning empty DataFrame",
+    except Exception as exc:
+        logger.error(
+            "Error downloading OHLCV for ticker=%s period=%s interval=%s, returning empty DataFrame: %s",
             ticker,
             period,
             interval,
+            exc,
         )
         return pd.DataFrame()
     if df is None or df.empty:
@@ -99,7 +100,7 @@ def load_sp500_tickers() -> list[str]:
             .str.strip()
             .tolist()
         )
-        # Remove empty symbols while also replacing prior redundant validation logic.
+        # Filter out empty symbols and remove prior redundant uppercase self-check.
         tickers = [x for x in tickers if x]
         return sorted(list(dict.fromkeys(tickers)))
     except Exception:
@@ -131,8 +132,12 @@ def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
             group_by="column",
             threads=True,
         )
-    except Exception:
-        logger.exception("Error downloading S&P 500 activity data, returning empty DataFrame")
+    except Exception as exc:
+        logger.error(
+            "Error downloading S&P 500 activity data for %s tickers (period=5d interval=1d), returning empty DataFrame: %s",
+            len(tickers),
+            exc,
+        )
         return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
