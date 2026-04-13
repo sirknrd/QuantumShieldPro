@@ -15,6 +15,7 @@ import yfinance as yf
 
 
 APP_TITLE = "QuantumShield Pro — Trading Terminal"
+ZERO_CONFIDENCE = 0
 VALID_PERIODS = {"1mo", "3mo", "6mo", "1y", "2y", "5y"}
 VALID_INTERVALS = {"1d", "1h", "30m", "15m"}
 
@@ -109,7 +110,7 @@ def load_sp500_tickers() -> list[str]:
             .tolist()
         )
         # Filter out empty ticker symbols.
-        tickers = [x for x in tickers if x]
+        tickers = [x for x in tickers if isinstance(x, str) and x]
         return sorted(list(dict.fromkeys(tickers)))
     except Exception:
         # Minimal fallback (keeps feature working offline-ish)
@@ -379,7 +380,7 @@ def recommend(df: pd.DataFrame) -> RecommendationResult:
         details, trend regime flag and latest ADX value.
     """
     if df.empty:
-        empty_rec = Recommendation("NEUTRAL", "#8B949E", 0.0, 0)
+        empty_rec = Recommendation("NEUTRAL", "#8B949E", 0.0, ZERO_CONFIDENCE)
         return RecommendationResult(empty_rec, pd.DataFrame(), pd.DataFrame(), False, 0.0)
     last = df.iloc[-1]
 
