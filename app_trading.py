@@ -60,7 +60,12 @@ def load_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
             threads=True,
         )
     except Exception:
-        logger.exception("Error downloading OHLCV for ticker=%s period=%s interval=%s", ticker, period, interval)
+        logger.exception(
+            "Error downloading OHLCV for ticker=%s period=%s interval=%s, returning empty DataFrame",
+            ticker,
+            period,
+            interval,
+        )
         return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
@@ -127,7 +132,7 @@ def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
             threads=True,
         )
     except Exception:
-        logger.exception("Error downloading S&P 500 activity data")
+        logger.exception("Error downloading S&P 500 activity data, returning empty DataFrame")
         return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
