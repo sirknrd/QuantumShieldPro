@@ -176,6 +176,8 @@ _BBP_COL    = "BBP_20_2.0"
 _BBW_COL    = "BBW_20_2.0"
 _SRSI_K_COL = "STOCHRSIk_14_14_3_3"
 _SRSI_D_COL = "STOCHRSId_14_14_3_3"
+_CCI_COL    = "CCI_14_0.015"
+_WILLR_COL  = "WILLR_14"
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -237,6 +239,36 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["VOL_SMA20"] = ta.sma(vol, length=20) if not vol.empty else np.nan
     out["REL_VOL"]   = out["Volume"] / out["VOL_SMA20"] if "Volume" in out.columns else np.nan
 
+    # --- Nuevos indicadores para estrategia mejorada ---
+
+    # CCI (Commodity Channel Index): extremos ±100 indican condiciones de entrada
+    cci = ta.cci(high, low, close, length=14)
+    if cci is not None:
+        out["CCI14"] = cci
+
+    # Williams %R: -80 a -100 = sobreventa, 0 a -20 = sobrecompra
+    willr = ta.willr(high, low, close, length=14)
+    if willr is not None:
+        out["WILLR14"] = willr
+
+    # OBV (On-Balance Volume): tendencia del volumen confirma precio
+    obv = ta.obv(close, vol) if not vol.empty else None
+    if obv is not None:
+        out["OBV"] = obv
+        out["OBV_EMA20"] = ta.ema(obv, length=20)
+
+    # ROC (Rate of Change 10): momentum de precio puro
+    roc = ta.roc(close, length=10)
+    if roc is not None:
+        out["ROC10"] = roc
+
+    # EMA corta para detección de cruces rápidos
+    out["EMA9"]  = ta.ema(close, length=9)
+    out["EMA21"] = ta.ema(close, length=21)
+
+    # Divergencia RSI simplificada: diferencia de pendiente RSI vs precio (últimas 5 velas)
+    # Se calcula en recommend() sobre las últimas N filas, no aquí (requiere ventana).
+
     # FIX: ffill solo en columnas de indicadores derivados, no en OHLCV ni en señales
     # con lag natural (Ichimoku). Las columnas de precio se dejan intactas.
     indicator_cols = [c for c in out.columns if c not in ("Open", "High", "Low", "Close", "Adj Close", "Volume")]
@@ -262,6 +294,7 @@ def _signal_trend(last: pd.Series) -> tuple[float, dict[str, float]]:
     details["Price vs EMA200"] = above("Close", "EMA200")
     details["EMA50 vs EMA200"] = gt("EMA50", "EMA200")
     details["Price vs EMA50"]  = above("Close", "EMA50")
+    details["EMA9 vs EMA21"]   = gt("EMA9", "EMA21")   # cruce rápido de corto plazo
 
     # Supertrend direction (SUPERTd_10_3.0): 1 = alcista, -1 = bajista
     st_dir = 0.0
@@ -287,6 +320,14 @@ def _signal_trend(last: pd.Series) -> tuple[float, dict[str, float]]:
                 ichi_score = -1.0
     details["Ichimoku Cloud"] = ichi_score
 
+    # OBV vs su EMA20: confirma tendencia con volumen
+    obv_score = 0.0
+    obv     = last.get("OBV")
+    obv_ema = last.get("OBV_EMA20")
+    if obv is not None and obv_ema is not None and not (pd.isna(obv) or pd.isna(obv_ema)):
+        obv_score = 1.0 if float(obv) > float(obv_ema) else -1.0
+    details["OBV vs EMA20"] = obv_score
+
     vals = np.array(list(details.values()), dtype="float64")
     return float(np.nanmean(vals)) if vals.size else 0.0, details
 
@@ -297,24 +338,11 @@ def _signal_momentum(last: pd.Series) -> tuple[float, dict[str, float]]:
     rsi = last.get("RSI14")
     if rsi is not None and not pd.isna(rsi):
         r = float(rsi)
-        # FIX: convención corregida
-        # RSI > 50 y subiendo => momentum alcista (+)
-        # RSI < 50 y bajando  => momentum bajista (-)
-        # (r - 50) / 20 da +1 a RSI=70 y -1 a RSI=30, lo cual es correcto:
-        # momentum alcista cuando RSI sube, pero *no* overbought extremo.
-        # Para capturar sobrecompra/sobreventa como señal contraria, usamos
-        # una curva que penaliza extremos.
         if r >= 70:
-            # Sobrecompra: momentum agotándose, señal levemente bajista
             details["RSI14"] = _clamp(1.0 - (r - 70.0) / 15.0, -1.0, 1.0)
         elif r <= 30:
-            # Sobreventa: momentum agotado al alza bajista, rebote potencial
-            details["RSI14"] = _clamp(-1.0 + (30.0 - r) / 15.0 * -1.0, -1.0, 1.0)
-            details["RSI14"] = _clamp((30.0 - r) / 15.0 - 1.0 + 1.0, -1.0, 1.0)
-            # Simplificado: sobreventa = señal alcista (potencial rebote)
             details["RSI14"] = _clamp((50.0 - r) / 20.0 * -1.0, -1.0, 1.0)
         else:
-            # Zona media: positivo si > 50, negativo si < 50
             details["RSI14"] = _clamp((r - 50.0) / 20.0, -1.0, 1.0)
     else:
         details["RSI14"] = 0.0
@@ -328,17 +356,47 @@ def _signal_momentum(last: pd.Series) -> tuple[float, dict[str, float]]:
     k = last.get("STOCHRSI_K")
     if k is not None and not pd.isna(k):
         kk = float(k)
-        # FIX: convención consistente con RSI
-        # StochRSI > 50 = momentum alcista; < 50 = bajista
         if kk >= 80:
             details["StochRSI"] = _clamp(1.0 - (kk - 80.0) / 10.0, -1.0, 1.0)
         elif kk <= 20:
-            details["StochRSI"] = _clamp((20.0 - kk) / 10.0 * -1.0 + 1.0, -1.0, 1.0)
             details["StochRSI"] = _clamp((kk - 20.0) / 10.0, -1.0, 1.0)
         else:
             details["StochRSI"] = _clamp((kk - 50.0) / 30.0, -1.0, 1.0)
     else:
         details["StochRSI"] = 0.0
+
+    # CCI: > +100 = sobrecompra (bajista corto plazo), < -100 = sobreventa (alcista)
+    cci = last.get("CCI14")
+    if cci is not None and not pd.isna(cci):
+        c = float(cci)
+        if c > 200:
+            details["CCI14"] = -1.0
+        elif c > 100:
+            details["CCI14"] = _clamp(1.0 - (c - 100.0) / 100.0, -1.0, 1.0)
+        elif c < -200:
+            details["CCI14"] = 1.0
+        elif c < -100:
+            details["CCI14"] = _clamp(-1.0 + (abs(c) - 100.0) / 100.0, -1.0, 1.0)
+        else:
+            details["CCI14"] = _clamp(c / 100.0, -1.0, 1.0)
+    else:
+        details["CCI14"] = 0.0
+
+    # Williams %R: -100 a -80 = sobreventa (alcista), 0 a -20 = sobrecompra (bajista)
+    willr = last.get("WILLR14")
+    if willr is not None and not pd.isna(willr):
+        w = float(willr)  # rango -100..0
+        # mapear a -1..+1: -100 -> +1 (sobreventa), 0 -> -1 (sobrecompra)
+        details["Williams%R"] = _clamp((-w - 50.0) / 50.0, -1.0, 1.0)
+    else:
+        details["Williams%R"] = 0.0
+
+    # ROC: momentum de precio puro, normalizado
+    roc = last.get("ROC10")
+    if roc is not None and not pd.isna(roc):
+        details["ROC10"] = _clamp(float(roc) / 10.0, -1.0, 1.0)
+    else:
+        details["ROC10"] = 0.0
 
     vals = np.array(list(details.values()), dtype="float64")
     return float(np.nanmean(vals)), details
@@ -385,6 +443,117 @@ def _signal_volume(last: pd.Series) -> tuple[float, dict[str, float]]:
     else:
         details["RelVol"] = _clamp((float(rv) - 1.0) / 1.0, -0.5, 0.8)
     return float(np.nanmean(list(details.values()))), details
+
+
+# ---------------------------------------------------------------------------
+# Detección de divergencias RSI/precio (requiere ventana de barras)
+# ---------------------------------------------------------------------------
+
+def detect_divergence(df: pd.DataFrame, window: int = 14) -> dict[str, str]:
+    """
+    Detecta divergencias alcistas/bajistas entre precio y RSI en las últimas `window` velas.
+    Retorna un dict con claves 'tipo' y 'descripcion'.
+    """
+    result = {"tipo": "Ninguna", "descripcion": "Sin divergencia detectada"}
+    if len(df) < window + 2 or "RSI14" not in df.columns:
+        return result
+
+    sub = df.tail(window).dropna(subset=["Close", "RSI14"])
+    if len(sub) < 4:
+        return result
+
+    prices = sub["Close"].values
+    rsis   = sub["RSI14"].values
+
+    # Buscar mínimos locales (divergencia alcista): precio hace mínimo más bajo, RSI hace mínimo más alto
+    price_lo1, price_lo2 = prices[0], prices[-1]
+    rsi_lo1,   rsi_lo2   = rsis[0],   rsis[-1]
+
+    # Buscar máximos locales (divergencia bajista): precio hace máximo más alto, RSI hace máximo más bajo
+    price_hi1, price_hi2 = prices[0], prices[-1]
+    rsi_hi1,   rsi_hi2   = rsis[0],   rsis[-1]
+
+    # Umbral mínimo de diferencia para filtrar ruido
+    price_thr = abs(price_lo1) * 0.005  # 0.5%
+    rsi_thr   = 2.0                      # 2 puntos RSI
+
+    if (price_lo2 < price_lo1 - price_thr) and (rsi_lo2 > rsi_lo1 + rsi_thr):
+        result = {
+            "tipo": "Alcista",
+            "descripcion": f"Divergencia alcista: precio hizo mínimo más bajo ({price_lo2:.2f} < {price_lo1:.2f}) pero RSI subió ({rsi_lo2:.1f} > {rsi_lo1:.1f}). Señal de agotamiento bajista.",
+        }
+    elif (price_hi2 > price_hi1 + price_thr) and (rsi_hi2 < rsi_hi1 - rsi_thr):
+        result = {
+            "tipo": "Bajista",
+            "descripcion": f"Divergencia bajista: precio hizo máximo más alto ({price_hi2:.2f} > {price_hi1:.2f}) pero RSI cayó ({rsi_hi2:.1f} < {rsi_hi1:.1f}). Señal de agotamiento alcista.",
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Gestión de riesgo: niveles de entrada, Stop Loss y Take Profit basados en ATR
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RiskLevels:
+    entry:      float
+    stop_loss:  float
+    tp1:        float
+    tp2:        float
+    tp3:        float
+    risk_reward: float  # ratio riesgo/beneficio hacia TP1
+    position_size_pct: float  # % de capital sugerido (riesgo 1%)
+    atr:        float
+    atr_pct:    float
+
+
+def compute_risk_levels(df: pd.DataFrame, risk_per_trade_pct: float = 1.0) -> RiskLevels | None:
+    """
+    Calcula niveles de entrada, SL y TPs basados en ATR.
+    - SL: 1.5x ATR bajo el precio de entrada (largo) o sobre (corto)
+    - TP1: 1.5x ATR, TP2: 3x ATR, TP3: 5x ATR
+    - Position size: riesgo_por_operacion / distancia_SL
+    """
+    if df.empty or "ATR14" not in df.columns or "Close" not in df.columns:
+        return None
+
+    last  = df.iloc[-1]
+    entry = float(last["Close"])
+    atr   = last.get("ATR14")
+
+    if atr is None or pd.isna(atr) or entry == 0:
+        return None
+
+    atr_v   = float(atr)
+    atr_pct = atr_v / entry * 100.0
+
+    sl_dist = 1.5 * atr_v
+    stop_loss = entry - sl_dist
+
+    tp1 = entry + 1.5 * atr_v
+    tp2 = entry + 3.0 * atr_v
+    tp3 = entry + 5.0 * atr_v
+
+    rr = (tp1 - entry) / sl_dist if sl_dist > 0 else 0.0
+
+    # Position size: cuántas unidades comprar para arriesgar risk_per_trade_pct% del capital
+    # Expresado como % del capital total: risk% / (SL_dist / entry)
+    sl_pct = sl_dist / entry * 100.0
+    position_size_pct = risk_per_trade_pct / sl_pct * 100.0 if sl_pct > 0 else 0.0
+    position_size_pct = _clamp(position_size_pct, 0.0, 100.0)
+
+    return RiskLevels(
+        entry=entry,
+        stop_loss=stop_loss,
+        tp1=tp1,
+        tp2=tp2,
+        tp3=tp3,
+        risk_reward=rr,
+        position_size_pct=position_size_pct,
+        atr=atr_v,
+        atr_pct=atr_pct,
+    )
 
 
 # FIX: type hint corregido para reflejar los 5 valores que realmente se retornan
@@ -617,6 +786,17 @@ def main() -> None:
         )
 
         st.markdown("---")
+        st.markdown("### Estrategia")
+        risk_per_trade = st.slider(
+            "Riesgo por operación (%)",
+            min_value=0.25,
+            max_value=5.0,
+            value=1.0,
+            step=0.25,
+            help="% del capital total que arriesgas por operación. Se usa para calcular el tamaño de posición.",
+        )
+
+        st.markdown("---")
         st.markdown("### Radar")
         radar_raw = st.text_area(
             "Lista (coma)",
@@ -649,6 +829,10 @@ def main() -> None:
     chg = _safe_pct(float(last["Close"]), float(prev_close)) if not pd.isna(prev_close) else float("nan")
 
     rec, expl, details, trending, adx_v = recommend(dfi)
+
+    # Divergencia y niveles de riesgo (calculados una sola vez)
+    divergence  = detect_divergence(dfi, window=20)
+    risk_levels = compute_risk_levels(dfi, risk_per_trade_pct=risk_per_trade)
 
     # KPI row
     k1, k2, k3, k4, k5 = st.columns([1.2, 1, 1, 1, 1.2])
@@ -694,7 +878,9 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
-    t_overview, t_chart, t_tech, t_radar = st.tabs(["Resumen", "Gráfico", "Técnicos", "Radar"])
+    t_overview, t_chart, t_tech, t_strategy, t_radar = st.tabs(
+        ["Resumen", "Gráfico", "Técnicos", "Estrategia", "Radar"]
+    )
 
     with t_overview:
         cL, cR = st.columns([1.05, 0.95])
@@ -761,6 +947,145 @@ def main() -> None:
             hide_index=True,
         )
         st.caption("Interpretación rápida: +1 bullish, -1 bearish, 0 neutral.")
+
+    with t_strategy:
+        st.markdown("### Plan de Estrategia de Inversión")
+
+        # --- Divergencias ---
+        div_color = {"Alcista": "#00D18F", "Bajista": "#FF4B4B"}.get(divergence["tipo"], "#8B949E")
+        st.markdown(
+            f"""
+<div style="border-left: 4px solid {div_color}; padding: 10px 16px; border-radius: 8px;
+            background: rgba(15,23,34,0.4); margin-bottom: 12px;">
+  <b style="color:{div_color};">Divergencia RSI/Precio: {divergence['tipo']}</b><br>
+  <span style="font-size:13px; color: rgba(230,237,243,0.85);">{divergence['descripcion']}</span>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # --- Niveles de riesgo ---
+        st.markdown("#### Gestión de Riesgo (basada en ATR)")
+        if risk_levels is None:
+            st.warning("No se pudieron calcular niveles de riesgo (ATR no disponible).")
+        else:
+            rl = risk_levels
+            rr_color = "#00D18F" if rl.risk_reward >= 1.5 else "#FFA657" if rl.risk_reward >= 1.0 else "#FF4B4B"
+
+            col_rl1, col_rl2, col_rl3 = st.columns(3)
+            with col_rl1:
+                st.metric("Entrada (Close)", format_price(rl.entry))
+                st.metric("Stop Loss (−1.5× ATR)", format_price(rl.stop_loss),
+                          delta=f"−{format_price(rl.entry - rl.stop_loss)} ({(rl.entry - rl.stop_loss)/rl.entry*100:.2f}%)",
+                          delta_color="inverse")
+            with col_rl2:
+                st.metric("TP1 (+1.5× ATR)", format_price(rl.tp1),
+                          delta=f"+{format_price(rl.tp1 - rl.entry)}")
+                st.metric("TP2 (+3× ATR)",   format_price(rl.tp2),
+                          delta=f"+{format_price(rl.tp2 - rl.entry)}")
+            with col_rl3:
+                st.metric("TP3 (+5× ATR)",   format_price(rl.tp3),
+                          delta=f"+{format_price(rl.tp3 - rl.entry)}")
+                st.markdown(
+                    f"""
+<div style="margin-top:8px; padding:10px; border-radius:8px; border:1px solid {rr_color};
+            background: rgba(15,23,34,0.4); text-align:center;">
+  <div style="font-size:11px; color:rgba(230,237,243,0.7);">RATIO RIESGO/BENEFICIO (TP1)</div>
+  <div style="font-size:24px; font-weight:800; color:{rr_color};">1 : {rl.risk_reward:.2f}</div>
+  <div style="font-size:11px; color:rgba(230,237,243,0.7);">{"✓ Aceptable" if rl.risk_reward >= 1.5 else "⚠ Bajo — considerar ajuste"}</div>
+</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("---")
+            col_ps1, col_ps2 = st.columns(2)
+            with col_ps1:
+                st.markdown("##### Tamaño de Posición Sugerido")
+                st.markdown(
+                    f"""
+<div style="padding:14px; border-radius:10px; background:rgba(15,23,34,0.4);
+            border:1px solid rgba(139,148,158,0.2);">
+  <p style="margin:0; font-size:13px; color:rgba(230,237,243,0.8);">
+    Asumiendo <b>riesgo del 1%</b> del capital por operación y SL de
+    <b>{(rl.entry - rl.stop_loss)/rl.entry*100:.2f}%</b>:
+  </p>
+  <p style="margin:8px 0 0 0; font-size:22px; font-weight:800; color:#2F81F7;">
+    {rl.position_size_pct:.1f}% del capital
+  </p>
+  <p style="margin:4px 0 0 0; font-size:11px; color:rgba(230,237,243,0.6);">
+    ATR: {format_price(rl.atr)} ({rl.atr_pct:.2f}% del precio)
+  </p>
+</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with col_ps2:
+                st.markdown("##### Guía de Salida Escalonada")
+                st.markdown(
+                    f"""
+<div style="padding:14px; border-radius:10px; background:rgba(15,23,34,0.4);
+            border:1px solid rgba(139,148,158,0.2); font-size:13px;
+            color:rgba(230,237,243,0.85); line-height:1.8;">
+  🟢 <b>TP1 ({format_price(rl.tp1)})</b>: cerrar 40% de la posición<br>
+  🟡 <b>TP2 ({format_price(rl.tp2)})</b>: cerrar 35% de la posición<br>
+  🔵 <b>TP3 ({format_price(rl.tp3)})</b>: cerrar 25% restante (trailing)<br>
+  🔴 <b>SL  ({format_price(rl.stop_loss)})</b>: salida total si se toca
+</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        # --- Condiciones de entrada recomendadas ---
+        st.markdown("---")
+        st.markdown("#### Condiciones de Entrada Recomendadas")
+
+        adx_ok    = adx_v >= 20
+        vol_ok    = not pd.isna(last.get("REL_VOL")) and float(last.get("REL_VOL", 0)) >= 1.1
+        trend_ok  = not pd.isna(last.get("EMA50")) and not pd.isna(last.get("EMA200")) and float(last["Close"]) > float(last["EMA50"])
+        macd_ok   = not pd.isna(last.get("MACD_HIST")) and float(last.get("MACD_HIST", 0)) > 0
+        rsi_ok    = not pd.isna(last.get("RSI14")) and 40 <= float(last.get("RSI14", 50)) <= 70
+        div_ok    = divergence["tipo"] == "Alcista"
+
+        conditions = [
+            ("ADX ≥ 20 (mercado con tendencia)",           adx_ok),
+            ("Volumen relativo ≥ 1.1× (confirmación)",     vol_ok),
+            ("Precio sobre EMA50 (tendencia alcista)",      trend_ok),
+            ("MACD Histograma positivo",                    macd_ok),
+            ("RSI entre 40–70 (zona de momentum sano)",     rsi_ok),
+            ("Divergencia alcista detectada (bonus)",       div_ok),
+        ]
+
+        cond_rows = [
+            {"Condición": label, "Estado": "✅ OK" if ok else "❌ No cumple"}
+            for label, ok in conditions
+        ]
+        met = sum(1 for _, ok in conditions if ok)
+        total = len(conditions)
+
+        st.dataframe(pd.DataFrame(cond_rows), use_container_width=True, hide_index=True)
+
+        quality_color = "#00D18F" if met >= 5 else "#FFA657" if met >= 3 else "#FF4B4B"
+        quality_label = "Alta" if met >= 5 else "Media" if met >= 3 else "Baja"
+        st.markdown(
+            f"""
+<div style="margin-top:8px; padding:10px 16px; border-radius:8px;
+            border:1px solid {quality_color}; background:rgba(15,23,34,0.35);">
+  <b style="color:{quality_color};">Calidad de setup: {quality_label}</b>
+  — {met}/{total} condiciones cumplidas.
+  {"Se recomienda esperar mayor convergencia de señales." if met < 4 else "Setup con suficiente confluencia para considerar entrada."}
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # --- Notas de descargo ---
+        st.markdown("---")
+        st.caption(
+            "⚠️ Esta información es exclusivamente educativa y de análisis técnico. "
+            "No constituye asesoramiento financiero. Toda inversión conlleva riesgo de pérdida. "
+            "Consulta a un asesor financiero certificado antes de operar."
+        )
 
     with t_radar:
         st.markdown("### Radar multi-activo")
