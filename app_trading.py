@@ -3,8 +3,11 @@ from __future__ import annotations
 import concurrent.futures
 import math
 import re
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable
 
 import numpy as np
@@ -158,6 +161,250 @@ def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
 
     out = out.sort_values("$ Volumen", ascending=False).head(int(top_n)).reset_index(drop=True)
     return out
+
+
+# ---------------------------------------------------------------------------
+# NOTICIAS: RSS de Yahoo Finance por ticker (sin API key)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def load_news(ticker: str, max_items: int = 15) -> list[dict]:
+    """
+    Descarga noticias del RSS de Yahoo Finance para el ticker dado.
+    Retorna lista de dicts con title, link, published, source.
+    """
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={urllib.parse.quote(ticker)}&region=US&lang=en-US"
+    items: list[dict] = []
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read()
+        root = ET.fromstring(raw)
+        ns = {"media": "http://search.yahoo.com/mrss/"}
+        channel = root.find("channel")
+        if channel is None:
+            return items
+        for item in channel.findall("item")[:max_items]:
+            title = (item.findtext("title") or "").strip()
+            link  = (item.findtext("link")  or "").strip()
+            pub   = (item.findtext("pubDate") or "").strip()
+            src_el = item.find("source")
+            source = src_el.text.strip() if src_el is not None and src_el.text else "Yahoo Finance"
+            # Parsear fecha
+            try:
+                dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %z")
+                ago = _time_ago(dt)
+            except Exception:
+                ago = pub[:16] if pub else "—"
+            if title and link:
+                items.append({"title": title, "link": link, "ago": ago, "source": source})
+    except Exception:
+        pass
+    return items
+
+
+def _time_ago(dt: datetime) -> str:
+    """Convierte un datetime UTC a texto relativo (ej. 'hace 3h')."""
+    now = datetime.now(tz=timezone.utc)
+    diff = now - dt
+    secs = int(diff.total_seconds())
+    if secs < 60:
+        return "hace moments"
+    if secs < 3600:
+        return f"hace {secs // 60}min"
+    if secs < 86400:
+        return f"hace {secs // 3600}h"
+    return f"hace {secs // 86400}d"
+
+
+# ---------------------------------------------------------------------------
+# SENTIMIENTO: scoring simple de titulares (léxico de palabras clave)
+# ---------------------------------------------------------------------------
+
+_BULL_WORDS = {
+    "surge", "surges", "surging", "rally", "rallies", "rallying", "gain", "gains",
+    "jump", "jumps", "beat", "beats", "record", "upgrade", "upgraded", "buy",
+    "outperform", "strong", "growth", "profit", "revenue", "bullish", "breakout",
+    "upside", "positive", "raises", "raise", "exceeds", "exceed", "higher",
+    "soars", "soar", "boom", "momentum", "upbeat", "optimistic",
+}
+_BEAR_WORDS = {
+    "fall", "falls", "falling", "drop", "drops", "slump", "slumps", "decline",
+    "declines", "miss", "misses", "downgrade", "downgraded", "sell", "underperform",
+    "weak", "loss", "losses", "bearish", "breakdown", "downside", "negative",
+    "cuts", "cut", "below", "lower", "plunge", "plunges", "crash", "warning",
+    "concern", "risk", "trouble", "disappoints", "disappointing",
+}
+
+
+def score_headline(title: str) -> float:
+    """Retorna score de sentimiento entre -1 (bearish) y +1 (bullish)."""
+    words = set(re.findall(r"[a-z]+", title.lower()))
+    bull = len(words & _BULL_WORDS)
+    bear = len(words & _BEAR_WORDS)
+    total = bull + bear
+    if total == 0:
+        return 0.0
+    return (bull - bear) / total
+
+
+def aggregate_sentiment(news: list[dict]) -> dict:
+    """Calcula sentimiento agregado sobre la lista de noticias."""
+    if not news:
+        return {"score": 0.0, "label": "Neutral", "color": "#8B949E", "bull": 0, "bear": 0, "neutral": 0}
+    scores = [score_headline(n["title"]) for n in news]
+    for i, n in enumerate(news):
+        news[i]["sentiment"] = scores[i]
+    avg = float(np.mean(scores))
+    bull    = sum(1 for s in scores if s > 0.1)
+    bear    = sum(1 for s in scores if s < -0.1)
+    neutral = len(scores) - bull - bear
+    if avg > 0.15:
+        label, color = "Bullish", "#00D18F"
+    elif avg < -0.15:
+        label, color = "Bearish", "#FF4B4B"
+    else:
+        label, color = "Neutral", "#8B949E"
+    return {"score": avg, "label": label, "color": color, "bull": bull, "bear": bear, "neutral": neutral}
+
+
+# ---------------------------------------------------------------------------
+# SCREENER: filtros multi-criterio sobre el universo S&P 500
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=60 * 15, show_spinner=False)
+def run_screener(
+    min_price: float,
+    max_price: float,
+    min_chg:   float,
+    max_chg:   float,
+    min_vol_m: float,        # volumen mínimo en millones de $
+    rsi_lo:    float,
+    rsi_hi:    float,
+    adx_min:   float,
+    rec_filter: str,         # "Todas" | "COMPRA*" | "VENTA*" | "NEUTRAL"
+    top_n:     int = 50,
+) -> pd.DataFrame:
+    """
+    Descarga datos del S&P 500 y aplica filtros técnicos/fundamentales.
+    Retorna DataFrame con los mejores candidatos según los criterios.
+    """
+    tickers = load_sp500_tickers()[:505]
+    if not tickers:
+        return pd.DataFrame()
+
+    # Descarga batch de 5 días (precio + volumen)
+    raw = yf.download(
+        " ".join(tickers),
+        period="5d",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
+        threads=True,
+    )
+    if raw is None or raw.empty or not isinstance(raw.columns, pd.MultiIndex):
+        return pd.DataFrame()
+
+    last2 = raw.tail(2)
+    rows: list[dict] = []
+
+    for t in tickers:
+        try:
+            close_s = last2["Close"]
+            if t not in close_s.columns:
+                continue
+            price = float(close_s[t].iloc[-1])
+            prev  = float(close_s[t].iloc[-2]) if len(last2) >= 2 else float("nan")
+            vol   = float(last2["Volume"][t].iloc[-1]) if "Volume" in last2.columns.get_level_values(0) else float("nan")
+
+            if math.isnan(price) or math.isnan(vol):
+                continue
+
+            chg    = _safe_pct(price, prev) if not math.isnan(prev) else float("nan")
+            vol_m  = price * vol / 1e6   # $ volumen en millones
+
+            # Filtros rápidos sin indicadores (evitar descargar 1y de cada ticker)
+            if not (min_price <= price <= max_price):
+                continue
+            if not math.isnan(chg) and not (min_chg <= chg <= max_chg):
+                continue
+            if vol_m < min_vol_m:
+                continue
+
+            rows.append({"Ticker": t, "Precio": price, "Cambio %": chg, "$ Vol (M)": vol_m})
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    base = pd.DataFrame(rows)
+
+    # Para los filtros técnicos (RSI, ADX, recomendación) necesitamos datos históricos.
+    # Lo hacemos en paralelo solo para los candidatos que pasaron los filtros de precio/vol.
+    candidates = base["Ticker"].tolist()[:120]   # cap para evitar sobrecarga
+
+    def _enrich(t: str) -> dict | None:
+        try:
+            d = load_ohlcv(t, period="3mo", interval="1d")
+            if d.empty or len(d) < 30:
+                return None
+            di = compute_indicators(d)
+            r, _, _, _, ax = recommend(di)
+            ll = di.iloc[-1]
+            rsi = ll.get("RSI14")
+            rsi_v = float(rsi) if rsi is not None and not pd.isna(rsi) else float("nan")
+            adx_v = float(ax) if ax else 0.0
+            return {"Ticker": t, "RSI": rsi_v, "ADX": adx_v, "Rec": r.label, "Score": r.score}
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        enriched_raw = list(ex.map(_enrich, candidates))
+
+    enriched = {e["Ticker"]: e for e in enriched_raw if e is not None}
+
+    out_rows = []
+    for _, row in base[base["Ticker"].isin(candidates)].iterrows():
+        t = row["Ticker"]
+        e = enriched.get(t)
+        if e is None:
+            continue
+        rsi_v = e["RSI"]
+        adx_v = e["ADX"]
+        rec_l = e["Rec"]
+        score = e["Score"]
+
+        # Aplicar filtros técnicos
+        if not math.isnan(rsi_v) and not (rsi_lo <= rsi_v <= rsi_hi):
+            continue
+        if adx_v < adx_min:
+            continue
+        if rec_filter != "Todas":
+            if rec_filter == "COMPRA" and not rec_l.startswith("COMPRA"):
+                continue
+            elif rec_filter == "VENTA" and not rec_l.startswith("VENTA"):
+                continue
+            elif rec_filter == "NEUTRAL" and rec_l != "NEUTRAL":
+                continue
+
+        out_rows.append({
+            "Ticker":      t,
+            "Precio":      row["Precio"],
+            "Cambio %":    row["Cambio %"],
+            "$ Vol (M)":   row["$ Vol (M)"],
+            "RSI":         rsi_v,
+            "ADX":         adx_v,
+            "Rec":         rec_l,
+            "Score":       score,
+        })
+
+    if not out_rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(out_rows).sort_values("Score", ascending=False).head(top_n).reset_index(drop=True)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -640,56 +887,203 @@ def format_price(x: float) -> str:
     return f"{float(x):.4f}".rstrip("0").rstrip(".")
 
 
-def build_chart(df: pd.DataFrame, overlays: Iterable[str]) -> go.Figure:
-    view = df.tail(220).copy()
-    x = view.index
+def _detect_patterns(df: pd.DataFrame) -> list[dict]:
+    """
+    Detecta patrones de velas simples en las últimas barras.
+    Retorna lista de dicts {bar_idx, name, color, direction}.
+    """
+    patterns: list[dict] = []
+    if len(df) < 3:
+        return patterns
 
-    fig = go.Figure()
+    tail = df.tail(30).copy()
+    tail = tail.dropna(subset=["Open", "High", "Low", "Close"])
+
+    for i in range(2, len(tail)):
+        o, h, l, c = (float(tail["Open"].iloc[i]),  float(tail["High"].iloc[i]),
+                      float(tail["Low"].iloc[i]),   float(tail["Close"].iloc[i]))
+        po, ph, pl, pc = (float(tail["Open"].iloc[i-1]), float(tail["High"].iloc[i-1]),
+                          float(tail["Low"].iloc[i-1]),  float(tail["Close"].iloc[i-1]))
+        body   = abs(c - o)
+        p_body = abs(pc - po)
+        rng    = h - l if h != l else 1e-9
+        ts     = tail.index[i]
+
+        # Doji: cuerpo muy pequeño
+        if body / rng < 0.1:
+            patterns.append({"ts": ts, "name": "Doji", "color": "#FFA657", "y": h})
+
+        # Hammer: sombra inferior larga (alcista en tendencia bajista)
+        lower_shadow = min(o, c) - l
+        upper_shadow = h - max(o, c)
+        if lower_shadow > 2 * body and upper_shadow < body * 0.5 and c > o:
+            patterns.append({"ts": ts, "name": "Hammer", "color": "#00D18F", "y": l * 0.998})
+
+        # Shooting Star: sombra superior larga (bajista en tendencia alcista)
+        if upper_shadow > 2 * body and lower_shadow < body * 0.5 and c < o:
+            patterns.append({"ts": ts, "name": "Shoot★", "color": "#FF4B4B", "y": h * 1.002})
+
+        # Engulfing alcista
+        if pc > po and c > o and c > po and o < pc and p_body > 0 and body > p_body:
+            patterns.append({"ts": ts, "name": "Bull Engulf", "color": "#00D18F", "y": l * 0.997})
+
+        # Engulfing bajista
+        if pc < po and c < o and c < po and o > pc and p_body > 0 and body > p_body:
+            patterns.append({"ts": ts, "name": "Bear Engulf", "color": "#FF4B4B", "y": h * 1.003})
+
+    return patterns
+
+
+def build_chart(
+    df: pd.DataFrame,
+    overlays: Iterable[str],
+    show_rsi: bool = True,
+    show_macd: bool = False,
+    show_patterns: bool = True,
+    show_sl_tp: bool = False,
+    risk: "RiskLevels | None" = None,
+) -> go.Figure:
+    from plotly.subplots import make_subplots
+
+    overlays = list(overlays)
+    view = df.tail(220).copy()
+    x    = view.index
+
+    # Determinar número de subplots
+    n_rows = 1
+    row_heights = [0.70]
+    subplot_titles = [""]
+    if show_rsi:
+        n_rows += 1; row_heights.append(0.15); subplot_titles.append("RSI 14")
+    if show_macd:
+        n_rows += 1; row_heights.append(0.15); subplot_titles.append("MACD")
+
+    fig = make_subplots(
+        rows=n_rows, cols=1,
+        shared_xaxes=True,
+        row_heights=row_heights,
+        vertical_spacing=0.03,
+        subplot_titles=subplot_titles,
+    )
+
+    # ── Candlestick principal ──
     fig.add_trace(
         go.Candlestick(
             x=x,
-            open=view["Open"],
-            high=view["High"],
-            low=view["Low"],
-            close=view["Close"],
+            open=view["Open"], high=view["High"],
+            low=view["Low"],   close=view["Close"],
             name="Precio",
             increasing_line_color="#00D18F",
             decreasing_line_color="#FF4B4B",
-        )
+        ),
+        row=1, col=1,
     )
 
+    # ── Volumen ──
     if "Volumen" in overlays and "Volume" in view.columns:
+        colors = [
+            "#00D18F" if float(view["Close"].iloc[i]) >= float(view["Open"].iloc[i]) else "#FF4B4B"
+            for i in range(len(view))
+        ]
         fig.add_trace(
-            go.Bar(
-                x=x,
-                y=view["Volume"],
-                name="Volumen",
-                marker_color="rgba(139,148,158,0.35)",
-                yaxis="y2",
-            )
+            go.Bar(x=x, y=view["Volume"], name="Volumen",
+                   marker_color=colors, opacity=0.4, yaxis="y2"),
+            row=1, col=1,
         )
 
+    # ── EMAs ──
     if "EMA 50/200" in overlays:
-        for n, col, w in [(50, "#2F81F7", 1), (200, "#FFA657", 2)]:
+        for n, col, w in [(9, "#8B949E", 1), (21, "#56D364", 1), (50, "#2F81F7", 1.5), (200, "#FFA657", 2)]:
             k = f"EMA{n}"
             if k in view.columns:
-                fig.add_trace(go.Scatter(x=x, y=view[k], name=f"EMA {n}", line=dict(color=col, width=w)))
+                fig.add_trace(go.Scatter(x=x, y=view[k], name=f"EMA {n}",
+                                         line=dict(color=col, width=w)), row=1, col=1)
 
+    # ── Bollinger Bands ──
     if "Bandas Bollinger" in overlays and all(k in view.columns for k in ("BBL", "BBM", "BBU")):
-        fig.add_trace(go.Scatter(x=x, y=view["BBU"], name="BB Upper", line=dict(color="rgba(139,148,158,0.45)", width=1)))
-        fig.add_trace(go.Scatter(x=x, y=view["BBM"], name="BB Mid",   line=dict(color="rgba(139,148,158,0.30)", width=1)))
-        fig.add_trace(go.Scatter(x=x, y=view["BBL"], name="BB Lower", line=dict(color="rgba(139,148,158,0.45)", width=1)))
+        fig.add_trace(go.Scatter(x=x, y=view["BBU"], name="BB Upper",
+                                  line=dict(color="rgba(139,148,158,0.5)", width=1, dash="dot")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=view["BBL"], name="BB Lower",
+                                  line=dict(color="rgba(139,148,158,0.5)", width=1, dash="dot"),
+                                  fill="tonexty", fillcolor="rgba(139,148,158,0.05)"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=view["BBM"], name="BB Mid",
+                                  line=dict(color="rgba(139,148,158,0.3)", width=1)), row=1, col=1)
+
+    # ── Supertrend ──
+    if "Supertrend" in overlays:
+        supert_col = next((c for c in view.columns if c.startswith("SUPERT_") and not c.startswith("SUPERTd_")), None)
+        superd_col = next((c for c in view.columns if c.startswith("SUPERTd_")), None)
+        if supert_col and superd_col:
+            bull_mask = view[superd_col] > 0
+            fig.add_trace(go.Scatter(
+                x=x[bull_mask], y=view[supert_col][bull_mask],
+                mode="lines", name="Supertrend ▲",
+                line=dict(color="#00D18F", width=1.5)), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=x[~bull_mask], y=view[supert_col][~bull_mask],
+                mode="lines", name="Supertrend ▼",
+                line=dict(color="#FF4B4B", width=1.5)), row=1, col=1)
+
+    # ── Patrones de velas ──
+    if show_patterns:
+        pats = _detect_patterns(view)
+        for p in pats:
+            fig.add_annotation(
+                x=p["ts"], y=p["y"],
+                text=p["name"], showarrow=True,
+                arrowhead=2, arrowsize=1, arrowwidth=1,
+                arrowcolor=p["color"], font=dict(size=9, color=p["color"]),
+                ax=0, ay=-18, row=1, col=1,
+            )
+
+    # ── SL/TP lines ──
+    if show_sl_tp and risk is not None:
+        for level, label, color, dash in [
+            (risk.stop_loss, f"SL {format_price(risk.stop_loss)}", "#FF4B4B", "dash"),
+            (risk.tp1,       f"TP1 {format_price(risk.tp1)}",      "#00D18F", "dot"),
+            (risk.tp2,       f"TP2 {format_price(risk.tp2)}",      "#56D364", "dot"),
+            (risk.tp3,       f"TP3 {format_price(risk.tp3)}",      "#2F81F7", "dot"),
+            (risk.entry,     f"Entrada {format_price(risk.entry)}", "#FFA657", "solid"),
+        ]:
+            fig.add_hline(y=level, line_dash=dash, line_color=color,
+                          line_width=1.2, annotation_text=label,
+                          annotation_font_color=color,
+                          annotation_position="right", row=1, col=1)
+
+    # ── RSI subplot ──
+    cur_row = 2
+    if show_rsi and "RSI14" in view.columns:
+        fig.add_trace(go.Scatter(x=x, y=view["RSI14"], name="RSI 14",
+                                  line=dict(color="#2F81F7", width=1.5)), row=cur_row, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="#FF4B4B", line_width=0.8, row=cur_row, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="#00D18F", line_width=0.8, row=cur_row, col=1)
+        fig.add_hline(y=50, line_dash="dot", line_color="#8B949E", line_width=0.5, row=cur_row, col=1)
+        fig.update_yaxes(range=[0, 100], row=cur_row, col=1)
+        cur_row += 1
+
+    # ── MACD subplot ──
+    if show_macd and all(k in view.columns for k in ("MACD", "MACD_SIGNAL", "MACD_HIST")):
+        hist = view["MACD_HIST"]
+        hist_colors = ["#00D18F" if float(v) >= 0 else "#FF4B4B" for v in hist]
+        fig.add_trace(go.Bar(x=x, y=hist, name="MACD Hist",
+                              marker_color=hist_colors, opacity=0.7), row=cur_row, col=1)
+        fig.add_trace(go.Scatter(x=x, y=view["MACD"], name="MACD",
+                                  line=dict(color="#2F81F7", width=1.2)), row=cur_row, col=1)
+        fig.add_trace(go.Scatter(x=x, y=view["MACD_SIGNAL"], name="Señal",
+                                  line=dict(color="#FFA657", width=1.2)), row=cur_row, col=1)
 
     fig.update_layout(
         template="plotly_dark",
-        height=620,
-        margin=dict(l=10, r=10, t=10, b=10),
+        height=700 + (120 if show_rsi else 0) + (120 if show_macd else 0),
+        margin=dict(l=10, r=80, t=24, b=10),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        yaxis=dict(title="Precio"),
-        yaxis2=dict(title="Vol", overlaying="y", side="right", showgrid=False, rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font_size=11),
+        yaxis=dict(title="Precio", side="right"),
+        yaxis2=dict(title="Vol", overlaying="y", side="left",
+                    showgrid=False, rangemode="tozero", showticklabels=False),
+        dragmode="zoom",
     )
     return fig
 
@@ -780,10 +1174,17 @@ def main() -> None:
         st.markdown("---")
         st.markdown("### Gráfico")
         overlays = st.multiselect(
-            "Overlays",
-            ["Volumen", "EMA 50/200", "Bandas Bollinger"],
+            "Overlays precio",
+            ["Volumen", "EMA 50/200", "Bandas Bollinger", "Supertrend"],
             default=["Volumen", "EMA 50/200"],
         )
+        col_gc1, col_gc2 = st.columns(2)
+        with col_gc1:
+            show_rsi  = st.checkbox("RSI panel", value=True)
+            show_pats = st.checkbox("Patrones velas", value=True)
+        with col_gc2:
+            show_macd  = st.checkbox("MACD panel", value=False)
+            show_sl_tp = st.checkbox("SL / TP", value=False)
 
         st.markdown("---")
         st.markdown("### Estrategia")
@@ -878,8 +1279,8 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
-    t_overview, t_chart, t_tech, t_strategy, t_radar = st.tabs(
-        ["Resumen", "Gráfico", "Técnicos", "Estrategia", "Radar"]
+    t_overview, t_chart, t_tech, t_strategy, t_news, t_screener, t_radar = st.tabs(
+        ["Resumen", "Gráfico", "Técnicos", "Estrategia", "Noticias", "Screener", "Radar"]
     )
 
     with t_overview:
@@ -936,8 +1337,14 @@ def main() -> None:
 
     with t_chart:
         st.markdown("### Gráfico")
-        fig = build_chart(dfi, overlays=overlays)
+        fig = build_chart(
+            dfi, overlays=overlays,
+            show_rsi=show_rsi, show_macd=show_macd,
+            show_patterns=show_pats,
+            show_sl_tp=show_sl_tp, risk=risk_levels,
+        )
         st.plotly_chart(fig, use_container_width=True)
+        st.caption("💡 Usa las herramientas de zoom/pan de Plotly. Los patrones de velas se anotan automáticamente en las últimas 30 barras.")
 
     with t_tech:
         st.markdown("### Señales por indicador")
@@ -1086,6 +1493,144 @@ def main() -> None:
             "No constituye asesoramiento financiero. Toda inversión conlleva riesgo de pérdida. "
             "Consulta a un asesor financiero certificado antes de operar."
         )
+
+    with t_news:
+        st.markdown("### Noticias y Sentimiento de Mercado")
+        with st.spinner("Cargando noticias…"):
+            news = load_news(ticker, max_items=20)
+        sentiment = aggregate_sentiment(news)
+
+        # ── Banner de sentimiento ──
+        sc = sentiment["color"]
+        bull_pct = int(sentiment["bull"] / max(len(news), 1) * 100)
+        bear_pct = int(sentiment["bear"] / max(len(news), 1) * 100)
+        neut_pct = 100 - bull_pct - bear_pct
+        st.markdown(
+            f"""
+<div style="display:flex; gap:16px; margin-bottom:16px; flex-wrap:wrap;">
+  <div style="flex:1; min-width:160px; padding:14px; border-radius:10px;
+              border:1px solid {sc}; background:rgba(15,23,34,0.4); text-align:center;">
+    <div style="font-size:11px; color:rgba(230,237,243,0.7); margin-bottom:4px;">SENTIMIENTO NOTICIAS</div>
+    <div style="font-size:26px; font-weight:800; color:{sc};">{sentiment['label']}</div>
+    <div style="font-size:12px; color:rgba(230,237,243,0.7);">Score: {sentiment['score']:+.2f}</div>
+  </div>
+  <div style="flex:2; min-width:240px; padding:14px; border-radius:10px;
+              border:1px solid rgba(139,148,158,0.2); background:rgba(15,23,34,0.4);">
+    <div style="font-size:11px; color:rgba(230,237,243,0.7); margin-bottom:8px;">DISTRIBUCIÓN ({len(news)} titulares)</div>
+    <div style="display:flex; gap:8px; align-items:center; font-size:13px;">
+      <span style="color:#00D18F;">🟢 Bullish: {sentiment['bull']} ({bull_pct}%)</span>
+      <span style="color:#FF4B4B;">🔴 Bearish: {sentiment['bear']} ({bear_pct}%)</span>
+      <span style="color:#8B949E;">⚪ Neutral: {sentiment['neutral']} ({neut_pct}%)</span>
+    </div>
+    <div style="margin-top:10px; height:8px; border-radius:4px; overflow:hidden; display:flex;">
+      <div style="width:{bull_pct}%; background:#00D18F;"></div>
+      <div style="width:{neut_pct}%; background:#3d444d;"></div>
+      <div style="width:{bear_pct}%; background:#FF4B4B;"></div>
+    </div>
+  </div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if not news:
+            st.warning("No se encontraron noticias para este ticker. Puede que el ticker no tenga cobertura en Yahoo Finance RSS.")
+        else:
+            # ── Lista de noticias con color de sentimiento ──
+            for n in news:
+                s = n.get("sentiment", 0.0)
+                if s > 0.1:
+                    badge_color, badge = "#00D18F", "▲ Bullish"
+                elif s < -0.1:
+                    badge_color, badge = "#FF4B4B", "▼ Bearish"
+                else:
+                    badge_color, badge = "#8B949E", "● Neutral"
+
+                st.markdown(
+                    f"""
+<div style="padding:10px 14px; border-radius:8px; margin-bottom:6px;
+            border-left:3px solid {badge_color}; background:rgba(15,23,34,0.35);">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+    <a href="{n['link']}" target="_blank"
+       style="color:rgba(230,237,243,0.92); text-decoration:none; font-size:13px;
+              font-weight:500; line-height:1.4; flex:1;">
+      {n['title']}
+    </a>
+    <span style="color:{badge_color}; font-size:10px; white-space:nowrap; font-weight:700;">
+      {badge}
+    </span>
+  </div>
+  <div style="font-size:10px; color:rgba(230,237,243,0.45); margin-top:4px;">
+    {n['source']} • {n['ago']}
+  </div>
+</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        st.caption("Sentimiento calculado con léxico de palabras clave. Es indicativo, no predictivo.")
+
+    with t_screener:
+        st.markdown("### Screener de Acciones (S&P 500)")
+        st.caption("Filtra el universo S&P 500 según criterios técnicos y de precio. El análisis técnico se ejecuta en paralelo sobre los candidatos que pasan los filtros de precio/volumen.")
+
+        with st.form("screener_form"):
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                st.markdown("**Precio (USD)**")
+                min_price = st.number_input("Mín.", value=5.0,  min_value=0.0,  step=5.0)
+                max_price = st.number_input("Máx.", value=2000.0, min_value=1.0, step=50.0)
+            with fc2:
+                st.markdown("**Cambio diario (%)**")
+                min_chg = st.number_input("Mín. %", value=-10.0, min_value=-50.0, step=1.0)
+                max_chg = st.number_input("Máx. %", value=10.0,  max_value=50.0,  step=1.0)
+            with fc3:
+                st.markdown("**Volumen ($M) mín.**")
+                min_vol_m = st.number_input("$ Vol mín. (M)", value=50.0, min_value=0.0, step=10.0)
+                st.markdown("**RSI (14)**")
+                rsi_range = st.slider("Rango RSI", 0, 100, (30, 70))
+
+            fd1, fd2, fd3 = st.columns(3)
+            with fd1:
+                adx_min = st.number_input("ADX mínimo", value=15.0, min_value=0.0, max_value=60.0, step=5.0)
+            with fd2:
+                rec_filter = st.selectbox(
+                    "Recomendación",
+                    ["Todas", "COMPRA", "VENTA", "NEUTRAL"],
+                    index=0,
+                )
+            with fd3:
+                top_n = st.number_input("Máx. resultados", value=30, min_value=5, max_value=100, step=5)
+
+            submitted = st.form_submit_button("🔍 Ejecutar Screener", use_container_width=True)
+
+        if submitted:
+            with st.spinner("Ejecutando screener… esto puede tomar 20–60 segundos según la red."):
+                scr = run_screener(
+                    min_price=min_price, max_price=max_price,
+                    min_chg=min_chg,     max_chg=max_chg,
+                    min_vol_m=min_vol_m,
+                    rsi_lo=float(rsi_range[0]), rsi_hi=float(rsi_range[1]),
+                    adx_min=adx_min,
+                    rec_filter=rec_filter,
+                    top_n=int(top_n),
+                )
+
+            if scr.empty:
+                st.warning("Ningún activo cumplió todos los filtros. Prueba ampliar los rangos.")
+            else:
+                st.success(f"✅ {len(scr)} activos encontrados")
+
+                # Formatear para display
+                show_scr = scr.copy()
+                show_scr["Precio"]    = show_scr["Precio"].map(lambda x: format_price(float(x)))
+                show_scr["Cambio %"]  = show_scr["Cambio %"].map(lambda x: f"{float(x):+.2f}%" if not math.isnan(x) else "—")
+                show_scr["$ Vol (M)"] = show_scr["$ Vol (M)"].map(lambda x: f"${float(x):,.0f}M")
+                show_scr["RSI"]       = show_scr["RSI"].map(lambda x: f"{float(x):.1f}" if not math.isnan(x) else "—")
+                show_scr["ADX"]       = show_scr["ADX"].map(lambda x: f"{float(x):.1f}")
+                show_scr["Score"]     = show_scr["Score"].map(lambda x: f"{float(x):+.0f}")
+
+                st.dataframe(show_scr, use_container_width=True, hide_index=True)
+                st.caption("Ordenado por Score descendente. Haz clic en un ticker para analizarlo en la terminal principal.")
 
     with t_radar:
         st.markdown("### Radar multi-activo")
