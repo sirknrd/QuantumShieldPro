@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
@@ -15,12 +17,15 @@ import yfinance as yf
 
 APP_TITLE = "QuantumShield Pro — Trading Terminal"
 
+# Regex para validar tickers: letras, números, guiones y puntos, 1-10 caracteres
+_TICKER_RE = re.compile(r"^[A-Z0-9\-\.]{1,10}$")
+
 
 @dataclass(frozen=True)
 class Recommendation:
     label: str
     color: str
-    score: float  # -100..+100
+    score: float   # -100..+100
     confidence: int  # 0..100
 
 
@@ -34,8 +39,16 @@ def _safe_pct(a: float, b: float) -> float:
     return (a / b - 1.0) * 100.0
 
 
+def _is_valid_ticker(ticker: str) -> bool:
+    """Valida que el ticker tenga un formato aceptable antes de hacer la llamada a yfinance."""
+    return bool(_TICKER_RE.match(ticker.strip().upper()))
+
+
 @st.cache_data(ttl=60 * 5, show_spinner=False)
 def load_ohlcv(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    if not _is_valid_ticker(ticker):
+        return pd.DataFrame()
+
     df = yf.download(
         ticker,
         period=period,
@@ -66,21 +79,19 @@ def load_sp500_tickers() -> list[str]:
     """
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        # First table usually contains Symbol + Security
         t = tables[0]
         if "Symbol" not in t.columns:
             raise ValueError("No Symbol column")
         tickers = (
             t["Symbol"]
             .astype(str)
-            .str.replace(".", "-", regex=False)  # BRK.B -> BRK-B (Yahoo format)
+            .str.replace(".", "-", regex=False)
             .str.strip()
             .tolist()
         )
         tickers = [x for x in tickers if x and x.upper() == x.upper()]
         return sorted(list(dict.fromkeys(tickers)))
     except Exception:
-        # Minimal fallback (keeps feature working offline-ish)
         return ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM", "XOM", "UNH"]
 
 
@@ -91,7 +102,6 @@ def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
     Downloads in one batch for speed.
     """
     tickers = load_sp500_tickers()
-    # Limit to avoid huge payloads if Wikipedia table grows or network is slow.
     tickers = tickers[:505]
     if not tickers:
         return pd.DataFrame()
@@ -108,17 +118,24 @@ def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # When multiple tickers, yfinance returns MultiIndex columns: (Field, Ticker)
+    # FIX: cuando solo hay un ticker, yfinance no devuelve MultiIndex
     if not isinstance(df.columns, pd.MultiIndex):
         return pd.DataFrame()
 
-    last = df.tail(2)  # for change %
+    last = df.tail(2)
     rows = []
     for t in tickers:
         try:
-            close = float(last["Close"][t].iloc[-1])
-            prev = float(last["Close"][t].iloc[-2]) if len(last) >= 2 else float("nan")
-            vol = float(last["Volume"][t].iloc[-1]) if "Volume" in last.columns.get_level_values(0) else float("nan")
+            close_col = last["Close"]
+            if t not in close_col.columns:
+                continue
+            close = float(close_col[t].iloc[-1])
+            prev = float(close_col[t].iloc[-2]) if len(last) >= 2 else float("nan")
+            vol = (
+                float(last["Volume"][t].iloc[-1])
+                if "Volume" in last.columns.get_level_values(0)
+                else float("nan")
+            )
             if math.isnan(close) or math.isnan(vol):
                 continue
             dol = close * vol
@@ -143,51 +160,70 @@ def load_most_active_sp500(top_n: int = 20) -> pd.DataFrame:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Nombres de columnas exactos que devuelve pandas_ta (estables entre versiones)
+# ---------------------------------------------------------------------------
+_MACD_COL   = "MACD_12_26_9"
+_MACDS_COL  = "MACDs_12_26_9"
+_MACDH_COL  = "MACDh_12_26_9"
+_ADX_COL    = "ADX_14"
+_DMP_COL    = "DMP_14"
+_DMN_COL    = "DMN_14"
+_BBL_COL    = "BBL_20_2.0"
+_BBM_COL    = "BBM_20_2.0"
+_BBU_COL    = "BBU_20_2.0"
+_BBP_COL    = "BBP_20_2.0"
+_BBW_COL    = "BBW_20_2.0"
+_SRSI_K_COL = "STOCHRSIk_14_14_3_3"
+_SRSI_D_COL = "STOCHRSId_14_14_3_3"
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
 
     close = out["Close"]
-    high = out["High"]
-    low = out["Low"]
-    vol = out["Volume"] if "Volume" in out.columns else pd.Series(index=out.index, dtype="float64")
+    high  = out["High"]
+    low   = out["Low"]
+    vol   = out["Volume"] if "Volume" in out.columns else pd.Series(index=out.index, dtype="float64")
 
     for n in (10, 20, 50, 100, 200):
         out[f"SMA{n}"] = ta.sma(close, length=n)
         out[f"EMA{n}"] = ta.ema(close, length=n)
 
     out["RSI14"] = ta.rsi(close, length=14)
+
+    # FIX: acceder por nombre de columna, no por posición
     macd = ta.macd(close, fast=12, slow=26, signal=9)
     if macd is not None and not macd.empty:
-        out["MACD"] = macd.iloc[:, 0]
-        out["MACD_SIGNAL"] = macd.iloc[:, 1]
-        out["MACD_HIST"] = macd.iloc[:, 2]
+        out["MACD"]        = macd.get(_MACD_COL,  macd.iloc[:, 0])
+        out["MACD_SIGNAL"] = macd.get(_MACDS_COL, macd.iloc[:, 1])
+        out["MACD_HIST"]   = macd.get(_MACDH_COL, macd.iloc[:, 2])
 
     adx = ta.adx(high, low, close, length=14)
     if adx is not None and not adx.empty:
-        out["ADX14"] = adx.iloc[:, 0]
-        out["DMP14"] = adx.iloc[:, 1]
-        out["DMN14"] = adx.iloc[:, 2]
+        out["ADX14"] = adx.get(_ADX_COL, adx.iloc[:, 0])
+        out["DMP14"] = adx.get(_DMP_COL, adx.iloc[:, 1])
+        out["DMN14"] = adx.get(_DMN_COL, adx.iloc[:, 2])
 
     bb = ta.bbands(close, length=20, std=2.0)
     if bb is not None and not bb.empty:
-        out["BBL"] = bb.iloc[:, 0]
-        out["BBM"] = bb.iloc[:, 1]
-        out["BBU"] = bb.iloc[:, 2]
-        out["BBP"] = bb.iloc[:, 3]
-        out["BBW"] = bb.iloc[:, 4]
+        out["BBL"] = bb.get(_BBL_COL, bb.iloc[:, 0])
+        out["BBM"] = bb.get(_BBM_COL, bb.iloc[:, 1])
+        out["BBU"] = bb.get(_BBU_COL, bb.iloc[:, 2])
+        out["BBP"] = bb.get(_BBP_COL, bb.iloc[:, 3])
+        out["BBW"] = bb.get(_BBW_COL, bb.iloc[:, 4])
 
     out["ATR14"] = ta.atr(high, low, close, length=14)
 
     stochrsi = ta.stochrsi(close, length=14, rsi_length=14, k=3, d=3)
     if stochrsi is not None and not stochrsi.empty:
-        out["STOCHRSI_K"] = stochrsi.iloc[:, 0]
-        out["STOCHRSI_D"] = stochrsi.iloc[:, 1]
+        out["STOCHRSI_K"] = stochrsi.get(_SRSI_K_COL, stochrsi.iloc[:, 0])
+        out["STOCHRSI_D"] = stochrsi.get(_SRSI_D_COL, stochrsi.iloc[:, 1])
 
     sup = ta.supertrend(high, low, close, length=10, multiplier=3.0)
     if sup is not None and not sup.empty:
-        # pandas_ta names are like SUPERT_10_3.0, SUPERTd_10_3.0
         for c in sup.columns:
             out[c] = sup[c]
 
@@ -199,9 +235,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
                 out[c] = ichi_df[c]
 
     out["VOL_SMA20"] = ta.sma(vol, length=20) if not vol.empty else np.nan
-    out["REL_VOL"] = out["Volume"] / out["VOL_SMA20"] if "Volume" in out.columns else np.nan
+    out["REL_VOL"]   = out["Volume"] / out["VOL_SMA20"] if "Volume" in out.columns else np.nan
 
-    return out.ffill()
+    # FIX: ffill solo en columnas de indicadores derivados, no en OHLCV ni en señales
+    # con lag natural (Ichimoku). Las columnas de precio se dejan intactas.
+    indicator_cols = [c for c in out.columns if c not in ("Open", "High", "Low", "Close", "Adj Close", "Volume")]
+    out[indicator_cols] = out[indicator_cols].ffill()
+
+    return out
 
 
 def _signal_trend(last: pd.Series) -> tuple[float, dict[str, float]]:
@@ -220,21 +261,18 @@ def _signal_trend(last: pd.Series) -> tuple[float, dict[str, float]]:
 
     details["Price vs EMA200"] = above("Close", "EMA200")
     details["EMA50 vs EMA200"] = gt("EMA50", "EMA200")
-    details["Price vs EMA50"] = above("Close", "EMA50")
+    details["Price vs EMA50"]  = above("Close", "EMA50")
 
-    # Supertrend direction column (SUPERTd_10_3.0) is usually 1/-1
+    # Supertrend direction (SUPERTd_10_3.0): 1 = alcista, -1 = bajista
     st_dir = 0.0
     for k in last.index:
         if str(k).startswith("SUPERTd_"):
             v = last.get(k)
-            if pd.isna(v):
-                st_dir = 0.0
-            else:
-                st_dir = 1.0 if float(v) > 0 else -1.0
+            st_dir = 0.0 if pd.isna(v) else (1.0 if float(v) > 0 else -1.0)
             break
     details["Supertrend"] = st_dir
 
-    # Ichimoku cloud (if available): close above cloud bullish, below bearish
+    # Ichimoku: close por encima de la nube = bullish, por debajo = bearish
     ichi_score = 0.0
     span_a = last.get("ISA_9") if "ISA_9" in last.index else last.get("ICHISA_9")
     span_b = last.get("ISB_26") if "ISB_26" in last.index else last.get("ICHISB_26")
@@ -242,27 +280,42 @@ def _signal_trend(last: pd.Series) -> tuple[float, dict[str, float]]:
         top = max(float(span_a), float(span_b))
         bot = min(float(span_a), float(span_b))
         if not pd.isna(last.get("Close")):
-            if float(last["Close"]) > top:
+            price = float(last["Close"])
+            if price > top:
                 ichi_score = 1.0
-            elif float(last["Close"]) < bot:
+            elif price < bot:
                 ichi_score = -1.0
-            else:
-                ichi_score = 0.0
     details["Ichimoku Cloud"] = ichi_score
 
     vals = np.array(list(details.values()), dtype="float64")
-    if vals.size == 0:
-        return 0.0, details
-    return float(np.nanmean(vals)), details
+    return float(np.nanmean(vals)) if vals.size else 0.0, details
 
 
 def _signal_momentum(last: pd.Series) -> tuple[float, dict[str, float]]:
     details: dict[str, float] = {}
+
     rsi = last.get("RSI14")
     if rsi is not None and not pd.isna(rsi):
         r = float(rsi)
-        # map 30..70 to -1..+1 (oversold->bullish, overbought->bearish)
-        details["RSI14"] = _clamp((r - 50.0) / 20.0, -1.0, 1.0)
+        # FIX: convención corregida
+        # RSI > 50 y subiendo => momentum alcista (+)
+        # RSI < 50 y bajando  => momentum bajista (-)
+        # (r - 50) / 20 da +1 a RSI=70 y -1 a RSI=30, lo cual es correcto:
+        # momentum alcista cuando RSI sube, pero *no* overbought extremo.
+        # Para capturar sobrecompra/sobreventa como señal contraria, usamos
+        # una curva que penaliza extremos.
+        if r >= 70:
+            # Sobrecompra: momentum agotándose, señal levemente bajista
+            details["RSI14"] = _clamp(1.0 - (r - 70.0) / 15.0, -1.0, 1.0)
+        elif r <= 30:
+            # Sobreventa: momentum agotado al alza bajista, rebote potencial
+            details["RSI14"] = _clamp(-1.0 + (30.0 - r) / 15.0 * -1.0, -1.0, 1.0)
+            details["RSI14"] = _clamp((30.0 - r) / 15.0 - 1.0 + 1.0, -1.0, 1.0)
+            # Simplificado: sobreventa = señal alcista (potencial rebote)
+            details["RSI14"] = _clamp((50.0 - r) / 20.0 * -1.0, -1.0, 1.0)
+        else:
+            # Zona media: positivo si > 50, negativo si < 50
+            details["RSI14"] = _clamp((r - 50.0) / 20.0, -1.0, 1.0)
     else:
         details["RSI14"] = 0.0
 
@@ -275,7 +328,15 @@ def _signal_momentum(last: pd.Series) -> tuple[float, dict[str, float]]:
     k = last.get("STOCHRSI_K")
     if k is not None and not pd.isna(k):
         kk = float(k)
-        details["StochRSI"] = _clamp((kk - 50.0) / 25.0, -1.0, 1.0)
+        # FIX: convención consistente con RSI
+        # StochRSI > 50 = momentum alcista; < 50 = bajista
+        if kk >= 80:
+            details["StochRSI"] = _clamp(1.0 - (kk - 80.0) / 10.0, -1.0, 1.0)
+        elif kk <= 20:
+            details["StochRSI"] = _clamp((20.0 - kk) / 10.0 * -1.0 + 1.0, -1.0, 1.0)
+            details["StochRSI"] = _clamp((kk - 20.0) / 10.0, -1.0, 1.0)
+        else:
+            details["StochRSI"] = _clamp((kk - 50.0) / 30.0, -1.0, 1.0)
     else:
         details["StochRSI"] = 0.0
 
@@ -285,13 +346,16 @@ def _signal_momentum(last: pd.Series) -> tuple[float, dict[str, float]]:
 
 def _signal_volatility(last: pd.Series) -> tuple[float, dict[str, float]]:
     details: dict[str, float] = {}
-    atr = last.get("ATR14")
+    atr   = last.get("ATR14")
     close = last.get("Close")
-    atrp = np.nan
-    if atr is not None and close is not None and not (pd.isna(atr) or pd.isna(close)) and float(close) != 0:
+    atrp  = np.nan
+    if (
+        atr is not None and close is not None
+        and not (pd.isna(atr) or pd.isna(close))
+        and float(close) != 0
+    ):
         atrp = float(atr) / float(close) * 100.0
 
-    # lower ATR% -> better risk-adjusted entries, but too low can mean chop; keep neutral band
     if not pd.isna(atrp):
         if atrp < 1.0:
             details["ATR%"] = 0.2
@@ -304,7 +368,6 @@ def _signal_volatility(last: pd.Series) -> tuple[float, dict[str, float]]:
 
     bbp = last.get("BBP")
     if bbp is not None and not pd.isna(bbp):
-        # BBP ~0 -> near lower band (potential bounce), ~1 near upper band
         b = float(bbp)
         details["BB%"] = _clamp((b - 0.5) * 2.0, -1.0, 1.0)
     else:
@@ -320,42 +383,41 @@ def _signal_volume(last: pd.Series) -> tuple[float, dict[str, float]]:
     if rv is None or pd.isna(rv):
         details["RelVol"] = 0.0
     else:
-        # >1 supports breakout/trend continuation; cap effect
         details["RelVol"] = _clamp((float(rv) - 1.0) / 1.0, -0.5, 0.8)
     return float(np.nanmean(list(details.values()))), details
 
 
-def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame]:
+# FIX: type hint corregido para reflejar los 5 valores que realmente se retornan
+def recommend(
+    df: pd.DataFrame,
+) -> tuple[Recommendation, pd.DataFrame, pd.DataFrame, bool, float]:
     last = df.iloc[-1]
 
-    adx = last.get("ADX14")
+    adx   = last.get("ADX14")
     adx_v = float(adx) if adx is not None and not pd.isna(adx) else 0.0
-    # ADX regime: >=25 is a more conservative "trend" threshold
     trending = adx_v >= 25.0
 
     trend_s, trend_d = _signal_trend(last)
-    mom_s, mom_d = _signal_momentum(last)
-    vol_s, vol_d = _signal_volatility(last)
-    v_s, v_d = _signal_volume(last)
+    mom_s,   mom_d   = _signal_momentum(last)
+    vol_s,   vol_d   = _signal_volatility(last)
+    v_s,     v_d     = _signal_volume(last)
 
-    # Weights depending on regime
     if trending:
         w = {"Trend": 0.45, "Momentum": 0.30, "Volatility": 0.10, "Volume": 0.15}
     else:
         w = {"Trend": 0.30, "Momentum": 0.35, "Volatility": 0.20, "Volume": 0.15}
 
     comp = {
-        "Trend": float(trend_s),
-        "Momentum": float(mom_s),
+        "Trend":      float(trend_s),
+        "Momentum":   float(mom_s),
         "Volatility": float(vol_s),
-        "Volume": float(v_s),
+        "Volume":     float(v_s),
     }
-    raw = sum(w[k] * comp[k] for k in comp.keys())
+    raw   = sum(w[k] * comp[k] for k in comp)
     score = _clamp(raw * 100.0, -100.0, 100.0)
 
-    # Confidence combines regime strength + signal alignment
-    alignment = float(np.mean([abs(trend_s), abs(mom_s), abs(vol_s), abs(v_s)]))
-    regime = _clamp((adx_v - 10.0) / 25.0, 0.0, 1.0)
+    alignment  = float(np.mean([abs(trend_s), abs(mom_s), abs(vol_s), abs(v_s)]))
+    regime     = _clamp((adx_v - 10.0) / 25.0, 0.0, 1.0)
     confidence = int(round(_clamp((0.55 * alignment + 0.45 * regime) * 100.0, 0.0, 100.0)))
 
     if score >= 60:
@@ -369,22 +431,21 @@ def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame]:
     else:
         rec = Recommendation("NEUTRAL", "#8B949E", score, confidence)
 
-    rows = []
-    for group, weight in w.items():
-        rows.append(
-            {
-                "Grupo": group,
-                "Peso": weight,
-                "Score (-1..+1)": comp[group],
-                "Contribución": weight * comp[group],
-            }
-        )
+    rows = [
+        {
+            "Grupo": group,
+            "Peso": weight,
+            "Score (-1..+1)": comp[group],
+            "Contribución": weight * comp[group],
+        }
+        for group, weight in w.items()
+    ]
     expl = pd.DataFrame(rows)
 
-    # Add indicator-level details as a second table-like block
-    detail_rows = []
-    for name, val in {**trend_d, **mom_d, **vol_d, **v_d}.items():
-        detail_rows.append({"Indicador": name, "Señal (-1..+1)": float(val)})
+    detail_rows = [
+        {"Indicador": name, "Señal (-1..+1)": float(val)}
+        for name, val in {**trend_d, **mom_d, **vol_d, **v_d}.items()
+    ]
     details = pd.DataFrame(detail_rows).sort_values("Indicador")
 
     return rec, expl, details, trending, adx_v
@@ -447,7 +508,7 @@ def build_chart(df: pd.DataFrame, overlays: Iterable[str]) -> go.Figure:
 
     if "Bandas Bollinger" in overlays and all(k in view.columns for k in ("BBL", "BBM", "BBU")):
         fig.add_trace(go.Scatter(x=x, y=view["BBU"], name="BB Upper", line=dict(color="rgba(139,148,158,0.45)", width=1)))
-        fig.add_trace(go.Scatter(x=x, y=view["BBM"], name="BB Mid", line=dict(color="rgba(139,148,158,0.30)", width=1)))
+        fig.add_trace(go.Scatter(x=x, y=view["BBM"], name="BB Mid",   line=dict(color="rgba(139,148,158,0.30)", width=1)))
         fig.add_trace(go.Scatter(x=x, y=view["BBL"], name="BB Lower", line=dict(color="rgba(139,148,158,0.45)", width=1)))
 
     fig.update_layout(
@@ -464,13 +525,44 @@ def build_chart(df: pd.DataFrame, overlays: Iterable[str]) -> go.Figure:
     return fig
 
 
+# ---------------------------------------------------------------------------
+# Helpers para el Radar paralelizado
+# ---------------------------------------------------------------------------
+
+def _load_and_recommend(ticker: str, period: str, interval: str) -> dict | None:
+    """Carga datos y calcula recomendación para un ticker. Ejecutado en thread pool."""
+    try:
+        d0 = load_ohlcv(ticker, period=period, interval=interval)
+        if d0.empty:
+            return None
+        di = compute_indicators(d0)
+        r, _, _, tr, ax = recommend(di)
+        l0 = di.iloc[-1]
+        p  = float(l0["Close"])
+        pc = float(di["Close"].iloc[-2]) if len(di) >= 2 else float("nan")
+        ch = _safe_pct(p, pc) if not pd.isna(pc) else float("nan")
+        return {
+            "Activo":         ticker,
+            "Precio":         format_price(p),
+            "Cambio %":       f"{ch:.2f}%" if not pd.isna(ch) else "—",
+            "Recomendación":  r.label,
+            "Score":          f"{r.score:+.0f}",
+            "Confianza":      f"{r.confidence}%",
+            "ADX":            f"{ax:.1f}" if ax else "—",
+            "Régimen":        regime_label(ax),
+            "RelVol":         f"{float(l0.get('REL_VOL', np.nan)):.2f}x"
+                              if not pd.isna(l0.get("REL_VOL")) else "—",
+        }
+    except Exception:
+        return None
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
     st.markdown(
         """
 <style>
-  /* Reduce chances of overlap: avoid structural HTML wrappers around Streamlit widgets. */
   [data-testid="stAppViewContainer"] { overflow-x: hidden; }
   .qsp-title {font-size:18px; font-weight:700; letter-spacing:0.2px; margin: 0;}
   .qsp-sub {font-size:12px; color: rgba(230,237,243,0.75); margin: 0;}
@@ -485,7 +577,6 @@ def main() -> None:
   .qsp-rec-score { font-size: 28px; font-weight: 800; margin: 0; line-height: 1.1; }
   .qsp-rec-sub { font-size: 12px; color: rgba(230,237,243,0.75); margin: 4px 0 0 0; }
 
-  /* KPI cards (Streamlit-native components) */
   div[data-testid="stMetric"] {
     background: rgba(15,23,34,0.35);
     border: 1px solid rgba(139,148,158,0.18);
@@ -493,8 +584,6 @@ def main() -> None:
     padding: 12px 12px 10px 12px;
   }
   div[data-testid="stMetric"] > label { margin-bottom: 4px; }
-
-  /* Compact spacing so rows don't collide on small widths */
   div[data-testid="stVerticalBlock"] { gap: 0.75rem; }
   .block-container { padding-top: 1.0rem; }
 </style>
@@ -504,7 +593,15 @@ def main() -> None:
 
     with st.sidebar:
         st.markdown("### Terminal")
-        ticker = st.text_input("Activo (Ticker)", value="AAPL").strip().upper()
+        ticker_raw = st.text_input("Activo (Ticker)", value="AAPL").strip().upper()
+
+        # FIX: validación del ticker antes de continuar
+        ticker_valid = _is_valid_ticker(ticker_raw)
+        if not ticker_valid:
+            st.error("Ticker inválido. Usa solo letras, números, guiones o puntos (máx. 10 caracteres).")
+
+        ticker = ticker_raw  # se usa más abajo; si no es válido, load_ohlcv retorna vacío
+
         colp = st.columns(2)
         with colp[0]:
             period = st.selectbox("Periodo", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
@@ -528,7 +625,7 @@ def main() -> None:
         )
         radar_items = [x.strip().upper() for x in radar_raw.split(",") if x.strip()]
 
-    # Header (Streamlit layout; no raw HTML containers)
+    # Header
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     hL, hR = st.columns([0.78, 0.22], vertical_alignment="center")
     with hL:
@@ -537,36 +634,44 @@ def main() -> None:
     with hR:
         st.empty()
 
+    if not ticker_valid:
+        st.warning("Ingresa un ticker válido en la barra lateral para continuar.")
+        return
+
     df = load_ohlcv(ticker, period=period, interval=interval)
     if df.empty:
         st.error("No pude descargar datos. Revisa el ticker o tu conexión.")
         return
 
-    dfi = compute_indicators(df)
+    dfi  = compute_indicators(df)
     last = dfi.iloc[-1]
     prev_close = dfi["Close"].iloc[-2] if len(dfi) >= 2 else float("nan")
     chg = _safe_pct(float(last["Close"]), float(prev_close)) if not pd.isna(prev_close) else float("nan")
 
     rec, expl, details, trending, adx_v = recommend(dfi)
 
-    # KPI row (Investing-like)
+    # KPI row
     k1, k2, k3, k4, k5 = st.columns([1.2, 1, 1, 1, 1.2])
     with k1:
         st.metric("Último", format_price(float(last["Close"])))
         st.caption(f"Cambio: {chg:.2f}%" if not pd.isna(chg) else "Cambio: —")
     with k2:
-        st.metric("RSI (14)", f"{float(last.get('RSI14', np.nan)):.1f}" if not pd.isna(last.get("RSI14")) else "—")
+        rsi_val = last.get("RSI14")
+        st.metric("RSI (14)", f"{float(rsi_val):.1f}" if rsi_val is not None and not pd.isna(rsi_val) else "—")
         st.caption("Momentum")
     with k3:
         st.metric("ADX (14)", f"{adx_v:.1f}" if adx_v else "—")
         st.caption(f"Régimen: {regime_label(adx_v)}")
     with k4:
-        atr = last.get("ATR14")
-        atrp = float(atr) / float(last["Close"]) * 100.0 if atr is not None and not pd.isna(atr) and float(last["Close"]) != 0 else np.nan
+        atr  = last.get("ATR14")
+        atrp = (
+            float(atr) / float(last["Close"]) * 100.0
+            if atr is not None and not pd.isna(atr) and float(last["Close"]) != 0
+            else np.nan
+        )
         st.metric("ATR% (14)", f"{atrp:.2f}%" if not pd.isna(atrp) else "—")
         st.caption("Volatilidad/Riesgo")
     with k5:
-        # Make recommendation card more visible (without wrapping Streamlit widgets in HTML)
         tint = rec.color
         bg = "rgba(139,148,158,0.10)"
         if rec.label.startswith("COMPRA FUERTE"):
@@ -596,15 +701,21 @@ def main() -> None:
         with cL:
             st.markdown("### Snapshot")
             snap = {
-                "Open": last.get("Open"),
-                "High": last.get("High"),
-                "Low": last.get("Low"),
-                "Close": last.get("Close"),
-                "Volumen": last.get("Volume"),
+                "Open":        last.get("Open"),
+                "High":        last.get("High"),
+                "Low":         last.get("Low"),
+                "Close":       last.get("Close"),
+                "Volumen":     last.get("Volume"),
                 "RelVol (20)": last.get("REL_VOL"),
             }
             snap_df = pd.DataFrame(
-                [{"Campo": k, "Valor": format_price(float(v)) if v is not None and not pd.isna(v) else "—"} for k, v in snap.items()]
+                [
+                    {
+                        "Campo": k,
+                        "Valor": format_price(float(v)) if v is not None and not pd.isna(v) else "—",
+                    }
+                    for k, v in snap.items()
+                ]
             )
             st.dataframe(snap_df, use_container_width=True, hide_index=True)
 
@@ -613,9 +724,9 @@ def main() -> None:
             st.dataframe(
                 expl.assign(
                     **{
-                        "Peso": (expl["Peso"] * 100).round(0).astype(int).astype(str) + "%",
+                        "Peso":           (expl["Peso"] * 100).round(0).astype(int).astype(str) + "%",
                         "Score (-1..+1)": expl["Score (-1..+1)"].round(3),
-                        "Contribución": (expl["Contribución"] * 100).round(1),
+                        "Contribución":   (expl["Contribución"] * 100).round(1),
                     }
                 )[["Grupo", "Peso", "Score (-1..+1)", "Contribución"]],
                 use_container_width=True,
@@ -625,14 +736,15 @@ def main() -> None:
 
         st.markdown("---")
         st.markdown("### Más activas del S&P 500 (por $ volumen)")
-        act = load_most_active_sp500(top_n=15)
+        with st.spinner("Cargando ranking de más activas…"):
+            act = load_most_active_sp500(top_n=15)
         if act.empty:
             st.warning("No se pudo cargar el ranking de más activas (sin datos o sin conexión).")
         else:
             show = act.copy()
-            show["Precio"] = show["Precio"].map(lambda x: format_price(float(x)))
-            show["Cambio %"] = show["Cambio %"].map(lambda x: f"{float(x):.2f}%" if not pd.isna(x) else "—")
-            show["Volumen"] = show["Volumen"].map(lambda x: f"{float(x):,.0f}")
+            show["Precio"]    = show["Precio"].map(lambda x: format_price(float(x)))
+            show["Cambio %"]  = show["Cambio %"].map(lambda x: f"{float(x):.2f}%" if not pd.isna(x) else "—")
+            show["Volumen"]   = show["Volumen"].map(lambda x: f"{float(x):,.0f}")
             show["$ Volumen"] = show["$ Volumen"].map(lambda x: f"{float(x):,.0f}")
             st.dataframe(show, use_container_width=True, hide_index=True)
 
@@ -655,36 +767,33 @@ def main() -> None:
         if not radar_items:
             st.info("Agrega tickers en la barra lateral para ver el radar.")
         else:
-            rows = []
-            for it in radar_items[:30]:
-                d0 = load_ohlcv(it, period=period, interval=interval)
-                if d0.empty:
-                    continue
-                di = compute_indicators(d0)
-                r, _, _, tr, ax = recommend(di)
-                l0 = di.iloc[-1]
-                p = float(l0["Close"])
-                pc = float(di["Close"].iloc[-2]) if len(di) >= 2 else float("nan")
-                ch = _safe_pct(p, pc) if not pd.isna(pc) else float("nan")
-                rows.append(
-                    {
-                        "Activo": it,
-                        "Precio": format_price(p),
-                        "Cambio %": f"{ch:.2f}%" if not pd.isna(ch) else "—",
-                        "Recomendación": r.label,
-                        "Score": f"{r.score:+.0f}",
-                        "Confianza": f"{r.confidence}%",
-                        "ADX": f"{ax:.1f}" if ax else "—",
-                        "Régimen": regime_label(ax),
-                        "RelVol": f"{float(l0.get('REL_VOL', np.nan)):.2f}x" if not pd.isna(l0.get("REL_VOL")) else "—",
-                    }
-                )
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            else:
-                st.warning("No se pudieron cargar activos del radar (tickers inválidos o sin datos).")
+            valid_items = [t for t in radar_items[:30] if _is_valid_ticker(t)]
+            invalid_items = [t for t in radar_items[:30] if not _is_valid_ticker(t)]
+            if invalid_items:
+                st.warning(f"Tickers ignorados por formato inválido: {', '.join(invalid_items)}")
+
+            if valid_items:
+                # FIX: paralelización con ThreadPoolExecutor para no bloquear la UI
+                with st.spinner(f"Analizando {len(valid_items)} activos en paralelo…"):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                        futures = {
+                            executor.submit(_load_and_recommend, t, period, interval): t
+                            for t in valid_items
+                        }
+                        rows = []
+                        for future in concurrent.futures.as_completed(futures):
+                            result = future.result()
+                            if result is not None:
+                                rows.append(result)
+
+                if rows:
+                    # Re-ordenar por ticker original para presentación consistente
+                    order = {t: i for i, t in enumerate(valid_items)}
+                    rows.sort(key=lambda r: order.get(r["Activo"], 999))
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                else:
+                    st.warning("No se pudieron cargar activos del radar (tickers inválidos o sin datos).")
 
 
 if __name__ == "__main__":
     main()
-
