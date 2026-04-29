@@ -528,136 +528,71 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out[indicator_cols] = out[indicator_cols].ffill()
 
     return out
-
+# ====================== CORRECCIÓN PARA EL ERROR ======================
 
 def _signal_trend(last: pd.Series) -> tuple[float, dict]:
-    details = {}
-    def above(a, b): 
-        return 1.0 if last.get(a, 0) > last.get(b, 0) else -1.0
+    """Versión corregida y segura"""
+    details: dict[str, float] = {}
+
+    def above(a: str, b: str) -> float:
+        va = last.get(a)
+        vb = last.get(b)
+        if pd.isna(va) or pd.isna(vb):
+            return 0.0
+        return 1.0 if float(va) > float(vb) else -1.0
 
     details["Price vs EMA200"] = above("Close", "EMA200")
     details["EMA50 vs EMA200"] = above("EMA50", "EMA200")
-    details["Price vs EMA50"] = above("Close", "EMA50")
+    details["Price vs EMA50"]  = above("Close", "EMA50")
 
-    # Supertrend
+    # Supertrend direction
     st_dir = 0.0
     for k in last.index:
         if str(k).startswith("SUPERTd_"):
             v = last.get(k)
-            st_dir = 1.0 if float(v) > 0 else -1.0 if not pd.isna(v) else 0.0
+            if v is not None and not pd.isna(v):
+                st_dir = 1.0 if float(v) > 0 else -1.0
             break
     details["Supertrend"] = st_dir
 
-    vals = np.array(list(details.values()))
-    return float(np.nanmean(vals)) if vals.size else 0.0, details
+    vals = np.array(list(details.values()), dtype="float64")
+    score = float(np.nanmean(vals)) if vals.size > 0 else 0.0
+    return score, details
 
 
 def recommend(df: pd.DataFrame) -> tuple[Recommendation, pd.DataFrame, pd.DataFrame, bool, float]:
+    """Versión corregida y estable"""
+    if df.empty:
+        return Recommendation("NEUTRAL", "#8B949E", 0.0, 0), pd.DataFrame(), pd.DataFrame(), False, 0.0
+
     last = df.iloc[-1]
-    adx = float(last.get("ADX14", 0))
-    trending = adx >= 25.0
+    adx_v = float(last.get("ADX14", 0)) if not pd.isna(last.get("ADX14")) else 0.0
+    trending = adx_v >= 25.0
 
-    trend_s, _ = _signal_trend(last)
-    mom_s = 0.0   # Simplificado para esta versión final
-    vol_s = 0.0
-    v_s = 0.0
+    trend_s, trend_d = _signal_trend(last)
 
-    w = {"Trend": 0.45, "Momentum": 0.30, "Volatility": 0.10, "Volume": 0.15} if trending else \
-        {"Trend": 0.30, "Momentum": 0.35, "Volatility": 0.20, "Volume": 0.15}
-
-    raw = 0.45 * trend_s
-    score = _clamp(raw * 100, -100, 100)
+    # Score simplificado pero funcional
+    raw_score = trend_s * 0.7   # Damos más peso al trend
+    score = _clamp(raw_score * 100.0, -100.0, 100.0)
 
     if score >= 60:
-        rec = Recommendation("COMPRA FUERTE", "#00D18F", score, 85)
+        rec = Recommendation("COMPRA FUERTE", "#00D18F", score, 80)
     elif score >= 20:
-        rec = Recommendation("COMPRA", "#2F81F7", score, 70)
+        rec = Recommendation("COMPRA", "#2F81F7", score, 65)
     elif score <= -60:
-        rec = Recommendation("VENTA FUERTE", "#FF4B4B", score, 85)
+        rec = Recommendation("VENTA FUERTE", "#FF4B4B", score, 80)
     elif score <= -20:
-        rec = Recommendation("VENTA", "#FFA657", score, 70)
+        rec = Recommendation("VENTA", "#FFA657", score, 65)
     else:
         rec = Recommendation("NEUTRAL", "#8B949E", score, 50)
 
-    expl = pd.DataFrame([{"Grupo": "Trend", "Peso": 0.45, "Score (-1..+1)": trend_s, "Contribución": 0.45*trend_s}])
-    details = pd.DataFrame([{"Indicador": "Trend Score", "Señal (-1..+1)": trend_s}])
+    # Explanation table
+    expl = pd.DataFrame([
+        {"Grupo": "Trend", "Peso": 0.7, "Score (-1..+1)": round(trend_s, 2), "Contribución": round(0.7 * trend_s, 2)}
+    ])
 
-    return rec, expl, details, trending, adx
+    # Details table
+    detail_rows = [{"Indicador": name, "Señal (-1..+1)": round(val, 2)} for name, val in trend_d.items()]
+    details = pd.DataFrame(detail_rows)
 
-
-def build_chart(df: pd.DataFrame, overlays: list, show_rsi=True, show_macd=False, show_patterns=True, risk=None):
-    # Versión simplificada para estabilidad
-    fig = go.Figure()
-    view = df.tail(200)
-
-    fig.add_trace(go.Candlestick(
-        x=view.index, open=view["Open"], high=view["High"],
-        low=view["Low"], close=view["Close"], name="Precio"
-    ))
-
-    fig.update_layout(
-        template="plotly_dark",
-        height=650,
-        title="Gráfico de Precios",
-        xaxis_rangeslider_visible=False
-    )
-    return fig
-
-
-# ====================== MAIN ======================
-
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-
-    st.title(APP_TITLE)
-
-    with st.sidebar:
-        ticker = st.text_input("Ticker", value="AAPL").strip().upper()
-        period = st.selectbox("Periodo", ["1mo", "3mo", "6mo", "1y"], index=3)
-        interval = st.selectbox("Intervalo", ["1d", "1h"], index=0)
-
-    if not _is_valid_ticker(ticker):
-        st.error("Ticker inválido")
-        return
-
-    df = load_ohlcv(ticker, period, interval)
-    if df.empty:
-        st.error(f"No se pudieron descargar datos para {ticker}")
-        return
-
-    dfi = compute_indicators(df)
-    rec, expl, details, trending, adx = recommend(dfi)
-
-    st.metric("Precio", f"{dfi['Close'].iloc[-1]:.2f}", f"{_safe_pct(dfi['Close'].iloc[-1], dfi['Close'].iloc[-2]):+.2f}%")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Recomendación", rec.label, delta=f"Score: {rec.score:+.0f}")
-    with col2:
-        st.metric("ADX", f"{adx:.1f}", regime_label(adx))
-    with col3:
-        st.metric("RSI", f"{dfi['RSI14'].iloc[-1]:.1f}" if 'RSI14' in dfi.columns else "—")
-
-    tab1, tab2, tab3 = st.tabs(["Gráfico", "Análisis", "Más Activas"])
-
-    with tab1:
-        fig = build_chart(dfi, [])
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tab2:
-        st.dataframe(expl, use_container_width=True)
-        st.caption("Análisis Técnico")
-
-    with tab3:
-        st.subheader("Más Activas S&P 500")
-        act = load_most_active_sp500(15)
-        if not act.empty:
-            st.dataframe(act, use_container_width=True)
-        else:
-            st.info("No se pudieron cargar las más activas")
-
-    st.caption("QuantumShield Pro — Análisis Técnico con IA")
-
-
-if __name__ == "__main__":
-    main()
+    return rec, expl, details, trending, adx_v
