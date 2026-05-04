@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import re
 from datetime import datetime
 
@@ -17,7 +16,6 @@ st.markdown(f"<h1 style='text-align:center;color:#00D18F;'>{APP_TITLE}</h1>", un
 
 
 def safe_float(x) -> float:
-    """Conversión ultra segura a float"""
     try:
         if x is None or pd.isna(x):
             return 0.0
@@ -76,28 +74,26 @@ def get_recommendation(df: pd.DataFrame) -> dict:
 
     last = df.iloc[-1]
 
-    close   = safe_float(last.get("Close"))
-    ema50   = safe_float(last.get("EMA50"))
-    ema200  = safe_float(last.get("EMA200"))
-    rsi     = safe_float(last.get("RSI14"))
-    adx     = safe_float(last.get("ADX14"))
-    macd_h  = safe_float(last.get("MACD_HIST"))
+    close = safe_float(last.get("Close"))
+    ema50 = safe_float(last.get("EMA50"))
+    ema200 = safe_float(last.get("EMA200"))
+    rsi = safe_float(last.get("RSI14"))
+    adx = safe_float(last.get("ADX14"))
+    macd_h = safe_float(last.get("MACD_HIST"))
 
     score = 0.0
     reasons = []
 
-    # Tendencia
     if close > ema50 and ema50 > 0:
         score += 35
-        reasons.append("Precio > EMA50")
+        reasons.append("Precio sobre EMA50")
     if ema50 > ema200 and ema200 > 0:
         score += 30
-        reasons.append("EMA50 > EMA200")
+        reasons.append("EMA50 sobre EMA200")
     if close > ema200 and ema200 > 0:
         score += 20
-        reasons.append("Precio > EMA200")
+        reasons.append("Precio sobre EMA200")
 
-    # RSI
     if 40 < rsi < 70:
         score += 20
         reasons.append("RSI saludable")
@@ -108,9 +104,8 @@ def get_recommendation(df: pd.DataFrame) -> dict:
         score -= 25
         reasons.append("Sobrecompra")
 
-    # ADX + MACD
     if adx > 25:
-        score += 10 if close > ema50 else -10
+        score += 12 if close > ema50 else -12
         reasons.append(f"Tendencia fuerte (ADX {adx:.1f})")
 
     if macd_h > 0:
@@ -120,15 +115,15 @@ def get_recommendation(df: pd.DataFrame) -> dict:
     score = max(-100, min(100, score))
 
     if score >= 70:
-        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 85, "reason": " • ".join(reasons[:4])}
+        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 85, "reason": " • ".join(reasons[:3])}
     elif score >= 35:
-        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 70, "reason": " • ".join(reasons[:4])}
+        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 70, "reason": " • ".join(reasons[:3])}
     elif score <= -70:
-        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 85, "reason": " • ".join(reasons[:4])}
+        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 85, "reason": " • ".join(reasons[:3])}
     elif score <= -35:
-        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 70, "reason": " • ".join(reasons[:4])}
+        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 70, "reason": " • ".join(reasons[:3])}
     else:
-        return {"label": "NEUTRAL", "color": "#8B949E", "score": int(score), "confidence": 50, "reason": "Mercado lateral"}
+        return {"label": "NEUTRAL", "color": "#8B949E", "score": int(score), "confidence": 50, "reason": "Mercado sin tendencia clara"}
 
 
 def main():
@@ -141,7 +136,7 @@ def main():
 
     if df.empty:
         st.error(f"❌ No se pudieron descargar datos para **{ticker}**")
-        st.info("Prueba con AAPL, MSFT, NVDA o TSLA")
+        st.info("Prueba con: AAPL, MSFT, NVDA, TSLA")
         return
 
     dfi = compute_indicators(df)
@@ -152,10 +147,10 @@ def main():
     change = (last_price / prev_price - 1) * 100 if prev_price != 0 else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Precio", f"${last_price:,.2f}", f"{change:+.2f}%")
+    c1.metric("Precio Actual", f"${last_price:,.2f}", f"{change:+.2f}%")
     c2.metric("Señal", rec["label"])
-    c3.metric("RSI 14", f"{safe_float(dfi.get('RSI14', [50]))[-1]:.1f}")
-    c4.metric("ADX 14", f"{safe_float(dfi.get('ADX14', [20]))[-1]:.1f}")
+    c3.metric("RSI 14", f"{safe_float(dfi['RSI14'].iloc[-1] if 'RSI14' in dfi.columns else 50):.1f}")
+    c4.metric("ADX 14", f"{safe_float(dfi['ADX14'].iloc[-1] if 'ADX14' in dfi.columns else 20):.1f}")
 
     st.subheader(f"📈 {ticker}")
     fig = go.Figure()
@@ -168,7 +163,7 @@ def main():
 
     st.subheader("📊 Recomendación Final")
     st.markdown(f"<h2 style='color:{rec['color']}; text-align:center;'>{rec['label']}</h2>", unsafe_allow_html=True)
-    st.metric("Score", f"{rec['score']}/100", f"Confianza {rec['confidence']}%")
+    st.metric("Score", f"{rec['score']}/100", f"Confianza: {rec['confidence']}%")
     st.info(rec["reason"])
 
 
