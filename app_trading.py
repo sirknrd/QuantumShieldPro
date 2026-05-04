@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-import numpy as np
 import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
@@ -27,51 +26,56 @@ def _is_valid_ticker(ticker: str) -> bool:
     return bool(re.match(r"^[A-Z0-9\-\.]{1,10}$", ticker.strip().upper()))
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=180)
 def load_ohlcv(ticker: str, period: str = "6mo") -> pd.DataFrame:
     if not _is_valid_ticker(ticker):
         return pd.DataFrame()
+    
     try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+        # Mejor método de descarga
+        df = yf.download(ticker, period=period, progress=False, auto_adjust=False, prepost=False)
+        if df.empty:
+            # Intento alternativo
+            df = yf.Ticker(ticker).history(period=period)
+        
         if df.empty:
             return pd.DataFrame()
-        return df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    except:
+
+        # Asegurar columnas correctas
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        return df
+    except Exception:
         return pd.DataFrame()
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 30:
         return df
+    
     out = df.copy()
     close = out["Close"]
     high = out["High"]
     low = out["Low"]
     vol = out["Volume"]
 
-    for n in [9, 21, 50, 100, 200]:
+    # EMAs
+    for n in [9, 21, 50, 200]:
         out[f"EMA{n}"] = ta.ema(close, length=n)
 
     out["RSI14"] = ta.rsi(close, length=14)
-    
-    adx_df = ta.adx(high, low, close)
-    if adx_df is not None:
-        out["ADX14"] = adx_df.iloc[:, 0]
+
+    adx = ta.adx(high, low, close)
+    if adx is not None:
+        out["ADX14"] = adx.iloc[:, 0]
 
     macd = ta.macd(close)
     if macd is not None and not macd.empty:
         out["MACD_HIST"] = macd.iloc[:, 2]
 
-    bb = ta.bbands(close)
-    if bb is not None and not bb.empty:
-        out["BBP"] = bb.iloc[:, 3]
-
-    out["ATR14"] = ta.atr(high, low, close, length=14)
-
     # Volumen Relativo seguro
     vol_sma = ta.sma(vol, length=20)
     if vol_sma is not None:
-        out["REL_VOL"] = vol / vol_sma.replace(0, np.nan)
+        out["REL_VOL"] = vol / vol_sma.where(vol_sma > 0)
 
     return out.ffill()
 
@@ -87,15 +91,14 @@ def get_recommendation(df: pd.DataFrame) -> dict:
     ema200 = safe_float(last.get("EMA200"))
     rsi = safe_float(last.get("RSI14"))
     adx = safe_float(last.get("ADX14"))
-    macd_hist = safe_float(last.get("MACD_HIST"))
 
     score = 0.0
     reasons = []
 
-    if close > ema50 > ema200:
+    if close > ema50 and ema50 > ema200:
         score += 45
         reasons.append("Tendencia Alcista Fuerte")
-    elif close < ema50 < ema200:
+    elif close < ema50 and ema50 < ema200:
         score -= 45
         reasons.append("Tendencia Bajista Fuerte")
 
@@ -109,33 +112,32 @@ def get_recommendation(df: pd.DataFrame) -> dict:
 
     if adx > 25:
         score += 15 if close > ema50 else -15
-    if macd_hist > 0:
-        score += 12
 
     score = max(-100, min(100, score))
 
     if score >= 65:
-        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 82, "reason": " • ".join(reasons[:4])}
+        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 82, "reason": " • ".join(reasons)}
     elif score >= 30:
-        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 68, "reason": " • ".join(reasons[:4])}
+        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 68, "reason": " • ".join(reasons)}
     elif score <= -65:
-        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 82, "reason": " • ".join(reasons[:4])}
+        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 82, "reason": " • ".join(reasons)}
     elif score <= -30:
-        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 68, "reason": " • ".join(reasons[:4])}
+        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 68, "reason": " • ".join(reasons)}
     else:
-        return {"label": "NEUTRAL", "color": "#8B949E", "score": int(score), "confidence": 55, "reason": "Sin tendencia clara"}
+        return {"label": "NEUTRAL", "color": "#8B949E", "score": int(score), "confidence": 55, "reason": "Mercado sin tendencia clara"}
 
 
 def main():
     with st.sidebar:
         st.header("🔍 Terminal")
-        ticker = st.text_input("Ticker", value="AAPL").strip().upper()
+        ticker = st.text_input("Ticker", value="NVDA").strip().upper()
         period = st.selectbox("Periodo", ["3mo", "6mo", "1y"], index=1)
 
     df = load_ohlcv(ticker, period)
 
     if df.empty:
         st.error(f"❌ No se pudieron descargar datos para **{ticker}**")
+        st.info("Prueba con NVDA, AAPL, TSLA o MSFT")
         return
 
     dfi = compute_indicators(df)
@@ -143,7 +145,7 @@ def main():
 
     last_price = safe_float(dfi["Close"].iloc[-1])
     prev_price = safe_float(dfi["Close"].iloc[-2]) if len(dfi) > 1 else last_price
-    change = ((last_price / prev_price - 1) * 100) if prev_price != 0 else 0.0
+    change = ((last_price / prev_price - 1) * 100) if prev_price > 0 else 0.0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Precio", f"${last_price:,.2f}", f"{change:+.2f}%")
@@ -157,7 +159,7 @@ def main():
 
     for ema in ["EMA9", "EMA21", "EMA50", "EMA200"]:
         if ema in dfi.columns:
-            fig.add_trace(go.Scatter(x=dfi.index, y=dfi[ema], name=ema))
+            fig.add_trace(go.Scatter(x=dfi.index, y=dfi[ema], name=ema, line=dict(width=2)))
 
     fig.update_layout(template="plotly_dark", height=700, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
