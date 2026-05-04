@@ -16,6 +16,16 @@ APP_TITLE = "QuantumShield Pro — Trading Terminal"
 st.markdown(f"<h1 style='text-align:center;color:#00D18F;'>{APP_TITLE}</h1>", unsafe_allow_html=True)
 
 
+def safe_float(x) -> float:
+    """Conversión ultra segura a float"""
+    try:
+        if x is None or pd.isna(x):
+            return 0.0
+        return float(x)
+    except:
+        return 0.0
+
+
 def _is_valid_ticker(ticker: str) -> bool:
     return bool(re.match(r"^[A-Z0-9\-\.]{1,10}$", ticker.strip().upper()))
 
@@ -61,96 +71,91 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_recommendation(df: pd.DataFrame) -> dict:
-    if df.empty or len(df) < 40:
+    if df.empty or len(df) < 30:
         return {"label": "NEUTRAL", "color": "#8B949E", "score": 0, "confidence": 40, "reason": "Datos insuficientes"}
 
     last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else last
+
+    close   = safe_float(last.get("Close"))
+    ema50   = safe_float(last.get("EMA50"))
+    ema200  = safe_float(last.get("EMA200"))
+    rsi     = safe_float(last.get("RSI14"))
+    adx     = safe_float(last.get("ADX14"))
+    macd_h  = safe_float(last.get("MACD_HIST"))
 
     score = 0.0
     reasons = []
 
-    close = float(last["Close"])
-    ema50 = float(last.get("EMA50", 0))
-    ema200 = float(last.get("EMA200", 0))
-    rsi = float(last.get("RSI14", 50))
-    adx = float(last.get("ADX14", 0))
-    macd_hist = float(last.get("MACD_HIST", 0))
-
-    # 1. Tendencia (peso alto)
-    if close > ema50 and ema50 > ema200:
-        score += 40
-        reasons.append("Tendencia alcista fuerte (EMA)")
-    elif close < ema50 and ema50 < ema200:
-        score -= 40
-        reasons.append("Tendencia bajista fuerte (EMA)")
-
-    # 2. Momentum RSI
-    if 45 < rsi < 70:
+    # Tendencia
+    if close > ema50 and ema50 > 0:
+        score += 35
+        reasons.append("Precio > EMA50")
+    if ema50 > ema200 and ema200 > 0:
+        score += 30
+        reasons.append("EMA50 > EMA200")
+    if close > ema200 and ema200 > 0:
         score += 20
-        reasons.append("Momentum sano")
+        reasons.append("Precio > EMA200")
+
+    # RSI
+    if 40 < rsi < 70:
+        score += 20
+        reasons.append("RSI saludable")
     elif rsi < 35:
         score -= 25
-        reasons.append("Sobreventa extrema")
+        reasons.append("Sobreventa")
     elif rsi > 75:
         score -= 25
-        reasons.append("Sobrecompra extrema")
+        reasons.append("Sobrecompra")
 
-    # 3. ADX + Tendencia
+    # ADX + MACD
     if adx > 25:
-        if close > ema50:
-            score += 15
-        else:
-            score -= 15
+        score += 10 if close > ema50 else -10
         reasons.append(f"Tendencia fuerte (ADX {adx:.1f})")
 
-    # 4. MACD
-    if macd_hist > 0:
+    if macd_h > 0:
         score += 15
         reasons.append("MACD alcista")
-    elif macd_hist < -0.5:
-        score -= 15
-        reasons.append("MACD bajista")
 
     score = max(-100, min(100, score))
 
     if score >= 70:
-        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 85, "reason": " • ".join(reasons[:3])}
+        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 85, "reason": " • ".join(reasons[:4])}
     elif score >= 35:
-        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 70, "reason": " • ".join(reasons[:3])}
+        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 70, "reason": " • ".join(reasons[:4])}
     elif score <= -70:
-        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 85, "reason": " • ".join(reasons[:3])}
+        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 85, "reason": " • ".join(reasons[:4])}
     elif score <= -35:
-        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 70, "reason": " • ".join(reasons[:3])}
+        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 70, "reason": " • ".join(reasons[:4])}
     else:
-        return {"label": "NEUTRAL", "color": "#8B949E", "score": int(score), "confidence": 50, "reason": "Mercado en rango"}
+        return {"label": "NEUTRAL", "color": "#8B949E", "score": int(score), "confidence": 50, "reason": "Mercado lateral"}
 
 
 def main():
     with st.sidebar:
         st.header("🔍 Terminal")
         ticker = st.text_input("Ticker", value="AAPL").strip().upper()
-        period = st.selectbox("Periodo", ["3mo", "6mo", "1y", "2y"], index=1)
-
-    if not ticker:
-        return
+        period = st.selectbox("Periodo", ["3mo", "6mo", "1y"], index=1)
 
     df = load_ohlcv(ticker, period)
+
     if df.empty:
         st.error(f"❌ No se pudieron descargar datos para **{ticker}**")
+        st.info("Prueba con AAPL, MSFT, NVDA o TSLA")
         return
 
     dfi = compute_indicators(df)
     rec = get_recommendation(dfi)
 
-    last_price = float(dfi["Close"].iloc[-1])
-    change = (last_price / float(dfi["Close"].iloc[-2]) - 1) * 100 if len(dfi) > 1 else 0
+    last_price = safe_float(dfi["Close"].iloc[-1])
+    prev_price = safe_float(dfi["Close"].iloc[-2]) if len(dfi) > 1 else last_price
+    change = (last_price / prev_price - 1) * 100 if prev_price != 0 else 0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Precio", f"${last_price:,.2f}", f"{change:+.2f}%")
     c2.metric("Señal", rec["label"])
-    c3.metric("RSI", f"{float(dfi['RSI14'].iloc[-1]):.1f}")
-    c4.metric("ADX", f"{float(dfi['ADX14'].iloc[-1]):.1f}")
+    c3.metric("RSI 14", f"{safe_float(dfi.get('RSI14', [50]))[-1]:.1f}")
+    c4.metric("ADX 14", f"{safe_float(dfi.get('ADX14', [20]))[-1]:.1f}")
 
     st.subheader(f"📈 {ticker}")
     fig = go.Figure()
@@ -161,12 +166,10 @@ def main():
     fig.update_layout(template="plotly_dark", height=680, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("📊 Recomendación")
-    st.markdown(f"<h2 style='color:{rec['color']};'>{rec['label']}</h2>", unsafe_allow_html=True)
-    st.metric("Score", f"{rec['score']}/100", f"Confianza: {rec['confidence']}%")
+    st.subheader("📊 Recomendación Final")
+    st.markdown(f"<h2 style='color:{rec['color']}; text-align:center;'>{rec['label']}</h2>", unsafe_allow_html=True)
+    st.metric("Score", f"{rec['score']}/100", f"Confianza {rec['confidence']}%")
     st.info(rec["reason"])
-
-    st.caption(f"QuantumShield Pro • {datetime.now().strftime('%d/%m/%Y %H:%M')}")
 
 
 if __name__ == "__main__":
