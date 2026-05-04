@@ -25,16 +25,15 @@ def load_ohlcv(ticker: str, period: str = "6mo") -> pd.DataFrame:
     if not _is_valid_ticker(ticker):
         return pd.DataFrame()
     try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True, timeout=15)
+        df = yf.download(ticker, period=period, progress=False, auto_adjust=True, timeout=20)
         if df.empty:
             return pd.DataFrame()
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        return df
-    except:
+        return df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+    except Exception:
         try:
             df = yf.Ticker(ticker).history(period=period)
             return df[['Open', 'High', 'Low', 'Close', 'Volume']].copy() if not df.empty else pd.DataFrame()
-        except:
+        except Exception:
             return pd.DataFrame()
 
 
@@ -61,30 +60,37 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out.ffill()
 
 
+def safe_float(val) -> float:
+    """Función ultra segura para convertir a float"""
+    try:
+        if pd.isna(val) or val is None:
+            return 0.0
+        return float(val)
+    except Exception:
+        return 0.0
+
+
 def get_recommendation(df: pd.DataFrame) -> dict:
     if df.empty or len(df) < 30:
         return {"label": "NEUTRAL", "color": "#8B949E", "score": 0, "confidence": 50}
 
     last = df.iloc[-1]
 
+    close_price = safe_float(last.get("Close"))
+    ema50 = safe_float(last.get("EMA50"))
+    ema200 = safe_float(last.get("EMA200"))
+    rsi = safe_float(last.get("RSI14"))
+
     score = 0.0
 
-    # Comparaciones seguras
-    close_price = float(last["Close"])
-    ema50 = float(last.get("EMA50", 0))
-    ema200 = float(last.get("EMA200", 0))
-
-    if close_price > ema50:
+    if close_price > ema50 and ema50 != 0:
         score += 35
-    if ema50 > ema200:
+    if ema50 > ema200 and ema200 != 0:
         score += 30
-    if close_price > ema200:
+    if close_price > ema200 and ema200 != 0:
         score += 25
 
-    # RSI
-    rsi = last.get("RSI14")
-    if rsi is not None:
-        rsi = float(rsi)
+    if rsi > 0:
         if 40 < rsi < 70:
             score += 20
         elif rsi < 35:
@@ -120,44 +126,41 @@ def main():
 
     if df.empty:
         st.error(f"❌ No se pudieron descargar datos para **{ticker}**")
-        st.info("Prueba con: AAPL, MSFT, NVDA, TSLA")
+        st.info("Prueba con: AAPL, MSFT, NVDA, TSLA, AMZN")
         return
 
     dfi = compute_indicators(df)
     rec = get_recommendation(dfi)
 
     # KPIs
-    last_price = float(dfi["Close"].iloc[-1])
-    prev_price = float(dfi["Close"].iloc[-2]) if len(dfi) > 1 else last_price
-    change = (last_price / prev_price - 1) * 100
+    last_price = safe_float(dfi["Close"].iloc[-1])
+    prev_price = safe_float(dfi["Close"].iloc[-2]) if len(dfi) > 1 else last_price
+    change = (last_price / prev_price - 1) * 100 if prev_price != 0 else 0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Precio Actual", f"${last_price:,.2f}", f"{change:+.2f}%")
     c2.metric("Señal", rec["label"])
-    c3.metric("RSI 14", f"{float(dfi['RSI14'].iloc[-1]):.1f}" if "RSI14" in dfi.columns else "—")
-    c4.metric("ADX 14", f"{float(dfi['ADX14'].iloc[-1]):.1f}" if "ADX14" in dfi.columns else "—")
+    c3.metric("RSI 14", f"{safe_float(dfi.get('RSI14', pd.Series([0])).iloc[-1]):.1f}")
+    c4.metric("ADX 14", f"{safe_float(dfi.get('ADX14', pd.Series([0])).iloc[-1]):.1f}")
 
     # Gráfico
-    st.subheader(f"📈 Gráfico de {ticker}")
+    st.subheader(f"📈 Gráfico — {ticker}")
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=dfi.index, open=dfi["Open"], high=dfi["High"],
-        low=dfi["Low"], close=dfi["Close"]
-    ))
+    fig.add_trace(go.Candlestick(x=dfi.index, open=dfi["Open"], high=dfi["High"], low=dfi["Low"], close=dfi["Close"]))
 
     for ema in ["EMA9", "EMA21", "EMA50", "EMA200"]:
         if ema in dfi.columns:
-            fig.add_trace(go.Scatter(x=dfi.index, y=dfi[ema], name=ema))
+            fig.add_trace(go.Scatter(x=dfi.index, y=dfi[ema], name=ema, line=dict(width=1.5)))
 
     fig.update_layout(template="plotly_dark", height=680, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Resultado
+    # Recomendación
     st.subheader("📊 Recomendación Final")
-    st.markdown(f"<h2 style='color:{rec['color']};'>{rec['label']}</h2>", unsafe_allow_html=True)
-    st.metric("Score", f"{rec['score']}/100", f"Confianza {rec['confidence']}%")
+    st.markdown(f"<h2 style='color:{rec['color']}; text-align:center;'>{rec['label']}</h2>", unsafe_allow_html=True)
+    st.metric("Score Técnico", f"{rec['score']}/100", f"Confianza: {rec['confidence']}%")
 
-    st.success("Análisis completado correctamente")
+    st.success("✅ Análisis completado correctamente")
 
 
 if __name__ == "__main__":
