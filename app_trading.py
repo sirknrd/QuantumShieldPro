@@ -49,11 +49,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low = out["Low"]
     vol = out["Volume"]
 
-    # EMAs
     for n in [9, 21, 50, 100, 200]:
         out[f"EMA{n}"] = ta.ema(close, length=n)
 
-    # Indicadores clave
     out["RSI14"] = ta.rsi(close, length=14)
     
     adx_df = ta.adx(high, low, close)
@@ -70,24 +68,16 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     out["ATR14"] = ta.atr(high, low, close, length=14)
 
-    # Volumen Relativo (corregido)
+    # Volumen Relativo seguro
     vol_sma = ta.sma(vol, length=20)
     if vol_sma is not None:
         out["REL_VOL"] = vol / vol_sma.replace(0, np.nan)
-
-    # Supertrend
-    try:
-        st_df = ta.supertrend(high, low, close, length=10, multiplier=3)
-        if st_df is not None:
-            out = pd.concat([out, st_df], axis=1)
-    except:
-        pass
 
     return out.ffill()
 
 
 def get_recommendation(df: pd.DataFrame) -> dict:
-    if df.empty or len(df) < 40:
+    if df.empty or len(df) < 30:
         return {"label": "NEUTRAL", "color": "#8B949E", "score": 0, "confidence": 40, "reason": "Datos insuficientes"}
 
     last = df.iloc[-1]
@@ -98,7 +88,6 @@ def get_recommendation(df: pd.DataFrame) -> dict:
     rsi = safe_float(last.get("RSI14"))
     adx = safe_float(last.get("ADX14"))
     macd_hist = safe_float(last.get("MACD_HIST"))
-    rel_vol = safe_float(last.get("REL_VOL"))
 
     score = 0.0
     reasons = []
@@ -120,11 +109,8 @@ def get_recommendation(df: pd.DataFrame) -> dict:
 
     if adx > 25:
         score += 15 if close > ema50 else -15
-
     if macd_hist > 0:
         score += 12
-    if rel_vol > 1.4:
-        score += 8
 
     score = max(-100, min(100, score))
 
@@ -156,7 +142,8 @@ def main():
     rec = get_recommendation(dfi)
 
     last_price = safe_float(dfi["Close"].iloc[-1])
-    change = (last_price / safe_float(dfi["Close"].iloc[-2]) - 1) * 100 if len(dfi) > 1 else 0
+    prev_price = safe_float(dfi["Close"].iloc[-2]) if len(dfi) > 1 else last_price
+    change = ((last_price / prev_price - 1) * 100) if prev_price != 0 else 0.0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Precio", f"${last_price:,.2f}", f"{change:+.2f}%")
