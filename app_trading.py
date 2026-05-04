@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import re
 from datetime import datetime
 
@@ -50,28 +49,35 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low = out["Low"]
     vol = out["Volume"]
 
-    # EMAs y SMAs
+    # EMAs
     for n in [9, 21, 50, 100, 200]:
         out[f"EMA{n}"] = ta.ema(close, length=n)
-        out[f"SMA{n}"] = ta.sma(close, length=n)
 
+    # Indicadores clave
     out["RSI14"] = ta.rsi(close, length=14)
-    out["ADX14"] = ta.adx(high, low, close).iloc[:, 0] if ta.adx(high, low, close) is not None else np.nan
+    
+    adx_df = ta.adx(high, low, close)
+    if adx_df is not None:
+        out["ADX14"] = adx_df.iloc[:, 0]
 
     macd = ta.macd(close)
-    if macd is not None:
+    if macd is not None and not macd.empty:
         out["MACD_HIST"] = macd.iloc[:, 2]
 
     bb = ta.bbands(close)
-    if bb is not None:
+    if bb is not None and not bb.empty:
         out["BBP"] = bb.iloc[:, 3]
 
     out["ATR14"] = ta.atr(high, low, close, length=14)
-    out["REL_VOL"] = vol / ta.sma(vol, length=20)
+
+    # Volumen Relativo (corregido)
+    vol_sma = ta.sma(vol, length=20)
+    if vol_sma is not None:
+        out["REL_VOL"] = vol / vol_sma.replace(0, np.nan)
 
     # Supertrend
     try:
-        st_df = ta.supertrend(high, low, close, length=10, multiplier=3.0)
+        st_df = ta.supertrend(high, low, close, length=10, multiplier=3)
         if st_df is not None:
             out = pd.concat([out, st_df], axis=1)
     except:
@@ -106,6 +112,7 @@ def get_recommendation(df: pd.DataFrame) -> dict:
 
     if 40 < rsi < 70:
         score += 20
+        reasons.append("Momentum sano")
     elif rsi < 35:
         score -= 25
     elif rsi > 75:
@@ -116,26 +123,26 @@ def get_recommendation(df: pd.DataFrame) -> dict:
 
     if macd_hist > 0:
         score += 12
-    if rel_vol > 1.5:
+    if rel_vol > 1.4:
         score += 8
 
     score = max(-100, min(100, score))
 
     if score >= 65:
-        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 82, "reason": "Señales alcistas alineadas"}
+        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 82, "reason": " • ".join(reasons[:4])}
     elif score >= 30:
-        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 68, "reason": "Señales alcistas moderadas"}
+        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 68, "reason": " • ".join(reasons[:4])}
     elif score <= -65:
-        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 82, "reason": "Señales bajistas alineadas"}
+        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 82, "reason": " • ".join(reasons[:4])}
     elif score <= -30:
-        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 68, "reason": "Señales bajistas moderadas"}
+        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 68, "reason": " • ".join(reasons[:4])}
     else:
         return {"label": "NEUTRAL", "color": "#8B949E", "score": int(score), "confidence": 55, "reason": "Sin tendencia clara"}
 
 
 def main():
     with st.sidebar:
-        st.header("Terminal")
+        st.header("🔍 Terminal")
         ticker = st.text_input("Ticker", value="AAPL").strip().upper()
         period = st.selectbox("Periodo", ["3mo", "6mo", "1y"], index=1)
 
@@ -157,7 +164,7 @@ def main():
     c3.metric("RSI 14", f"{safe_float(dfi.get('RSI14', pd.Series([50])).iloc[-1]):.1f}")
     c4.metric("ADX 14", f"{safe_float(dfi.get('ADX14', pd.Series([20])).iloc[-1]):.1f}")
 
-    st.subheader(f"Gráfico — {ticker}")
+    st.subheader(f"📈 {ticker}")
     fig = go.Figure()
     fig.add_trace(go.Candlestick(x=dfi.index, open=dfi["Open"], high=dfi["High"], low=dfi["Low"], close=dfi["Close"]))
 
@@ -168,9 +175,9 @@ def main():
     fig.update_layout(template="plotly_dark", height=700, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Recomendación del Sistema")
-    st.markdown(f"<h2 style='color:{rec['color']};'>{rec['label']}</h2>", unsafe_allow_html=True)
-    st.metric("Score", f"{rec['score']}/100", f"Confianza {rec['confidence']}%")
+    st.subheader("📊 Recomendación del Sistema")
+    st.markdown(f"<h2 style='color:{rec['color']}; text-align:center;'>{rec['label']}</h2>", unsafe_allow_html=True)
+    st.metric("Score", f"{rec['score']}/100", f"Confianza: {rec['confidence']}%")
     st.info(rec["reason"])
 
 
