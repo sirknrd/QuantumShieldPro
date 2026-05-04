@@ -4,7 +4,6 @@ import math
 import re
 from datetime import datetime
 
-import numpy as np
 import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
@@ -68,18 +67,24 @@ def get_recommendation(df: pd.DataFrame) -> dict:
 
     last = df.iloc[-1]
 
-    score = 0
-    # Tendencia
-    if last["Close"] > last.get("EMA50", 0):
+    score = 0.0
+
+    # Comparaciones seguras
+    close_price = float(last["Close"])
+    ema50 = float(last.get("EMA50", 0))
+    ema200 = float(last.get("EMA200", 0))
+
+    if close_price > ema50:
         score += 35
-    if last.get("EMA50", 0) > last.get("EMA200", 0):
+    if ema50 > ema200:
         score += 30
-    if last["Close"] > last.get("EMA200", 0):
+    if close_price > ema200:
         score += 25
 
-    # Momentum RSI
+    # RSI
     rsi = last.get("RSI14")
     if rsi is not None:
+        rsi = float(rsi)
         if 40 < rsi < 70:
             score += 20
         elif rsi < 35:
@@ -106,8 +111,6 @@ def main():
         st.header("🔍 Terminal")
         ticker = st.text_input("Ticker", value="AAPL").strip().upper()
         period = st.selectbox("Periodo", ["1mo", "3mo", "6mo", "1y"], index=2)
-        st.markdown("---")
-        st.caption("Datos de Yahoo Finance")
 
     if not ticker:
         st.warning("Ingresa un ticker")
@@ -117,7 +120,7 @@ def main():
 
     if df.empty:
         st.error(f"❌ No se pudieron descargar datos para **{ticker}**")
-        st.info("Prueba con: AAPL, MSFT, NVDA, TSLA, GOOGL")
+        st.info("Prueba con: AAPL, MSFT, NVDA, TSLA")
         return
 
     dfi = compute_indicators(df)
@@ -125,39 +128,36 @@ def main():
 
     # KPIs
     last_price = float(dfi["Close"].iloc[-1])
-    change = (last_price / float(dfi["Close"].iloc[-2]) - 1) * 100 if len(dfi) > 1 else 0
+    prev_price = float(dfi["Close"].iloc[-2]) if len(dfi) > 1 else last_price
+    change = (last_price / prev_price - 1) * 100
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Precio", f"${last_price:,.2f}", f"{change:+.2f}%")
-    c2.metric("Señal", rec["label"], help=f"Score: {rec['score']}")
-    c3.metric("RSI 14", f"{dfi['RSI14'].iloc[-1]:.1f}" if "RSI14" in dfi.columns else "—")
-    c4.metric("ADX 14", f"{dfi['ADX14'].iloc[-1]:.1f}" if "ADX14" in dfi.columns else "—")
+    c1.metric("Precio Actual", f"${last_price:,.2f}", f"{change:+.2f}%")
+    c2.metric("Señal", rec["label"])
+    c3.metric("RSI 14", f"{float(dfi['RSI14'].iloc[-1]):.1f}" if "RSI14" in dfi.columns else "—")
+    c4.metric("ADX 14", f"{float(dfi['ADX14'].iloc[-1]):.1f}" if "ADX14" in dfi.columns else "—")
 
     # Gráfico
-    st.subheader(f"📈 {ticker} - Evolución")
+    st.subheader(f"📈 Gráfico de {ticker}")
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=dfi.index, open=dfi["Open"], high=dfi["High"], low=dfi["Low"], close=dfi["Close"]))
+    fig.add_trace(go.Candlestick(
+        x=dfi.index, open=dfi["Open"], high=dfi["High"],
+        low=dfi["Low"], close=dfi["Close"]
+    ))
 
-    for ema_col in ["EMA9", "EMA21", "EMA50", "EMA200"]:
-        if ema_col in dfi.columns:
-            fig.add_trace(go.Scatter(x=dfi.index, y=dfi[ema_col], name=ema_col, line=dict(width=1.8)))
+    for ema in ["EMA9", "EMA21", "EMA50", "EMA200"]:
+        if ema in dfi.columns:
+            fig.add_trace(go.Scatter(x=dfi.index, y=dfi[ema], name=ema))
 
-    fig.update_layout(template="plotly_dark", height=680, xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.05))
+    fig.update_layout(template="plotly_dark", height=680, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Análisis
-    st.subheader("📊 Análisis Técnico")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(f"**Recomendación:** <span style='color:{rec['color']};font-weight:bold;font-size:1.3em;'>{rec['label']}</span>", unsafe_allow_html=True)
-        st.metric("Score Final", f"{rec['score']}/100", f"Confianza: {rec['confidence']}%")
-    with col2:
-        st.info("**Interpretación:**\n" + 
-                ("Fuerte tendencia alcista con momentum sano." if rec['score'] >= 65 else
-                 "Señal alcista moderada." if rec['score'] >= 30 else
-                 "Fuerte señal bajista." if rec['score'] <= -65 else "Señal bajista moderada." if rec['score'] <= -30 else "Mercado en rango / neutral."))
+    # Resultado
+    st.subheader("📊 Recomendación Final")
+    st.markdown(f"<h2 style='color:{rec['color']};'>{rec['label']}</h2>", unsafe_allow_html=True)
+    st.metric("Score", f"{rec['score']}/100", f"Confianza {rec['confidence']}%")
 
-    st.caption(f"QuantumShield Pro • {datetime.now().strftime('%d/%m/%Y %H:%M')} • Datos en tiempo real vía Yahoo Finance")
+    st.success("Análisis completado correctamente")
 
 
 if __name__ == "__main__":
