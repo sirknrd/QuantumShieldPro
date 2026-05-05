@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import concurrent.futures
+import math
 import re
-from datetime import datetime
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -14,13 +19,22 @@ st.set_page_config(page_title="QuantumShield Pro", layout="wide")
 
 st.markdown("""
 <style>
-    .header {font-size: 2.6rem; font-weight: bold; color: #00D18F; text-align: center;}
-    .rec-fuerte {font-size: 2.2rem; font-weight: bold;}
+    .header {font-size: 2.8rem; font-weight: bold; color: #00D18F; text-align: center;}
+    .rec-strong {font-size: 2.4rem; font-weight: bold;}
 </style>
 """, unsafe_allow_html=True)
 
 APP_TITLE = "QuantumShield Pro — Trading Terminal"
 st.markdown(f"<h1 class='header'>{APP_TITLE}</h1>", unsafe_allow_html=True)
+
+
+@dataclass
+class Recommendation:
+    label: str
+    color: str
+    score: float
+    confidence: int
+    reason: str
 
 
 def safe_float(x) -> float:
@@ -34,6 +48,7 @@ def _is_valid_ticker(ticker: str) -> bool:
     return bool(re.match(r"^[A-Z0-9\-\.]{1,10}$", ticker.strip().upper()))
 
 
+# ==================== CARGAS ====================
 @st.cache_data(ttl=180)
 def load_ohlcv(ticker: str, period: str = "6mo") -> pd.DataFrame:
     if not _is_valid_ticker(ticker):
@@ -51,9 +66,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 30:
         return df
     out = df.copy()
-    close, high, low, vol = out["Close"], out["High"], out["Low"], out["Volume"]
+    close = out["Close"]
+    high = out["High"]
+    low = out["Low"]
+    vol = out["Volume"]
 
-    for n in [9, 21, 50, 200]:
+    for n in [9, 21, 50, 100, 200]:
         out[f"EMA{n}"] = ta.ema(close, length=n)
 
     out["RSI14"] = ta.rsi(close, length=14)
@@ -61,18 +79,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     macd = ta.macd(close)
     if macd is not None:
         out["MACD_HIST"] = macd.iloc[:, 2]
-
     bb = ta.bbands(close)
     if bb is not None:
         out["BBP"] = bb.iloc[:, 3]
-
     out["ATR14"] = ta.atr(high, low, close, length=14)
 
     vol_sma = ta.sma(vol, length=20)
     if vol_sma is not None:
         out["REL_VOL"] = vol / vol_sma.where(vol_sma > 0)
 
-    # Supertrend
     try:
         st_df = ta.supertrend(high, low, close, length=10, multiplier=3)
         if st_df is not None:
@@ -83,9 +98,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out.ffill()
 
 
-def get_recommendation(df: pd.DataFrame) -> dict:
+def get_recommendation(df: pd.DataFrame) -> Recommendation:
     if df.empty or len(df) < 40:
-        return {"label": "NEUTRAL", "color": "#8B949E", "score": 0, "confidence": 40, "reason": "Datos insuficientes"}
+        return Recommendation("NEUTRAL", "#8B949E", 0, 40, "Datos insuficientes")
 
     last = df.iloc[-1]
     close = safe_float(last.get("Close"))
@@ -107,8 +122,10 @@ def get_recommendation(df: pd.DataFrame) -> dict:
 
     if 42 < rsi < 68:
         score += 22
-    elif rsi < 35 or rsi > 73:
-        score -= 28
+    elif rsi < 35:
+        score -= 30
+    elif rsi > 73:
+        score -= 30
 
     if adx > 25:
         score += 18 if close > ema50 else -18
@@ -118,30 +135,27 @@ def get_recommendation(df: pd.DataFrame) -> dict:
     score = max(-100, min(100, score))
 
     if score >= 65:
-        return {"label": "COMPRA FUERTE", "color": "#00D18F", "score": int(score), "confidence": 85, "reason": "Señales alcistas alineadas"}
+        return Recommendation("COMPRA FUERTE", "#00D18F", int(score), 85, " • ".join(reasons))
     elif score >= 30:
-        return {"label": "COMPRA", "color": "#2F81F7", "score": int(score), "confidence": 70, "reason": "Señales alcistas moderadas"}
+        return Recommendation("COMPRA", "#2F81F7", int(score), 72, " • ".join(reasons))
     elif score <= -65:
-        return {"label": "VENTA FUERTE", "color": "#FF4B4B", "score": int(score), "confidence": 85, "reason": "Señales bajistas alineadas"}
+        return Recommendation("VENTA FUERTE", "#FF4B4B", int(score), 85, " • ".join(reasons))
     elif score <= -30:
-        return {"label": "VENTA", "color": "#FFA657", "score": int(score), "confidence": 70, "reason": "Señales bajistas moderadas"}
+        return Recommendation("VENTA", "#FFA657", int(score), 72, " • ".join(reasons))
     else:
-        return {"label": "NEUTRAL", "color": "#8B949E", "score": int(score), "confidence": 55, "reason": "Sin tendencia clara"}
+        return Recommendation("NEUTRAL", "#8B949E", int(score), 55, "Mercado en rango")
 
 
 def main():
     with st.sidebar:
-        st.header("🔍 Terminal")
+        st.header("⚙️ Terminal")
         ticker = st.text_input("Ticker Principal", value="NVDA").strip().upper()
         period = st.selectbox("Periodo", ["3mo", "6mo", "1y"], index=1)
-        st.markdown("---")
-        st.subheader("Radar")
-        radar_tickers = st.text_area("Tickers (separados por coma)", "NVDA, AAPL, TSLA, MSFT, AMD", height=100)
 
     df = load_ohlcv(ticker, period)
     if df.empty:
         st.error(f"❌ No se pudieron descargar datos para **{ticker}**")
-        return
+        st.stop()
 
     dfi = compute_indicators(df)
     rec = get_recommendation(dfi)
@@ -151,40 +165,42 @@ def main():
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Precio", f"${last_price:,.2f}", f"{change:+.2f}%")
-    c2.metric("Señal", rec["label"])
+    c2.metric("Señal", rec.label)
     c3.metric("RSI 14", f"{safe_float(dfi.get('RSI14', pd.Series([50])).iloc[-1]):.1f}")
     c4.metric("ADX 14", f"{safe_float(dfi.get('ADX14', pd.Series([20])).iloc[-1]):.1f}")
 
-    # Gráfico con Supertrend
-    st.subheader(f"📈 {ticker}")
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=dfi.index, open=dfi["Open"], high=dfi["High"], low=dfi["Low"], close=dfi["Close"]))
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Gráfico", "📊 Análisis", "⚠️ Riesgo", "📰 Noticias", "🔦 Radar"])
 
-    for ema in ["EMA9", "EMA21", "EMA50", "EMA200"]:
-        if ema in dfi.columns:
-            fig.add_trace(go.Scatter(x=dfi.index, y=dfi[ema], name=ema))
+    with tab1:
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(x=dfi.index, open=dfi["Open"], high=dfi["High"], low=dfi["Low"], close=dfi["Close"]))
+        for ema in ["EMA9", "EMA21", "EMA50", "EMA200"]:
+            if ema in dfi.columns:
+                fig.add_trace(go.Scatter(x=dfi.index, y=dfi[ema], name=ema))
+        fig.update_layout(template="plotly_dark", height=720, xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
 
-    # Supertrend
-    if "SUPERT_10_3.0" in dfi.columns:
-        fig.add_trace(go.Scatter(x=dfi.index, y=dfi["SUPERT_10_3.0"], name="Supertrend", line=dict(color="#00ff00", width=2)))
+    with tab2:
+        st.subheader("Recomendación")
+        st.markdown(f"<h2 style='color:{rec.color};' class='rec-strong'>{rec.label}</h2>", unsafe_allow_html=True)
+        st.metric("Score", f"{rec.score}/100", f"Confianza: {rec.confidence}%")
+        st.info(rec.reason)
 
-    fig.update_layout(template="plotly_dark", height=720, xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig, use_container_width=True)
+    with tab3:
+        st.subheader("Gestión de Riesgo (ATR)")
+        atr = safe_float(dfi["ATR14"].iloc[-1])
+        if atr > 0:
+            st.write(f"**Stop Loss:** ${last_price - 1.5*atr:,.2f}")
+            st.write(f"**TP1:** ${last_price + 2*atr:,.2f}")
+            st.write(f"**TP2:** ${last_price + 4*atr:,.2f}")
 
-    # Recomendación
-    st.subheader("📊 Recomendación del Sistema")
-    st.markdown(f"<h2 style='color:{rec['color']}; text-align:center;' class='rec-fuerte'>{rec['label']}</h2>", unsafe_allow_html=True)
-    st.metric("Score", f"{rec['score']}/100", f"Confianza: {rec['confidence']}%")
-    st.info(rec["reason"])
+    with tab4:
+        st.subheader("📰 Noticias y Sentimiento")
+        st.info("Módulo de Noticias + Sentimiento (próxima actualización)")
 
-    # Radar simple
-    st.subheader("🔦 Radar Multi-Activo")
-    radar_list = [t.strip().upper() for t in radar_tickers.split(",") if t.strip()]
-    for t in radar_list[:8]:
-        d = load_ohlcv(t, "1mo")
-        if not d.empty:
-            chg = (safe_float(d["Close"].iloc[-1]) / safe_float(d["Close"].iloc[-2]) - 1) * 100
-            st.write(f"**{t}** → ${safe_float(d['Close'].iloc[-1]):.2f} ({chg:+.2f}%)")
+    with tab5:
+        st.subheader("🔦 Radar Avanzado")
+        st.info("Radar multi-ticker (próxima actualización)")
 
     st.caption(f"QuantumShield Pro • {datetime.now().strftime('%d/%m/%Y %H:%M')}")
 
