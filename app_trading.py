@@ -448,14 +448,15 @@ with tab2:
             except Exception:
                 return ""
 
-        st.dataframe(
-            df_radar.style
-                .applymap(color_senal, subset=["Señal"])
-                .applymap(color_num,   subset=["Cambio %", "Puntos"])
-                .format({"Precio": "{:,.4f}", "Cambio %": "{:+.2f}%",
-                         "RSI": "{:.1f}", "ATR": "{:.4f}"}),
-            use_container_width=True, height=620,
-        )
+        # pandas >= 2.1 renombró applymap → map (por elemento)
+        _cell_map = "map" if hasattr(df_radar.style, "map") else "applymap"
+        styled = df_radar.style.format({
+            "Precio": "{:,.4f}", "Cambio %": "{:+.2f}%",
+            "RSI": "{:.1f}", "ATR": "{:.4f}",
+        })
+        styled = getattr(styled, _cell_map)(color_senal, subset=["Señal"])
+        styled = getattr(styled, _cell_map)(color_num,   subset=["Cambio %", "Puntos"])
+        st.dataframe(styled, use_container_width=True, height=620)
 
         fig_bar = px.bar(
             df_radar, x="Activo", y="Puntos", color="Puntos",
