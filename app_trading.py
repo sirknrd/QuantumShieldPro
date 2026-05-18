@@ -217,50 +217,54 @@ def get_close_only(ticker: str, period: str) -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# IA — Claude API helpers
+# IA — Groq API (gratuito · llama-3.3-70b)
 # ══════════════════════════════════════════════════════════════════════════════
 
-CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL   = "claude-haiku-4-5-20251001"   # rápido y económico para trading
-CLAUDE_HEADERS = {
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama-3.3-70b-versatile"
+GROQ_HEADERS = {
     "Content-Type": "application/json",
-    "anthropic-version": "2023-06-01",
 }
 
-def _claude(system: str, user: str, max_tokens: int = 1000) -> str:
-    """Llamada simple a Claude. Retorna texto o mensaje de error."""
-    if "x-api-key" not in CLAUDE_HEADERS or not CLAUDE_HEADERS["x-api-key"]:
+def _ia_activa() -> bool:
+    return bool(GROQ_HEADERS.get("Authorization", "").replace("Bearer ", "").strip())
+
+def _groq(system: str, user: str, max_tokens: int = 1000) -> str:
+    """Llamada simple a Groq. Retorna texto o mensaje de error."""
+    if not _ia_activa():
         return "❌ API key no configurada."
     payload = {
-        "model": CLAUDE_MODEL,
+        "model": GROQ_MODEL,
         "max_tokens": max_tokens,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
     }
     try:
-        resp = requests.post(CLAUDE_API_URL, headers=CLAUDE_HEADERS,
+        resp = requests.post(GROQ_API_URL, headers=GROQ_HEADERS,
                              json=payload, timeout=30)
         if not resp.ok:
             try:
-                detalle = resp.json().get("error", {}).get("message", resp.text[:200])
+                detalle = resp.json().get("error", {}).get("message", resp.text[:300])
             except Exception:
-                detalle = resp.text[:200]
+                detalle = resp.text[:300]
             if resp.status_code == 401:
-                return "❌ API key inválida o sin permisos. Verifica en console.anthropic.com"
-            if resp.status_code == 400:
-                return f"❌ Solicitud inválida: {detalle}"
+                return "❌ API key inválida. Verifica en console.groq.com"
+            if resp.status_code == 429:
+                return "⚠️ Rate limit alcanzado. Espera unos segundos e intenta de nuevo."
             return f"❌ Error HTTP {resp.status_code}: {detalle}"
         data = resp.json()
-        return data["content"][0]["text"]
+        return data["choices"][0]["message"]["content"]
     except Exception as e:
         return f"❌ Error de conexión: {e}"
 
-def _claude_stream(system: str, messages: list, max_tokens: int = 1000):
+def _groq_stream(system: str, messages: list, max_tokens: int = 1000):
     """Streaming para el chat. Yield de chunks de texto."""
-    if "x-api-key" not in CLAUDE_HEADERS or not CLAUDE_HEADERS["x-api-key"]:
+    if not _ia_activa():
         yield "❌ API key no configurada."
         return
-    # Filtrar mensajes: solo role user/assistant, content string
+    # Limpiar mensajes — solo user/assistant con content válido
     mensajes_limpios = [
         {"role": m["role"], "content": str(m["content"])}
         for m in messages
@@ -270,20 +274,19 @@ def _claude_stream(system: str, messages: list, max_tokens: int = 1000):
         yield "❌ Sin mensajes para enviar."
         return
     payload = {
-        "model": CLAUDE_MODEL,
+        "model": GROQ_MODEL,
         "max_tokens": max_tokens,
-        "system": system,
-        "messages": mensajes_limpios,
+        "messages": [{"role": "system", "content": system}] + mensajes_limpios,
         "stream": True,
     }
     try:
-        with requests.post(CLAUDE_API_URL, headers=CLAUDE_HEADERS,
+        with requests.post(GROQ_API_URL, headers=GROQ_HEADERS,
                            json=payload, timeout=60, stream=True) as resp:
             if not resp.ok:
                 try:
-                    detalle = resp.json().get("error", {}).get("message", resp.text[:200])
+                    detalle = resp.json().get("error", {}).get("message", resp.text[:300])
                 except Exception:
-                    detalle = resp.text[:200]
+                    detalle = resp.text[:300]
                 yield f"\n❌ Error {resp.status_code}: {detalle}"
                 return
             for line in resp.iter_lines():
@@ -296,9 +299,9 @@ def _claude_stream(system: str, messages: list, max_tokens: int = 1000):
                         break
                     try:
                         chunk = json.loads(data_str)
-                        if chunk.get("type") == "content_block_delta":
-                            yield chunk["delta"].get("text", "")
-                    except json.JSONDecodeError:
+                        delta = chunk["choices"][0].get("delta", {})
+                        yield delta.get("content", "")
+                    except (json.JSONDecodeError, KeyError, IndexError):
                         continue
     except Exception as e:
         yield f"\n❌ Error de conexión: {e}"
@@ -358,23 +361,23 @@ with st.sidebar:
     mostrar_vanom   = st.checkbox("Volumen anómalo",       value=True)
 
     st.markdown("---")
-    st.subheader("🤖 IA")
-    api_key_input = st.text_input(
-        "Anthropic API Key",
+    st.subheader("🤖 IA — Groq (gratis)")
+    groq_key_input = st.text_input(
+        "Groq API Key",
         type="password",
-        placeholder="sk-ant-...",
-        help="Necesaria para las funciones de IA. Obtén la tuya en console.anthropic.com",
+        placeholder="gsk_...",
+        help="Gratis en console.groq.com · Sin tarjeta de crédito",
     )
-    if api_key_input:
-        CLAUDE_HEADERS["x-api-key"] = api_key_input
-        st.success("API key cargada ✓", icon="🔑")
+    if groq_key_input:
+        GROQ_HEADERS["Authorization"] = f"Bearer {groq_key_input}"
+        st.success("Groq listo ✓", icon="🔑")
     else:
-        # Intentar desde st.secrets
         try:
-            CLAUDE_HEADERS["x-api-key"] = st.secrets["ANTHROPIC_API_KEY"]
-            st.success("API key desde secrets ✓", icon="🔑")
+            GROQ_HEADERS["Authorization"] = f"Bearer {st.secrets['GROQ_API_KEY']}"
+            st.success("Groq desde secrets ✓", icon="🔑")
         except Exception:
             st.warning("Sin API key — IA desactivada", icon="⚠️")
+            st.markdown("[Obtener clave gratis →](https://console.groq.com)", unsafe_allow_html=False)
 
     st.markdown("---")
     st.caption("Datos vía Yahoo Finance · Caché 5 min")
@@ -858,11 +861,11 @@ with tab5:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab6:
 
-    ia_activa = "x-api-key" in CLAUDE_HEADERS and CLAUDE_HEADERS["x-api-key"]
+    ia_activa = _ia_activa()
 
     if not ia_activa:
-        st.warning("Ingresa tu Anthropic API key en el panel izquierdo para activar las funciones de IA.")
-        st.info("Obtén una en [console.anthropic.com](https://console.anthropic.com) · El tier gratuito es suficiente para esta app.")
+        st.warning("Ingresa tu Groq API key en el panel izquierdo para activar las funciones de IA.")
+        st.info("Obtén una **gratis** (sin tarjeta) en [console.groq.com](https://console.groq.com)")
         st.stop()
 
     resumen_tecnico = _resumen_tecnico(ticker, df, info)
@@ -887,7 +890,7 @@ conciso y profesional en español. Estructura tu respuesta así:
 5. **Conclusión** (1 oración directa)
 Sé directo, evita repetir los números del resumen textualmente."""
 
-            analisis_texto = _claude(
+            analisis_texto = _groq(
                 system=sistema_analisis,
                 user=f"Analiza este activo:\n\n{resumen_tecnico}",
                 max_tokens=700,
@@ -915,7 +918,7 @@ Cuando el usuario te pida analizar noticias de un activo financiero, debes:
 4. Mencionar eventos próximos relevantes (earnings, halvings, regulaciones, etc.) si los conoces
 Formato: usa emojis, sé visual y directo. Responde en español."""
 
-            noticias_texto = _claude(
+            noticias_texto = _groq(
                 system=sistema_noticias,
                 user=f"Analiza el sentimiento actual de mercado para {ticker}. Datos técnicos de contexto:\n{resumen_tecnico}",
                 max_tokens=700,
@@ -964,7 +967,7 @@ estructurada, práctica y en español. Usa este formato exacto:
 
 Sé específico con los precios. Adapta el tono al perfil de riesgo indicado."""
 
-            tesis_texto = _claude(
+            tesis_texto = _groq(
                 system=sistema_tesis,
                 user=f"Genera una tesis de inversión para {ticker}.\nHorizonte: {horizonte}\nPerfil: {perfil}\nDatos técnicos:\n{resumen_tecnico}",
                 max_tokens=800,
@@ -1021,7 +1024,7 @@ enfatiza que es análisis técnico educativo."""
         with st.chat_message("assistant"):
             respuesta_placeholder = st.empty()
             respuesta_completa    = ""
-            for chunk in _claude_stream(sistema_chat, mensajes_api, max_tokens=600):
+            for chunk in _groq_stream(sistema_chat, mensajes_api, max_tokens=600):
                 respuesta_completa += chunk
                 respuesta_placeholder.markdown(respuesta_completa + "▌")
             respuesta_placeholder.markdown(respuesta_completa)
