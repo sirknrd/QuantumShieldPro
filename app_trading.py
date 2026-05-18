@@ -10,6 +10,8 @@ from scipy.signal import argrelextrema
 import time
 import requests
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -94,6 +96,26 @@ def calcular_atr(df: pd.DataFrame, periodo=14) -> pd.Series:
     tr = pd.concat([(h - l), (h - c).abs(), (l - c).abs()], axis=1).max(axis=1)
     return tr.rolling(periodo).mean()
 
+def calcular_adx(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
+    """Average Directional Index — mide la FUERZA de la tendencia (0-100)."""
+    high, low, close = df['High'], df['Low'], df['Close']
+    plus_dm  = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    mask = plus_dm < minus_dm
+    plus_dm[mask]  = 0
+    mask2 = minus_dm < plus_dm
+    minus_dm[mask2] = 0
+    tr = pd.concat([
+        (high - low),
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    atr_s    = tr.rolling(periodo).mean()
+    plus_di  = 100 * (plus_dm.rolling(periodo).mean()  / atr_s.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.rolling(periodo).mean() / atr_s.replace(0, np.nan))
+    dx       = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+    return dx.rolling(periodo).mean()
+
 def detectar_soportes_resistencias(df: pd.DataFrame, orden: int = 10):
     close    = df['Close'].values
     idx_max  = argrelextrema(close, np.greater, order=orden)[0]
@@ -143,13 +165,24 @@ def generar_senal(df: pd.DataFrame) -> dict:
     else:              senal, color = "⚪ NEUTRAL",        "#aaaaaa"
 
     atr_val = float(ultima['ATR']) if not pd.isna(ultima['ATR']) else 0
+    adx_val = float(ultima['ADX']) if 'ADX' in ultima.index and not pd.isna(ultima['ADX']) else 0
     precio  = float(ultima['Close'])
+
+    # ADX — ajustar puntuación según fuerza de tendencia
+    if adx_val >= 25:
+        razones.append(f"✅ ADX {adx_val:.1f} — tendencia fuerte (señal más confiable)")
+    elif adx_val >= 15:
+        razones.append(f"⚠️ ADX {adx_val:.1f} — tendencia moderada")
+    else:
+        puntos = max(-1, min(1, puntos))  # limitar señal en mercado sin tendencia
+        razones.append(f"⚠️ ADX {adx_val:.1f} — sin tendencia clara (señal poco confiable)")
+
     return {
         "senal": senal, "color": color, "puntos": puntos,
         "razones": razones,
         "sl": precio - 2 * atr_val,
         "tp": precio + 3 * atr_val,
-        "atr": atr_val, "rsi": rsi_val,
+        "atr": atr_val, "rsi": rsi_val, "adx": adx_val,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -199,6 +232,7 @@ def get_data(ticker: str, period: str) -> pd.DataFrame:
     df['MACD'], df['MACD_SIGNAL'], df['MACD_HIST'] = calcular_macd(close)
     df['BB_UPPER'], df['BB_MID'], df['BB_LOWER']   = calcular_bollinger(close)
     df['ATR']                                      = calcular_atr(df)
+    df['ADX']                                      = calcular_adx(df)
     if 'Volume' in df.columns:
         df['VOL_ANOMALO'] = volumen_anomalo(df)
     return df
@@ -326,6 +360,120 @@ Razones: {"; ".join(info["razones"])}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BACKTESTING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: int = -1) -> dict:
+    """
+    Simula la estrategia de confluencia sobre el historial.
+    Genera señal diaria, entra en la vela siguiente, sale cuando señal invierte.
+    Retorna métricas y DataFrame de operaciones.
+    """
+    resultados = []
+    en_posicion = False
+    precio_entrada = 0.0
+    fecha_entrada  = None
+    senal_entrada  = ""
+
+    # Calcular puntuación diaria para todo el historial
+    puntos_serie = []
+    for i in range(len(df)):
+        if i < 50:   # necesitamos mínimo 50 velas para indicadores
+            puntos_serie.append(0)
+            continue
+        fila = df.iloc[i]
+        p = 0
+        try:
+            if float(fila['Close']) > float(fila['EMA50']): p += 1
+            else: p -= 1
+            rsi = float(fila['RSI'])
+            if rsi < 30:   p += 2
+            elif rsi > 70: p -= 2
+            elif 40 <= rsi <= 60: p += 1
+            if float(fila['MACD']) > float(fila['MACD_SIGNAL']): p += 1
+            else: p -= 1
+            if float(fila['Close']) < float(fila['BB_LOWER']):  p += 1
+            elif float(fila['Close']) > float(fila['BB_UPPER']): p -= 1
+        except Exception:
+            pass
+        puntos_serie.append(p)
+
+    df = df.copy()
+    df['_puntos'] = puntos_serie
+
+    for i in range(51, len(df) - 1):
+        pts_hoy   = df['_puntos'].iloc[i]
+        precio_sig = float(df['Close'].iloc[i + 1])
+        fecha_sig  = df.index[i + 1]
+
+        if not en_posicion:
+            if pts_hoy >= umbral_compra:
+                en_posicion    = True
+                precio_entrada = precio_sig
+                fecha_entrada  = fecha_sig
+                senal_entrada  = f"+{pts_hoy}"
+        else:
+            # Salir si señal invierte o al final
+            if pts_hoy <= umbral_venta or i == len(df) - 2:
+                retorno = (precio_sig - precio_entrada) / precio_entrada * 100
+                duracion = (fecha_sig - fecha_entrada).days if hasattr(fecha_sig - fecha_entrada, 'days') else 1
+                resultados.append({
+                    "Entrada":       fecha_entrada.strftime("%d/%m/%Y") if hasattr(fecha_entrada, 'strftime') else str(fecha_entrada),
+                    "Salida":        fecha_sig.strftime("%d/%m/%Y")     if hasattr(fecha_sig,      'strftime') else str(fecha_sig),
+                    "Precio entrada": round(precio_entrada, 4),
+                    "Precio salida":  round(precio_sig, 4),
+                    "Retorno %":      round(retorno, 2),
+                    "Días":           duracion,
+                    "Señal entrada":  senal_entrada,
+                    "Resultado":      "✅ Ganada" if retorno > 0 else "❌ Perdida",
+                })
+                en_posicion = False
+
+    if not resultados:
+        return {"ops": pd.DataFrame(), "win_rate": 0, "retorno_total": 0,
+                "retorno_bh": 0, "n_ops": 0, "promedio_op": 0, "max_ganancia": 0, "max_perdida": 0}
+
+    df_ops    = pd.DataFrame(resultados)
+    n_ops     = len(df_ops)
+    ganadas   = (df_ops['Retorno %'] > 0).sum()
+    win_rate  = round(ganadas / n_ops * 100, 1) if n_ops > 0 else 0
+    ret_total = round(df_ops['Retorno %'].sum(), 2)
+    prom_op   = round(df_ops['Retorno %'].mean(), 2)
+    max_gan   = round(df_ops['Retorno %'].max(), 2)
+    max_per   = round(df_ops['Retorno %'].min(), 2)
+
+    # Buy & Hold
+    ret_bh = round(
+        (float(df['Close'].iloc[-1]) / float(df['Close'].iloc[50]) - 1) * 100, 2
+    )
+
+    return {
+        "ops": df_ops,
+        "win_rate": win_rate,
+        "retorno_total": ret_total,
+        "retorno_bh": ret_bh,
+        "n_ops": n_ops,
+        "promedio_op": prom_op,
+        "max_ganancia": max_gan,
+        "max_perdida": max_per,
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VALIDACIÓN DE TICKER
+# ══════════════════════════════════════════════════════════════════════════════
+
+TICKER_REGEX = re.compile(r'^[A-Z0-9\.\^\-]{1,12}$')
+
+def validar_ticker(t: str) -> tuple[bool, str]:
+    """Valida formato básico del ticker. Retorna (ok, mensaje)."""
+    t = t.strip().upper()
+    if not t:
+        return False, "El ticker no puede estar vacío."
+    if not TICKER_REGEX.match(t):
+        return False, f"Ticker inválido: '{t}'. Solo letras, números, puntos, guiones y ^ (máx 12 caracteres)."
+    return True, ""
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -346,8 +494,14 @@ with st.sidebar:
         benchmark = BENCHMARK_CRYPTO
         preset_dict = CRYPTOS
     else:
-        ticker    = st.text_input("Ticker personalizado", value="NVDA").upper().strip()
-        benchmark = BENCHMARK_ACCIONES
+        _ticker_raw = st.text_input("Ticker personalizado", value="NVDA").upper().strip()
+        _ok, _msg   = validar_ticker(_ticker_raw)
+        if not _ok:
+            st.error(_msg)
+            ticker = "NVDA"
+        else:
+            ticker = _ticker_raw
+        benchmark   = BENCHMARK_ACCIONES
         preset_dict = ACCIONES
 
     st.markdown("---")
@@ -425,13 +579,14 @@ chg   = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 e
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Análisis",
     "🌐 Señales del Mercado",
     "📉 Comparación Relativa",
     "🔗 Correlación",
     "📒 Paper Trading & Notas",
     "🤖 Asistente IA",
+    "🧪 Backtesting",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -439,12 +594,14 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Precio",      f"${price:,.4f}",       f"{chg:+.2f}%")
     k2.metric("RSI (14)",    f"{info['rsi']:.1f}")
-    k3.metric("ATR (14)",    f"${info['atr']:,.4f}")
-    k4.metric("Stop Loss",   f"${info['sl']:,.4f}")
-    k5.metric("Take Profit", f"${info['tp']:,.4f}")
+    k3.metric("ADX (14)",    f"{info['adx']:.1f}",
+              delta="Tendencia fuerte" if info['adx'] >= 25 else ("Moderada" if info['adx'] >= 15 else "Sin tendencia"))
+    k4.metric("ATR (14)",    f"${info['atr']:,.4f}")
+    k5.metric("Stop Loss",   f"${info['sl']:,.4f}")
+    k6.metric("Take Profit", f"${info['tp']:,.4f}")
 
     fecha_str = last.name.strftime('%d/%m/%Y') if hasattr(last.name, 'strftime') else str(last.name)
     st.markdown(f"""
@@ -587,31 +744,46 @@ with tab2:
     st.subheader("🌐 Señales del Mercado — Vista en Paralelo")
     st.caption(f"Período: {period} · Caché 5 min — ordenado por puntuación")
 
-    todos  = {**ACCIONES, **CRYPTOS}
-    filas  = []
-    prog   = st.progress(0)
-    for i, (nm, sym) in enumerate(todos.items()):
-        prog.progress((i + 1) / len(todos))
+    todos = {**ACCIONES, **CRYPTOS}
+    filas = []
+
+    def _fetch_fila(nm_sym):
+        nm, sym = nm_sym
         try:
             d = get_data(sym, period)
             if d.empty or len(d) < 30:
-                continue
+                return None
             inf = generar_senal(d)
             p   = float(d['Close'].iloc[-1])
             pv  = float(d['Close'].iloc[-2]) if len(d) > 1 else p
             chg_row = ((p / pv) - 1) * 100 if pv > 0 else 0
-            filas.append({
+            adx_val = round(float(d['ADX'].iloc[-1]), 1) if 'ADX' in d.columns else 0
+            return {
                 "Activo":   nm,
                 "Ticker":   sym,
                 "Precio":   p,
                 "Cambio %": round(chg_row, 2),
                 "RSI":      round(float(d['RSI'].iloc[-1]), 1),
+                "ADX":      adx_val,
                 "ATR":      round(float(d['ATR'].iloc[-1]), 4),
                 "Señal":    inf['senal'],
                 "Puntos":   inf['puntos'],
-            })
+            }
         except Exception:
-            continue
+            return None
+
+    prog = st.progress(0, text="Cargando señales en paralelo...")
+    completados = 0
+    total_sym   = len(todos)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futuros = {executor.submit(_fetch_fila, item): item for item in todos.items()}
+        for fut in as_completed(futuros):
+            completados += 1
+            prog.progress(completados / total_sym,
+                          text=f"Cargando... {completados}/{total_sym}")
+            res = fut.result()
+            if res:
+                filas.append(res)
     prog.empty()
 
     if filas:
@@ -634,7 +806,7 @@ with tab2:
         _cell_map = "map" if hasattr(df_radar.style, "map") else "applymap"
         styled = df_radar.style.format({
             "Precio": "{:,.4f}", "Cambio %": "{:+.2f}%",
-            "RSI": "{:.1f}", "ATR": "{:.4f}",
+            "RSI": "{:.1f}", "ADX": "{:.1f}", "ATR": "{:.4f}",
         })
         styled = getattr(styled, _cell_map)(color_senal, subset=["Señal"])
         styled = getattr(styled, _cell_map)(color_num,   subset=["Cambio %", "Puntos"])
@@ -1038,3 +1210,129 @@ enfatiza que es análisis técnico educativo."""
     if historial and st.button("🗑️ Limpiar chat", key="clear_chat"):
         st.session_state.chat_history[ticker] = []
         st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — BACKTESTING
+# ══════════════════════════════════════════════════════════════════════════════
+with tab7:
+    st.subheader(f"🧪 Backtesting — {ticker}")
+    st.caption("Simulación de la estrategia de confluencia sobre el historial de precio. No garantiza resultados futuros.")
+
+    col_bt1, col_bt2, col_bt3 = st.columns(3)
+    with col_bt1:
+        bt_umbral_compra = st.slider("Umbral de compra (puntos mínimos)", 1, 4, 2,
+            help="Puntuación mínima para generar señal de entrada LONG")
+    with col_bt2:
+        bt_umbral_venta  = st.slider("Umbral de salida (puntos máximos)", -4, -1, -1,
+            help="Puntuación máxima para cerrar posición")
+    with col_bt3:
+        bt_period_sel = st.selectbox("Período de backtest", ["6mo","1y","2y"], index=1, key="bt_period")
+
+    if st.button("▶️ Ejecutar Backtest", type="primary"):
+        with st.spinner("Simulando estrategia..."):
+            df_bt = get_data(ticker, bt_period_sel)
+            if df_bt.empty or len(df_bt) < 60:
+                st.warning("No hay suficientes datos para el backtest (mínimo 60 velas).")
+            else:
+                bt = backtest_estrategia(df_bt, bt_umbral_compra, bt_umbral_venta)
+
+                if bt['n_ops'] == 0:
+                    st.info("La estrategia no generó ninguna operación en el período. Prueba ajustando los umbrales.")
+                else:
+                    # KPIs
+                    b1, b2, b3, b4, b5, b6 = st.columns(6)
+                    b1.metric("Operaciones",     bt['n_ops'])
+                    b2.metric("Win Rate",        f"{bt['win_rate']}%")
+                    b3.metric("Retorno estrategia", f"{bt['retorno_total']:+.2f}%",
+                              delta=f"{bt['retorno_total'] - bt['retorno_bh']:+.2f}% vs B&H")
+                    b4.metric("Buy & Hold",      f"{bt['retorno_bh']:+.2f}%")
+                    b5.metric("Mejor operación", f"{bt['max_ganancia']:+.2f}%")
+                    b6.metric("Peor operación",  f"{bt['max_perdida']:+.2f}%")
+
+                    # Comparación visual
+                    st.markdown("---")
+
+                    # Curva de equity acumulada
+                    df_ops = bt['ops'].copy()
+                    df_ops['Retorno acumulado %'] = df_ops['Retorno %'].cumsum()
+                    df_ops['Op'] = range(1, len(df_ops) + 1)
+
+                    fig_eq = go.Figure()
+                    fig_eq.add_trace(go.Scatter(
+                        x=df_ops['Op'], y=df_ops['Retorno acumulado %'],
+                        mode='lines+markers',
+                        name='Retorno acumulado',
+                        line=dict(color="#00cfff", width=2),
+                        fill='tozeroy',
+                        fillcolor='rgba(0,207,255,0.08)',
+                    ))
+                    fig_eq.add_hline(y=bt['retorno_bh'], line_color="#ffd700",
+                                     line_dash="dash",
+                                     annotation_text=f"Buy & Hold {bt['retorno_bh']:+.1f}%",
+                                     annotation_font_color="#ffd700")
+                    fig_eq.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_dash="dot")
+                    fig_eq.update_layout(
+                        template="plotly_dark", height=340,
+                        title="Curva de equity acumulada",
+                        xaxis_title="Número de operación",
+                        yaxis_title="Retorno acumulado %",
+                        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                    )
+                    st.plotly_chart(fig_eq, use_container_width=True)
+
+                    # Distribución de retornos
+                    col_h1, col_h2 = st.columns(2)
+                    with col_h1:
+                        fig_hist = go.Figure()
+                        colors_hist = ["#00ff88" if v > 0 else "#ff4444" for v in df_ops['Retorno %']]
+                        fig_hist.add_trace(go.Bar(
+                            x=df_ops['Op'], y=df_ops['Retorno %'],
+                            marker_color=colors_hist, name="Retorno por op."
+                        ))
+                        fig_hist.add_hline(y=0, line_color="rgba(255,255,255,0.3)")
+                        fig_hist.update_layout(
+                            template="plotly_dark", height=280,
+                            title="Retorno por operación",
+                            paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                        )
+                        st.plotly_chart(fig_hist, use_container_width=True)
+
+                    with col_h2:
+                        gan = (df_ops['Retorno %'] > 0).sum()
+                        per = (df_ops['Retorno %'] <= 0).sum()
+                        fig_pie = go.Figure(go.Pie(
+                            labels=["Ganadas", "Perdidas"],
+                            values=[gan, per],
+                            marker_colors=["#00ff88", "#ff4444"],
+                            hole=0.55,
+                        ))
+                        fig_pie.update_layout(
+                            template="plotly_dark", height=280,
+                            title=f"Win Rate: {bt['win_rate']}%",
+                            paper_bgcolor="#0d1117",
+                        )
+                        st.plotly_chart(fig_pie, use_container_width=True)
+
+                    # Tabla de operaciones
+                    with st.expander("📋 Tabla de operaciones"):
+                        def color_retorno(val):
+                            try:
+                                return "color:#00ff88" if float(val) > 0 else "color:#ff4444"
+                            except Exception:
+                                return ""
+                        _cm = "map" if hasattr(df_ops.style, "map") else "applymap"
+                        styled_bt = df_ops.drop(columns=['Op']).style.format({"Retorno %": "{:+.2f}%"})
+                        styled_bt = getattr(styled_bt, _cm)(color_retorno, subset=["Retorno %"])
+                        st.dataframe(styled_bt, use_container_width=True)
+
+                        csv_bt = df_ops.to_csv(index=False).encode()
+                        st.download_button("⬇️ Descargar CSV", csv_bt,
+                                           f"{ticker}_backtest.csv", "text/csv")
+
+                    st.caption(
+                        "⚠️ El backtesting usa datos históricos y no garantiza rendimientos futuros. "
+                        "Los resultados asumen ejecución al precio de cierre del día siguiente a la señal, "
+                        "sin comisiones ni slippage."
+                    )
+    else:
+        st.info("Configura los parámetros y haz clic en **▶️ Ejecutar Backtest** para simular la estrategia.")
