@@ -283,9 +283,10 @@ with tab1:
         for r in info['razones']:
             st.markdown(f"- {r}")
 
-    # Gráfico
-    rows_n      = 4 if mostrar_volumen else 3
-    row_heights = [0.50, 0.15, 0.20, 0.15] if mostrar_volumen else [0.55, 0.22, 0.23]
+    # Gráfico — con volumen: 4 filas (velas|vol|RSI|MACD), sin volumen: 3 filas (velas|RSI|MACD)
+    tiene_vol   = mostrar_volumen and 'Volume' in df.columns
+    rows_n      = 4 if tiene_vol else 3
+    row_heights = [0.48, 0.13, 0.20, 0.19] if tiene_vol else [0.55, 0.22, 0.23]
 
     fig = make_subplots(
         rows=rows_n, cols=1,
@@ -338,24 +339,25 @@ with tab1:
     fig.add_hline(y=info['sl'], line_color="#ff4444", line_dash="dash",
                   annotation_text=f"SL {info['sl']:,.2f}", row=1, col=1)
 
-    rsi_row = macd_row = 2
-
-    # Volumen con marcado de anomalías
-    if mostrar_volumen and 'Volume' in df.columns:
+    # Con volumen: velas(1)|vol(2)|RSI(3)|MACD(4) — sin volumen: velas(1)|RSI(2)|MACD(3)
+    if tiene_vol:
+        rsi_row  = 3
+        macd_row = 4
         colors_vol = []
         for i in range(len(df)):
             is_anom = bool(df['VOL_ANOMALO'].iloc[i]) if 'VOL_ANOMALO' in df.columns else False
             up = float(df['Close'].iloc[i]) >= float(df['Open'].iloc[i])
             if is_anom:
-                colors_vol.append("#ffffff" if up else "#ffaa00")
+                colors_vol.append("rgba(255,255,255,0.9)" if up else "rgba(255,170,0,0.9)")
             else:
-                colors_vol.append("#00ff8866" if up else "#ff444466")
+                colors_vol.append("rgba(0,255,136,0.4)" if up else "rgba(255,68,68,0.4)")
         fig.add_trace(go.Bar(
             x=df.index, y=df['Volume'], name="Volumen",
             marker_color=colors_vol,
         ), row=2, col=1)
-        rsi_row  = 3
-        macd_row = 4
+    else:
+        rsi_row  = 2
+        macd_row = 3
 
     # RSI
     fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name="RSI",
