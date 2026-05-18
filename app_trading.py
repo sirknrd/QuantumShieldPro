@@ -1,773 +1,672 @@
-"""
-Quantum Shield Pro — Financial Trading Terminal
-Mejoras: Backtesting · Multi-Timeframe · Filtro Volumen · Caché · Intraday · Paper Trading
-"""
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime
-import io
+from scipy.signal import argrelextrema
 
-# ─────────────────────────────────────────────
-# CONFIGURACIÓN
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="QuantumShield Pro",
-    page_icon="🛡️",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Paper Trading state
-if "portfolio" not in st.session_state:
-    st.session_state.portfolio = {
-        "cash": 10_000.0,
-        "position": 0.0,
-        "entry_price": 0.0,
-        "trades": [],
-        "equity_curve": [],
-    }
-if "pt_capital" not in st.session_state:
-    st.session_state.pt_capital = 10_000.0
-
-# ─────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────
-st.sidebar.header("⚙️ Configuración")
-
-MERCADOS = {
-    "🌐 Criptomonedas":              ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD"],
-    "📈 Acciones Internacionales":   ["NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "META"],
-    "🇨🇱 Mercado Chileno (IPSA)":   ["FALABELLA.SN", "COPEC.SN", "BCI.SN", "CMPC.SN", "CHILE.SN"],
-    "✏️ Personalizado":              [],
+# ══════════════════════════════════════════════════════════════════════════════
+# PRESETS
+# ══════════════════════════════════════════════════════════════════════════════
+ACCIONES = {
+    "NVIDIA (NVDA)":      "NVDA",
+    "Apple (AAPL)":       "AAPL",
+    "Microsoft (MSFT)":   "MSFT",
+    "Tesla (TSLA)":       "TSLA",
+    "Amazon (AMZN)":      "AMZN",
+    "Meta (META)":        "META",
+    "Alphabet (GOOGL)":   "GOOGL",
+    "JPMorgan (JPM)":     "JPM",
+    "S&P 500 ETF (SPY)":  "SPY",
+    "IPSA Chile (^IPSA)": "^IPSA",
 }
 
-mercado = st.sidebar.selectbox("Mercado", list(MERCADOS.keys()))
-if mercado == "✏️ Personalizado":
-    ticker = st.sidebar.text_input("Ticker", value="NVDA").upper().strip()
-else:
-    ticker = st.sidebar.selectbox("Activo", MERCADOS[mercado])
-
-INTERVAL_OPTIONS = {
-    "15 minutos": "15m",
-    "30 minutos": "30m",
-    "1 hora":     "1h",
-    "4 horas":    "4h",
-    "Diario":     "1d",
-    "Semanal":    "1wk",
-}
-PERIOD_BY_INTERVAL = {
-    "15m": ["1d", "5d", "1mo"],
-    "30m": ["1d", "5d", "1mo"],
-    "1h":  ["5d", "1mo", "3mo"],
-    "4h":  ["1mo", "3mo", "6mo"],
-    "1d":  ["3mo", "6mo", "1y", "2y"],
-    "1wk": ["1y", "2y", "5y"],
+CRYPTOS = {
+    "Bitcoin (BTC)":      "BTC-USD",
+    "Ethereum (ETH)":     "ETH-USD",
+    "Solana (SOL)":       "SOL-USD",
+    "BNB (BNB)":          "BNB-USD",
+    "XRP (XRP)":          "XRP-USD",
+    "Cardano (ADA)":      "ADA-USD",
+    "Avalanche (AVAX)":   "AVAX-USD",
+    "Dogecoin (DOGE)":    "DOGE-USD",
+    "Chainlink (LINK)":   "LINK-USD",
+    "Polkadot (DOT)":     "DOT-USD",
 }
 
-interval_label = st.sidebar.selectbox("Intervalo", list(INTERVAL_OPTIONS.keys()), index=4)
-interval = INTERVAL_OPTIONS[interval_label]
-period   = st.sidebar.selectbox("Período", PERIOD_BY_INTERVAL[interval])
+BENCHMARK_ACCIONES = "SPY"
+BENCHMARK_CRYPTO   = "BTC-USD"
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎚️ Parámetros de Riesgo")
-atr_sl_mult = st.sidebar.slider("ATR Stop Loss ×",   1.0, 4.0, 1.5, 0.25)
-atr_tp_mult = st.sidebar.slider("ATR Take Profit ×", 1.5, 6.0, 3.0, 0.25)
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE — Paper Trading & Notas
+# ══════════════════════════════════════════════════════════════════════════════
+if "paper_trades" not in st.session_state:
+    st.session_state.paper_trades = []
+if "notas" not in st.session_state:
+    st.session_state.notas = {}
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔊 Filtro de Volumen")
-vol_filter = st.sidebar.checkbox("Activar filtro de volumen", value=True,
-                                  help="La señal solo es válida si el volumen supera su media")
-vol_mult   = st.sidebar.slider("Volumen mínimo (× media)", 1.0, 3.0, 1.2, 0.1,
-                                disabled=not vol_filter)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("💼 Paper Trading")
-pt_capital_input = st.sidebar.number_input(
-    "Capital inicial (USD)", min_value=100,
-    value=int(st.session_state.pt_capital), step=500)
-if pt_capital_input != st.session_state.pt_capital:
-    st.session_state.pt_capital = float(pt_capital_input)
-    st.session_state.portfolio  = {
-        "cash": float(pt_capital_input), "position": 0.0,
-        "entry_price": 0.0, "trades": [], "equity_curve": [],
-    }
-pt_size_pct = st.sidebar.slider("Tamaño por operación (%)", 5, 100, 50, 5)
-if st.sidebar.button("🔄 Resetear Portfolio"):
-    st.session_state.portfolio = {
-        "cash": st.session_state.pt_capital, "position": 0.0,
-        "entry_price": 0.0, "trades": [], "equity_curve": [],
-    }
-
-
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # INDICADORES
-# ─────────────────────────────────────────────
-def calc_ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
+# ══════════════════════════════════════════════════════════════════════════════
 
-def calc_rsi(s, n=14):
-    d = s.diff()
-    g = d.clip(lower=0).rolling(n).mean()
-    l = (-d.clip(upper=0)).rolling(n).mean()
-    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+def calcular_rsi(serie: pd.Series, periodo: int = 14) -> pd.Series:
+    delta    = serie.diff()
+    ganancia = delta.clip(lower=0).rolling(periodo).mean()
+    perdida  = (-delta.clip(upper=0)).rolling(periodo).mean()
+    rs       = ganancia / perdida.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-def calc_macd(s, f=12, sl=26, sig=9):
-    ml = calc_ema(s, f) - calc_ema(s, sl)
-    sg = calc_ema(ml, sig)
-    return ml, sg, ml - sg
+def calcular_macd(serie: pd.Series, rapido=12, lento=26, senal=9):
+    ema_r       = serie.ewm(span=rapido, adjust=False).mean()
+    ema_l       = serie.ewm(span=lento,  adjust=False).mean()
+    macd_line   = ema_r - ema_l
+    signal_line = macd_line.ewm(span=senal, adjust=False).mean()
+    return macd_line, signal_line, macd_line - signal_line
 
-def calc_atr(df, n=14):
-    h, l, c = df["High"], df["Low"], df["Close"]
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
+def calcular_bollinger(serie: pd.Series, periodo=20, desv=2):
+    media = serie.rolling(periodo).mean()
+    std   = serie.rolling(periodo).std()
+    return media + desv * std, media, media - desv * std
 
-def calc_bollinger(s, n=20, k=2.0):
-    m   = s.rolling(n).mean()
-    std = s.rolling(n).std()
-    return m + k * std, m, m - k * std
+def calcular_atr(df: pd.DataFrame, periodo=14) -> pd.Series:
+    h, l, c = df['High'], df['Low'], df['Close'].shift(1)
+    tr = pd.concat([(h - l), (h - c).abs(), (l - c).abs()], axis=1).max(axis=1)
+    return tr.rolling(periodo).mean()
 
+def detectar_soportes_resistencias(df: pd.DataFrame, orden: int = 10):
+    close    = df['Close'].values
+    idx_max  = argrelextrema(close, np.greater, order=orden)[0]
+    idx_min  = argrelextrema(close, np.less,    order=orden)[0]
+    resistencias = [(df.index[i], close[i]) for i in idx_max]
+    soportes     = [(df.index[i], close[i]) for i in idx_min]
+    return resistencias[-5:], soportes[-5:]
 
-# ─────────────────────────────────────────────
-# MOTOR DE CONFLUENCIA + FILTRO VOLUMEN
-# ─────────────────────────────────────────────
-def motor_confluencia(df: pd.DataFrame, use_vol: bool, vmult: float) -> pd.DataFrame:
-    c = df["Close"]
+def volumen_anomalo(df: pd.DataFrame, factor: float = 2.0) -> pd.Series:
+    if 'Volume' not in df.columns:
+        return pd.Series(False, index=df.index)
+    vol_media = df['Volume'].rolling(20).mean()
+    return df['Volume'] > (factor * vol_media)
 
-    df["EMA50"]                              = calc_ema(c, 50)
-    df["RSI"]                                = calc_rsi(c)
-    df["MACD"], df["MACD_Sig"], df["MACD_Hist"] = calc_macd(c)
-    df["ATR"]                                = calc_atr(df)
-    df["BB_U"], df["BB_M"], df["BB_L"]       = calc_bollinger(c)
-    df["Vol_MA"]                             = df["Volume"].rolling(20).mean()
+def generar_senal(df: pd.DataFrame) -> dict:
+    ultima  = df.iloc[-1]
+    puntos  = 0
+    razones = []
 
-    above_ema = c > df["EMA50"]
-    ema_buy   = (~above_ema.shift(1).fillna(False)) & above_ema
-    ema_sell  = above_ema.shift(1).fillna(False) & (~above_ema)
+    if float(ultima['Close']) > float(ultima['EMA50']):
+        puntos += 1; razones.append("✅ Precio sobre EMA50 (alcista)")
+    else:
+        puntos -= 1; razones.append("❌ Precio bajo EMA50 (bajista)")
 
-    r = df["RSI"]
-    rsi_buy  = (r.shift(1) < 30) & (r >= 30)
-    rsi_sell = (r.shift(1) > 70) & (r <= 70)
+    rsi_val = float(ultima['RSI'])
+    if rsi_val < 30:
+        puntos += 2; razones.append(f"✅ RSI sobrevendido ({rsi_val:.1f}) — posible rebote")
+    elif rsi_val > 70:
+        puntos -= 2; razones.append(f"❌ RSI sobrecomprado ({rsi_val:.1f}) — posible corrección")
+    elif 40 <= rsi_val <= 60:
+        puntos += 1; razones.append(f"✅ RSI en zona neutral ({rsi_val:.1f})")
 
-    m, s = df["MACD"], df["MACD_Sig"]
-    macd_buy  = (m.shift(1) < s.shift(1)) & (m >= s)
-    macd_sell = (m.shift(1) > s.shift(1)) & (m <= s)
+    if float(ultima['MACD']) > float(ultima['MACD_SIGNAL']):
+        puntos += 1; razones.append("✅ MACD sobre señal (impulso alcista)")
+    else:
+        puntos -= 1; razones.append("❌ MACD bajo señal (impulso bajista)")
 
-    buy_score  = ema_buy.astype(int)  + rsi_buy.astype(int)  + macd_buy.astype(int)
-    sell_score = ema_sell.astype(int) + rsi_sell.astype(int) + macd_sell.astype(int)
+    if float(ultima['Close']) < float(ultima['BB_LOWER']):
+        puntos += 1; razones.append("✅ Precio bajo BB inferior (sobreventa)")
+    elif float(ultima['Close']) > float(ultima['BB_UPPER']):
+        puntos -= 1; razones.append("❌ Precio sobre BB superior (sobrecompra)")
 
-    vol_ok = (df["Volume"] >= df["Vol_MA"] * vmult) if use_vol else pd.Series(True, index=df.index)
+    if   puntos >= 3:  senal, color = "🟢 COMPRA FUERTE", "#00ff88"
+    elif puntos >= 1:  senal, color = "🟡 COMPRA DÉBIL",  "#ffd700"
+    elif puntos <= -3: senal, color = "🔴 VENTA FUERTE",  "#ff4444"
+    elif puntos <= -1: senal, color = "🟠 VENTA DÉBIL",   "#ff8c00"
+    else:              senal, color = "⚪ NEUTRAL",        "#aaaaaa"
 
-    df["Signal"]     = "NEUTRAL"
-    df["Score_Buy"]  = buy_score
-    df["Score_Sell"] = sell_score
-    df.loc[(buy_score  >= 2) & vol_ok, "Signal"] = "BUY"
-    df.loc[(sell_score >= 2) & vol_ok, "Signal"] = "SELL"
+    atr_val = float(ultima['ATR']) if not pd.isna(ultima['ATR']) else 0
+    precio  = float(ultima['Close'])
+    return {
+        "senal": senal, "color": color, "puntos": puntos,
+        "razones": razones,
+        "sl": precio - 2 * atr_val,
+        "tp": precio + 3 * atr_val,
+        "atr": atr_val, "rsi": rsi_val,
+    }
 
-    df["SL_Buy"]  = c - atr_sl_mult * df["ATR"]
-    df["TP_Buy"]  = c + atr_tp_mult * df["ATR"]
-    df["SL_Sell"] = c + atr_sl_mult * df["ATR"]
-    df["TP_Sell"] = c - atr_tp_mult * df["ATR"]
+# ══════════════════════════════════════════════════════════════════════════════
+# CARGA DE DATOS
+# ══════════════════════════════════════════════════════════════════════════════
 
+@st.cache_data(ttl=300)
+def get_data(ticker: str, period: str) -> pd.DataFrame:
+    df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+    if df.empty:
+        df = yf.Ticker(ticker).history(period=period)
+    if df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[[c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]].copy()
+    df.dropna(subset=['Close'], inplace=True)
+
+    close = df['Close']
+    df['EMA20']                                    = close.ewm(span=20, adjust=False).mean()
+    df['EMA50']                                    = close.ewm(span=50, adjust=False).mean()
+    df['RSI']                                      = calcular_rsi(close)
+    df['MACD'], df['MACD_SIGNAL'], df['MACD_HIST'] = calcular_macd(close)
+    df['BB_UPPER'], df['BB_MID'], df['BB_LOWER']   = calcular_bollinger(close)
+    df['ATR']                                      = calcular_atr(df)
+    if 'Volume' in df.columns:
+        df['VOL_ANOMALO'] = volumen_anomalo(df)
     return df
 
-
-# ─────────────────────────────────────────────
-# DESCARGA CON CACHÉ (TTL 5 min)
-# ─────────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)
-def get_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.download(ticker, period=period, interval=interval,
-                     progress=False, auto_adjust=True)
+@st.cache_data(ttl=300)
+def get_close_only(ticker: str, period: str) -> pd.Series:
+    df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+    if df.empty:
+        return pd.Series(dtype=float, name=ticker)
     if isinstance(df.columns, pd.MultiIndex):
-        try:
-            df = df.xs(ticker, axis=1, level=1)
-        except KeyError:
-            df.columns = df.columns.get_level_values(0)
-    needed = {"Open", "High", "Low", "Close", "Volume"}
-    if not needed.issubset(df.columns):
-        raise ValueError(f"Columnas inesperadas: {list(df.columns)}")
-    return df[list(needed)].dropna(subset=["Close"]).copy()
+        df.columns = df.columns.get_level_values(0)
+    return df['Close'].rename(ticker)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────
-# MULTI-TIMEFRAME
-# ─────────────────────────────────────────────
-MTF_MAP = {
-    "15m": ("1h",  "1d"),
-    "30m": ("4h",  "1d"),
-    "1h":  ("4h",  "1d"),
-    "4h":  ("1d",  "1wk"),
-    "1d":  ("1wk", None),
-    "1wk": (None,  None),
-}
-MTF_PERIOD = {
-    "15m": "5d", "30m": "5d", "1h": "1mo",
-    "4h": "3mo", "1d": "6mo", "1wk": "2y",
-}
+with st.sidebar:
+    st.markdown("## 🛡️ QuantumShield Pro")
+    st.markdown("---")
 
-def get_mtf_bias(ticker, tf):
-    result = {}
-    for sup_tf in MTF_MAP.get(tf, (None, None)):
-        if sup_tf is None:
-            continue
-        try:
-            per = MTF_PERIOD.get(sup_tf, "3mo")
-            d   = get_data(ticker, per, sup_tf)
-            if len(d) < 55:
-                continue
-            d["EMA50"] = calc_ema(d["Close"], 50)
-            d["RSI"]   = calc_rsi(d["Close"])
-            lc = float(d["Close"].iloc[-1])
-            le = float(d["EMA50"].iloc[-1])
-            lr = float(d["RSI"].iloc[-1])
-            bias = ("🟢 Alcista" if (lc > le and lr > 50) else
-                    "🔴 Bajista" if (lc < le and lr < 50) else "🟡 Neutral")
-            result[sup_tf] = {
-                "bias": bias, "rsi": round(lr, 1),
-                "ema_label": "Sobre EMA50" if lc > le else "Bajo EMA50",
-            }
-        except Exception:
-            pass
-    return result
+    tipo = st.radio("Tipo de activo", ["📈 Acciones", "₿ Criptomonedas", "✏️ Ticker manual"])
 
+    if tipo == "📈 Acciones":
+        nombre    = st.selectbox("Selecciona acción", list(ACCIONES.keys()))
+        ticker    = ACCIONES[nombre]
+        benchmark = BENCHMARK_ACCIONES
+        preset_dict = ACCIONES
+    elif tipo == "₿ Criptomonedas":
+        nombre    = st.selectbox("Selecciona crypto", list(CRYPTOS.keys()))
+        ticker    = CRYPTOS[nombre]
+        benchmark = BENCHMARK_CRYPTO
+        preset_dict = CRYPTOS
+    else:
+        ticker    = st.text_input("Ticker personalizado", value="NVDA").upper().strip()
+        benchmark = BENCHMARK_ACCIONES
+        preset_dict = ACCIONES
 
-# ─────────────────────────────────────────────
-# BACKTESTING
-# ─────────────────────────────────────────────
-def run_backtest(df: pd.DataFrame, init_capital: float = 10_000.0) -> dict:
-    cash     = init_capital
-    position = 0.0
-    entry_px = 0.0
-    sl = tp  = 0.0
-    trades   = []
-    equity   = []
+    st.markdown("---")
+    period = st.selectbox("Período", ["1mo","3mo","6mo","1y","2y"], index=2)
 
-    for idx, row in df.iterrows():
-        price = float(row["Close"])
+    st.markdown("---")
+    mostrar_bb      = st.checkbox("Bandas de Bollinger",  value=True)
+    mostrar_ema     = st.checkbox("EMA 20 / EMA 50",      value=True)
+    mostrar_volumen = st.checkbox("Volumen",               value=True)
+    mostrar_sr      = st.checkbox("Soporte/Resistencia",   value=True)
+    mostrar_vanom   = st.checkbox("Volumen anómalo",       value=True)
 
-        if position > 0:
-            if price <= sl or price >= tp or row["Signal"] == "SELL":
-                pnl    = (price - entry_px) * position
-                reason = ("SL" if price <= sl else
-                          "TP" if price >= tp else "Señal SELL")
-                cash  += position * price
-                trades.append({
-                    "Fecha cierre": idx,
-                    "Entrada":  round(entry_px, 4),
-                    "Salida":   round(price, 4),
-                    "PnL USD":  round(pnl, 2),
-                    "PnL %":    round((price / entry_px - 1) * 100, 2),
-                    "Resultado": "✅ Win" if pnl > 0 else "❌ Loss",
-                    "Cierre por": reason,
-                })
-                position = 0.0
+    st.markdown("---")
+    st.caption("Datos vía Yahoo Finance · Caché 5 min")
 
-        if position == 0 and row["Signal"] == "BUY":
-            invest   = cash * 0.95
-            position = invest / price
-            entry_px = price
-            sl       = float(row["SL_Buy"])
-            tp       = float(row["TP_Buy"])
-            cash    -= invest
+# ══════════════════════════════════════════════════════════════════════════════
+# DATOS PRINCIPALES
+# ══════════════════════════════════════════════════════════════════════════════
 
-        equity.append({"Fecha": idx, "Equity": cash + position * price})
+st.title("🛡️ QuantumShield Pro — Trading Terminal")
 
-    if position > 0:
-        price = float(df["Close"].iloc[-1])
-        pnl   = (price - entry_px) * position
-        cash += position * price
-        trades.append({
-            "Fecha cierre": df.index[-1],
-            "Entrada":  round(entry_px, 4),
-            "Salida":   round(price, 4),
-            "PnL USD":  round(pnl, 2),
-            "PnL %":    round((price / entry_px - 1) * 100, 2),
-            "Resultado": "✅ Win" if pnl > 0 else "❌ Loss",
-            "Cierre por": "Fin período",
-        })
-        equity[-1]["Equity"] = cash
-
-    eq_df     = pd.DataFrame(equity).set_index("Fecha")
-    total_ret = (cash / init_capital - 1) * 100
-    wins      = [t for t in trades if t["PnL USD"] > 0]
-    losses    = [t for t in trades if t["PnL USD"] <= 0]
-    win_rate  = len(wins) / len(trades) * 100 if trades else 0
-    gross_p   = sum(t["PnL USD"] for t in wins)  or 0
-    gross_l   = abs(sum(t["PnL USD"] for t in losses)) or 1
-    eq_s      = eq_df["Equity"]
-    dd        = (eq_s - eq_s.cummax()) / eq_s.cummax() * 100
-    rets      = eq_s.pct_change().dropna()
-    sharpe    = float(rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0
-
-    return {
-        "trades": trades, "equity_df": eq_df,
-        "total_ret": total_ret, "win_rate": win_rate,
-        "profit_factor": gross_p / gross_l,
-        "max_drawdown": float(dd.min()),
-        "sharpe": sharpe,
-        "n_trades": len(trades),
-        "final_equity": cash,
-    }
-
-
-# ─────────────────────────────────────────────
-# CARGA PRINCIPAL
-# ─────────────────────────────────────────────
 if not ticker:
-    st.warning("Ingresa un ticker válido.")
+    st.warning("Ingresa un ticker válido en el panel izquierdo.")
     st.stop()
 
-with st.spinner(f"Cargando {ticker} [{interval_label} · {period}]…"):
-    try:
-        df = get_data(ticker, period, interval)
-        if len(df) < 55:
-            st.error(f"Solo {len(df)} velas — extiende el período.")
-            st.stop()
-        df = motor_confluencia(df, vol_filter, vol_mult)
-    except Exception as e:
-        st.error(f"Error: {e}")
-        st.stop()
+with st.spinner(f"Analizando {ticker}..."):
+    df = get_data(ticker, period)
 
-sig_icon = {"BUY": "🟢", "SELL": "🔴", "NEUTRAL": "⚪"}
+if df.empty:
+    st.error(f"No se encontraron datos para **{ticker}**.")
+    st.stop()
 
-# ─────────────────────────────────────────────
+info  = generar_senal(df)
+last  = df.iloc[-1]
+prev  = df.iloc[-2] if len(df) > 1 else last
+price = float(last['Close'])
+chg   = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 else 0.0
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TABS
-# ─────────────────────────────────────────────
-tab_main, tab_mtf, tab_bt, tab_pt = st.tabs([
-    "📈 Terminal", "🔭 Multi-Timeframe", "📊 Backtesting", "💼 Paper Trading"
+# ══════════════════════════════════════════════════════════════════════════════
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Análisis",
+    "🌐 Señales del Mercado",
+    "📉 Comparación Relativa",
+    "🔗 Correlación",
+    "📒 Paper Trading & Notas",
 ])
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — ANÁLISIS PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
 
-# ══════════════════════════════════════════════
-# TAB 1 — TERMINAL
-# ══════════════════════════════════════════════
-with tab_main:
-    st.title(f"🛡️ Quantum Shield Pro — {ticker}")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Precio",      f"${price:,.4f}",       f"{chg:+.2f}%")
+    k2.metric("RSI (14)",    f"{info['rsi']:.1f}")
+    k3.metric("ATR (14)",    f"${info['atr']:,.4f}")
+    k4.metric("Stop Loss",   f"${info['sl']:,.4f}")
+    k5.metric("Take Profit", f"${info['tp']:,.4f}")
 
-    last      = float(df["Close"].iloc[-1])
-    prev      = float(df["Close"].iloc[-2])
-    change    = (last / prev - 1) * 100
-    rsi_v     = float(df["RSI"].iloc[-1])
-    atr_v     = float(df["ATR"].iloc[-1])
-    signal    = df["Signal"].iloc[-1]
-    vol_v     = float(df["Volume"].iloc[-1])
-    volma_v   = float(df["Vol_MA"].iloc[-1])
-    vol_ratio = vol_v / volma_v if volma_v > 0 else 1.0
-    ts_fmt    = "%d/%m/%Y %H:%M" if interval in ["15m","30m","1h","4h"] else "%d/%m/%Y"
+    fecha_str = last.name.strftime('%d/%m/%Y') if hasattr(last.name, 'strftime') else str(last.name)
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
+        border:1px solid {info['color']};border-radius:12px;
+        padding:20px 28px;margin:16px 0;
+        box-shadow:0 0 20px {info['color']}33;">
+      <h2 style="color:{info['color']};margin:0 0 6px;font-size:1.5rem;">
+        Señal de Confluencia: {info['senal']}
+      </h2>
+      <p style="color:#ccc;margin:0;font-size:.9rem;">
+        Puntuación: <strong style="color:{info['color']}">{info['puntos']:+d}</strong> pts
+        &nbsp;|&nbsp; {fecha_str}
+      </p>
+    </div>""", unsafe_allow_html=True)
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Precio",  f"${last:,.4f}",   f"{change:+.2f}%")
-    c2.metric("RSI (14)", f"{rsi_v:.1f}",
-              "Sobrevendido" if rsi_v < 30 else "Sobrecomprado" if rsi_v > 70 else "Neutral")
-    c3.metric("ATR (14)", f"${atr_v:,.4f}")
-    c4.metric("Volumen",  f"{vol_v:,.0f}",   f"× {vol_ratio:.1f} vs media")
-    c5.metric("Última vela", df.index[-1].strftime(ts_fmt))
-    c6.metric("Señal",   f"{sig_icon.get(signal,'')} {signal}")
+    with st.expander("📋 Detalle de la señal"):
+        for r in info['razones']:
+            st.markdown(f"- {r}")
 
-    if signal != "NEUTRAL":
-        st.markdown("---")
-        st.subheader("📐 Gestión de Riesgo ATR")
-        sl = float(df["SL_Buy"  if signal == "BUY" else "SL_Sell"].iloc[-1])
-        tp = float(df["TP_Buy"  if signal == "BUY" else "TP_Sell"].iloc[-1])
-        sl_dist = abs(last - sl)
-        rr = abs(tp - last) / sl_dist if sl_dist > 0 else 0
-        riesgo_usd = st.session_state.pt_capital * 0.01
-        pos_sz = riesgo_usd / sl_dist if sl_dist > 0 else 0
+    # Gráfico
+    rows_n      = 4 if mostrar_volumen else 3
+    row_heights = [0.50, 0.15, 0.20, 0.15] if mostrar_volumen else [0.55, 0.22, 0.23]
 
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Stop Loss",   f"${sl:,.4f}", f"{((sl/last)-1)*100:+.2f}%")
-        r2.metric("Take Profit", f"${tp:,.4f}", f"{((tp/last)-1)*100:+.2f}%")
-        r3.metric("Posición (1% riesgo)", f"{pos_sz:,.4f} u", f"${riesgo_usd:,.0f}")
-        r4.metric("Ratio R:R",   f"1 : {rr:.2f}", "✅" if rr >= 2 else "⚠️")
-
-    # ── Gráfico principal ──
-    st.markdown("---")
     fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True,
-        row_heights=[0.55, 0.15, 0.15, 0.15],
+        rows=rows_n, cols=1,
+        shared_xaxes=True,
         vertical_spacing=0.03,
-        subplot_titles=("Precio · Bollinger · EMA50", "Volumen", "RSI (14)", "MACD (12/26/9)"),
+        row_heights=row_heights,
     )
 
+    # Velas
     fig.add_trace(go.Candlestick(
-        x=df.index, open=df["Open"], high=df["High"],
-        low=df["Low"], close=df["Close"], name="Precio",
-        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        x=df.index, open=df['Open'], high=df['High'],
+        low=df['Low'], close=df['Close'], name="Precio",
+        increasing_line_color="#00ff88", decreasing_line_color="#ff4444",
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=df.index, y=df["BB_U"],
-        line=dict(color="rgba(100,180,255,0.4)", width=1),
-        name="BB Sup", showlegend=False), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["BB_L"],
-        fill="tonexty", fillcolor="rgba(100,180,255,0.07)",
-        line=dict(color="rgba(100,180,255,0.4)", width=1),
-        name="Bollinger"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["BB_M"],
-        line=dict(color="rgba(150,150,150,0.4)", width=1, dash="dot"),
-        name="SMA 20"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"],
-        line=dict(color="#FFA726", width=1.5), name="EMA 50"), row=1, col=1)
+    # Bollinger
+    if mostrar_bb:
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_UPPER'], name="BB Sup",
+            line=dict(color="rgba(100,180,255,.6)", width=1, dash="dot")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_MID'], name="BB Med",
+            line=dict(color="rgba(100,180,255,.4)", width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOWER'], name="BB Inf",
+            line=dict(color="rgba(100,180,255,.6)", width=1, dash="dot"),
+            fill='tonexty', fillcolor="rgba(100,180,255,.04)"), row=1, col=1)
 
-    buys  = df[df["Signal"] == "BUY"]
-    sells = df[df["Signal"] == "SELL"]
-    fig.add_trace(go.Scatter(x=buys.index,  y=buys["Low"]   * 0.992, mode="markers",
-        marker=dict(symbol="triangle-up",   size=12, color="#00E676"), name="BUY"),  row=1, col=1)
-    fig.add_trace(go.Scatter(x=sells.index, y=sells["High"] * 1.008, mode="markers",
-        marker=dict(symbol="triangle-down", size=12, color="#FF1744"), name="SELL"), row=1, col=1)
+    # EMAs
+    if mostrar_ema:
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], name="EMA20",
+            line=dict(color="#ffd700", width=1.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA50'], name="EMA50",
+            line=dict(color="#ff8c00", width=1.5)), row=1, col=1)
 
-    vol_colors = ["#26a69a" if c >= o else "#ef5350"
-                  for c, o in zip(df["Close"], df["Open"])]
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"],
-        marker_color=vol_colors, name="Vol", showlegend=False), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Vol_MA"],
-        line=dict(color="#FFD54F", width=1.2, dash="dash"), name="Vol MA20"), row=2, col=1)
+    # Soporte / Resistencia
+    if mostrar_sr and len(df) >= 25:
+        resistencias, soportes = detectar_soportes_resistencias(df)
+        for _, nivel in resistencias:
+            fig.add_hline(y=nivel, line_color="rgba(255,68,68,0.5)", line_dash="dot",
+                          annotation_text=f"R {nivel:,.2f}",
+                          annotation_font_color="#ff6666",
+                          annotation_position="top right", row=1, col=1)
+        for _, nivel in soportes:
+            fig.add_hline(y=nivel, line_color="rgba(0,255,136,0.5)", line_dash="dot",
+                          annotation_text=f"S {nivel:,.2f}",
+                          annotation_font_color="#00ff88",
+                          annotation_position="bottom right", row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=df.index, y=df["RSI"],
-        line=dict(color="#AB47BC", width=1.5), name="RSI"), row=3, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="red",   opacity=0.4, row=3, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.4, row=3, col=1)
-    fig.add_hrect(y0=70, y1=100, fillcolor="red",   opacity=0.04, row=3, col=1)
-    fig.add_hrect(y0=0,  y1=30,  fillcolor="green", opacity=0.04, row=3, col=1)
+    # SL / TP
+    fig.add_hline(y=info['tp'], line_color="#00ff88", line_dash="dash",
+                  annotation_text=f"TP {info['tp']:,.2f}", row=1, col=1)
+    fig.add_hline(y=info['sl'], line_color="#ff4444", line_dash="dash",
+                  annotation_text=f"SL {info['sl']:,.2f}", row=1, col=1)
 
-    hc = ["#26a69a" if v >= 0 else "#ef5350" for v in df["MACD_Hist"]]
-    fig.add_trace(go.Bar(x=df.index, y=df["MACD_Hist"],
-        marker_color=hc, showlegend=False), row=4, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"],
-        line=dict(color="#42A5F5", width=1.5), name="MACD"), row=4, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["MACD_Sig"],
-        line=dict(color="#FF7043", width=1.5), name="Señal MACD"), row=4, col=1)
+    rsi_row = macd_row = 2
+
+    # Volumen con marcado de anomalías
+    if mostrar_volumen and 'Volume' in df.columns:
+        colors_vol = []
+        for i in range(len(df)):
+            is_anom = bool(df['VOL_ANOMALO'].iloc[i]) if 'VOL_ANOMALO' in df.columns else False
+            up = float(df['Close'].iloc[i]) >= float(df['Open'].iloc[i])
+            if is_anom:
+                colors_vol.append("#ffffff" if up else "#ffaa00")
+            else:
+                colors_vol.append("#00ff8866" if up else "#ff444466")
+        fig.add_trace(go.Bar(
+            x=df.index, y=df['Volume'], name="Volumen",
+            marker_color=colors_vol,
+        ), row=2, col=1)
+        rsi_row  = 3
+        macd_row = 4
+
+    # RSI
+    fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name="RSI",
+        line=dict(color="#c77dff", width=1.5)), row=rsi_row, col=1)
+    fig.add_hline(y=70, line_color="rgba(255,68,68,.5)",  line_dash="dot", row=rsi_row, col=1)
+    fig.add_hline(y=30, line_color="rgba(0,255,136,.5)", line_dash="dot", row=rsi_row, col=1)
+
+    # MACD
+    macd_cols = ["#00ff88" if v >= 0 else "#ff4444" for v in df['MACD_HIST'].fillna(0)]
+    fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name="Hist MACD",
+        marker_color=macd_cols), row=macd_row, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], name="MACD",
+        line=dict(color="#00cfff", width=1.2)), row=macd_row, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['MACD_SIGNAL'], name="Señal",
+        line=dict(color="#ff8c00", width=1.2)), row=macd_row, col=1)
 
     fig.update_layout(
-        template="plotly_dark", height=860,
+        template="plotly_dark", height=880,
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=1, xanchor="right"),
-        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(orientation="h", y=1.01, x=0),
+        margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
     )
-    fig.update_yaxes(row=3, col=1, range=[0, 100])
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Historial + exportar
-    st.subheader("📋 Historial de Señales")
-    sig_hist = df[df["Signal"] != "NEUTRAL"].tail(30).iloc[::-1]
+    if mostrar_vanom and mostrar_volumen:
+        st.caption("⬜ blanco / 🟠 naranja en volumen = anomalía (>2× media 20 períodos) — posible punto de inflexión")
 
-    def fmt_row(row):
-        sig = row["Signal"]
-        sl_ = row["SL_Buy"]  if sig == "BUY" else row["SL_Sell"]
-        tp_ = row["TP_Buy"]  if sig == "BUY" else row["TP_Sell"]
-        sc  = int(row["Score_Buy"] if sig == "BUY" else row["Score_Sell"])
-        vr  = row["Volume"] / row["Vol_MA"] if row["Vol_MA"] > 0 else 0
-        return pd.Series({
-            "Fecha":       row.name.strftime(ts_fmt),
-            "Señal":       "🟢 COMPRA" if sig == "BUY" else "🔴 VENTA",
-            "Precio":      f"${float(row['Close']):,.4f}",
-            "Stop Loss":   f"${float(sl_):,.4f}",
-            "Take Profit": f"${float(tp_):,.4f}",
-            "Confluencia": "⭐" * sc + f" ({sc}/3)",
-            "Vol/Media":   f"× {vr:.2f}",
-        })
-
-    if not sig_hist.empty:
-        tabla = sig_hist.apply(fmt_row, axis=1)
-        st.dataframe(tabla, use_container_width=True, hide_index=True)
-        buf = io.StringIO()
-        tabla.to_csv(buf, index=False)
-        st.download_button("⬇️ Exportar CSV",
-                           buf.getvalue(),
-                           f"señales_{ticker}_{datetime.now().strftime('%Y%m%d')}.csv",
-                           "text/csv")
-    else:
-        st.info("Sin señales en este período. Extiende el rango o desactiva el filtro de volumen.")
-
-
-# ══════════════════════════════════════════════
-# TAB 2 — MULTI-TIMEFRAME
-# ══════════════════════════════════════════════
-with tab_mtf:
-    st.header(f"🔭 Análisis Multi-Timeframe — {ticker}")
-    st.caption("Confirma la dirección en timeframes superiores antes de operar.")
-
-    with st.spinner("Calculando TF superiores…"):
-        mtf_data = get_mtf_bias(ticker, interval)
-
-    tf1, tf2 = MTF_MAP.get(interval, (None, None))
-
-    lc   = float(df["Close"].iloc[-1])
-    le   = float(df["EMA50"].iloc[-1])
-    lr   = float(df["RSI"].iloc[-1])
-    b_cur = ("🟢 Alcista" if (lc > le and lr > 50) else
-             "🔴 Bajista" if (lc < le and lr < 50) else "🟡 Neutral")
-
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        st.metric(f"TF Actual ({interval_label})", b_cur)
-        st.write(f"RSI: **{lr:.1f}** | {'Sobre' if lc > le else 'Bajo'} EMA50")
-
-    for col, tf in zip([col_b, col_c], [tf1, tf2]):
-        if tf and tf in mtf_data:
-            with col:
-                d = mtf_data[tf]
-                st.metric(f"TF Superior ({tf})", d["bias"])
-                st.write(f"RSI: **{d['rsi']}** | {d['ema_label']}")
-        elif tf:
-            with col:
-                st.metric(f"TF Superior ({tf})", "⚠️ Sin datos")
-
-    st.markdown("---")
-    biases  = [b_cur] + [mtf_data[tf]["bias"] for tf in [tf1, tf2] if tf and tf in mtf_data]
-    n_bull  = sum(1 for b in biases if "Alcista" in b)
-    n_bear  = sum(1 for b in biases if "Bajista" in b)
-    total   = len(biases)
-
-    if n_bull == total:
-        verdict = "✅ **ALINEACIÓN ALCISTA TOTAL** — Condiciones óptimas para COMPRA"
-    elif n_bear == total:
-        verdict = "🚨 **ALINEACIÓN BAJISTA TOTAL** — Condiciones óptimas para VENTA"
-    elif n_bull > n_bear:
-        verdict = f"🟡 **SESGO ALCISTA PARCIAL** ({n_bull}/{total} TF) — Opera con precaución"
-    elif n_bear > n_bull:
-        verdict = f"🟡 **SESGO BAJISTA PARCIAL** ({n_bear}/{total} TF) — Opera con precaución"
-    else:
-        verdict = "⚪ **SIN ALINEACIÓN** — Mercado en rango, mejor esperar"
-
-    st.markdown(f"### Veredicto\n> {verdict}")
-
-    # Mini gráficos por TF
-    st.markdown("---")
-    st.subheader("Gráficos por Timeframe")
-    tfs_show = [(interval_label, interval, period)] + [
-        (tf, tf, MTF_PERIOD.get(tf, "3mo")) for tf in [tf1, tf2] if tf
-    ]
-    cols = st.columns(len(tfs_show))
-    for col, (lbl, iv, per) in zip(cols, tfs_show):
-        with col:
-            st.caption(f"**{lbl}**")
-            try:
-                d_tf = get_data(ticker, per, iv)
-                if len(d_tf) >= 55:
-                    d_tf["EMA50"] = calc_ema(d_tf["Close"], 50)
-                    mini = go.Figure()
-                    mini.add_trace(go.Candlestick(
-                        x=d_tf.index[-60:], open=d_tf["Open"][-60:],
-                        high=d_tf["High"][-60:], low=d_tf["Low"][-60:],
-                        close=d_tf["Close"][-60:], showlegend=False,
-                        increasing_line_color="#26a69a",
-                        decreasing_line_color="#ef5350",
-                    ))
-                    mini.add_trace(go.Scatter(
-                        x=d_tf.index[-60:], y=d_tf["EMA50"][-60:],
-                        line=dict(color="#FFA726", width=1.5), showlegend=False,
-                    ))
-                    mini.update_layout(
-                        template="plotly_dark", height=220,
-                        xaxis_rangeslider_visible=False,
-                        margin=dict(l=0, r=0, t=5, b=0),
-                    )
-                    st.plotly_chart(mini, use_container_width=True)
-            except Exception:
-                st.info("Sin datos suficientes")
-
-
-# ══════════════════════════════════════════════
-# TAB 3 — BACKTESTING
-# ══════════════════════════════════════════════
-with tab_bt:
-    st.header(f"📊 Backtesting — {ticker} [{interval_label} · {period}]")
-    st.caption("Simulación histórica de la estrategia de confluencia. Long-only.")
-
-    bt_cap = st.number_input("Capital inicial (USD)", min_value=100,
-                              value=10_000, step=500, key="bt_cap")
-
-    if st.button("▶️ Ejecutar Backtest"):
-        with st.spinner("Simulando…"):
-            bt = run_backtest(df, float(bt_cap))
-        st.session_state["bt_results"] = bt
-
-    if "bt_results" in st.session_state:
-        bt = st.session_state["bt_results"]
-
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Retorno Total",  f"{bt['total_ret']:+.2f}%",
-                  f"${bt['final_equity']:,.0f}")
-        k2.metric("Win Rate",       f"{bt['win_rate']:.1f}%",
-                  f"{sum(1 for t in bt['trades'] if t['PnL USD']>0)} / {bt['n_trades']} trades")
-        k3.metric("Profit Factor",  f"{bt['profit_factor']:.2f}",
-                  "✅" if bt['profit_factor'] >= 1.5 else "⚠️")
-        k4.metric("Max Drawdown",   f"{bt['max_drawdown']:.2f}%")
-        k5.metric("Sharpe",         f"{bt['sharpe']:.2f}",
-                  "✅" if bt['sharpe'] >= 1 else "⚠️")
-
-        st.markdown("---")
-        eq_df = bt["equity_df"]
-        bm    = (df["Close"] / float(df["Close"].iloc[0])) * float(bt_cap)
-
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(
-            x=eq_df.index, y=eq_df["Equity"],
-            fill="tozeroy", fillcolor="rgba(38,166,154,0.15)",
-            line=dict(color="#26a69a", width=2), name="Estrategia"))
-        fig_eq.add_trace(go.Scatter(
-            x=bm.index, y=bm,
-            line=dict(color="#546E7A", width=1.5, dash="dash"), name="Buy & Hold"))
-        fig_eq.update_layout(template="plotly_dark", height=320,
-                              title="Equity vs Buy & Hold",
-                              margin=dict(l=0, r=0, t=40, b=0))
-        st.plotly_chart(fig_eq, use_container_width=True)
-
-        roll_max  = eq_df["Equity"].cummax()
-        dd_series = (eq_df["Equity"] - roll_max) / roll_max * 100
-        fig_dd = go.Figure()
-        fig_dd.add_trace(go.Scatter(
-            x=dd_series.index, y=dd_series,
-            fill="tozeroy", fillcolor="rgba(239,83,80,0.2)",
-            line=dict(color="#ef5350", width=1.5), name="Drawdown"))
-        fig_dd.update_layout(template="plotly_dark", height=200,
-                              title="Drawdown (%)",
-                              margin=dict(l=0, r=0, t=40, b=0))
-        st.plotly_chart(fig_dd, use_container_width=True)
-
-        st.markdown("---")
-        st.subheader("📋 Log de Operaciones")
-        if bt["trades"]:
-            td = pd.DataFrame(bt["trades"])
-            td["Fecha cierre"] = td["Fecha cierre"].apply(
-                lambda x: x.strftime(ts_fmt) if hasattr(x, "strftime") else str(x))
-            td["Entrada"] = td["Entrada"].apply(lambda x: f"${x:,.4f}")
-            td["Salida"]  = td["Salida"].apply(lambda x:  f"${x:,.4f}")
-            td["PnL USD"] = td["PnL USD"].apply(lambda x: f"${x:+,.2f}")
-            td["PnL %"]   = td["PnL %"].apply(lambda x:   f"{x:+.2f}%")
-            st.dataframe(td, use_container_width=True, hide_index=True)
-
-            buf_bt = io.StringIO()
-            td.to_csv(buf_bt, index=False)
-            st.download_button("⬇️ Exportar trades CSV",
-                               buf_bt.getvalue(),
-                               f"backtest_{ticker}_{datetime.now().strftime('%Y%m%d')}.csv",
-                               "text/csv")
-        else:
-            st.info("No se generaron operaciones en este período.")
-
-
-# ══════════════════════════════════════════════
-# TAB 4 — PAPER TRADING
-# ══════════════════════════════════════════════
-with tab_pt:
-    st.header(f"💼 Paper Trading — {ticker}")
-    st.caption("Simulación sin dinero real. Los datos tienen el retraso habitual de yfinance.")
-
-    port  = st.session_state.portfolio
-    price = float(df["Close"].iloc[-1])
-    sig   = df["Signal"].iloc[-1]
-
-    equity_now = port["cash"] + port["position"] * price
-    pnl_open   = (price - port["entry_price"]) * port["position"] if port["position"] > 0 else 0.0
-    ret_total  = (equity_now / st.session_state.pt_capital - 1) * 100
-
-    p1, p2, p3, p4, p5 = st.columns(5)
-    p1.metric("Equity",    f"${equity_now:,.2f}", f"{ret_total:+.2f}%")
-    p2.metric("Cash",      f"${port['cash']:,.2f}")
-    p3.metric("Posición",  f"{port['position']:,.6f} u",
-              f"Entry: ${port['entry_price']:,.4f}" if port["position"] > 0 else "—")
-    p4.metric("PnL abierto", f"${pnl_open:+,.2f}",
-              f"{(pnl_open/(port['entry_price']*port['position'])*100):+.2f}%"
-              if port["position"] > 0 else "—")
-    p5.metric("Trades", len(port["trades"]))
-
-    st.markdown("---")
-    col_b, col_s, col_i = st.columns([1, 1, 2])
-
-    invest_usd = port["cash"] * (pt_size_pct / 100)
-    units_buy  = invest_usd / price if price > 0 else 0
-
-    with col_b:
-        st.subheader("🟢 COMPRAR")
-        st.write(f"Precio: **${price:,.4f}**")
-        st.write(f"Invertir: **${invest_usd:,.2f}** ({pt_size_pct}%)")
-        st.write(f"Unidades: **{units_buy:,.6f}**")
-        if st.button("✅ Ejecutar COMPRA",
-                     disabled=port["position"] > 0 or port["cash"] < 1,
-                     use_container_width=True):
-            port["cash"]        -= invest_usd
-            port["position"]    += units_buy
-            port["entry_price"]  = price
-            port["trades"].append({
-                "Tipo": "COMPRA", "Precio": price, "Unidades": units_buy,
-                "Total": invest_usd,
-                "SL": float(df["SL_Buy"].iloc[-1]),
-                "TP": float(df["TP_Buy"].iloc[-1]),
-                "Fecha": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                "PnL USD": None,
-            })
-            port["equity_curve"].append({"Fecha": datetime.now(), "Equity": equity_now})
-            st.success(f"Compra: {units_buy:,.6f} u @ ${price:,.4f}")
-            st.rerun()
-
-    with col_s:
-        st.subheader("🔴 VENDER")
-        if port["position"] > 0:
-            sale_val = port["position"] * price
-            pnl_s    = sale_val - port["entry_price"] * port["position"]
-            st.write(f"Posición: **{port['position']:,.6f} u**")
-            st.write(f"Valor: **${sale_val:,.2f}**")
-            st.write(f"PnL est.: **${pnl_s:+,.2f}**")
-        else:
-            st.write("Sin posición abierta")
-        if st.button("🔴 Ejecutar VENTA",
-                     disabled=port["position"] == 0,
-                     use_container_width=True):
-            sale_val = port["position"] * price
-            pnl_s    = sale_val - port["entry_price"] * port["position"]
-            if port["trades"]:
-                port["trades"][-1]["PnL USD"] = round(pnl_s, 2)
-            port["cash"]        += sale_val
-            port["equity_curve"].append({"Fecha": datetime.now(), "Equity": port["cash"]})
-            port["position"]     = 0.0
-            port["entry_price"]  = 0.0
-            st.success(f"Venta ejecutada — PnL: ${pnl_s:+,.2f}")
-            st.rerun()
-
-    with col_i:
-        st.subheader("📡 Señal Actual")
-        st.info(f"Confluencia: **{sig_icon.get(sig,'')} {sig}**")
-        if sig == "BUY":
-            st.success("El motor detecta señal de COMPRA — puede ejecutar manualmente.")
-        elif sig == "SELL":
-            st.warning("El motor detecta señal de VENTA — considera cerrar la posición.")
-        else:
-            st.write("Sin señal activa — espera confluencia.")
-
-    if port["trades"]:
-        st.markdown("---")
-        st.subheader("📋 Historial Paper")
-        pt_df = pd.DataFrame(port["trades"])
-        pt_df["Precio"] = pt_df["Precio"].apply(lambda x: f"${x:,.4f}")
-        pt_df["Total"]  = pt_df["Total"].apply(lambda x:  f"${x:,.2f}")
-        pt_df["PnL USD"]= pt_df["PnL USD"].apply(
-            lambda x: f"${x:+,.2f}" if x is not None else "Abierta")
+    with st.expander("📊 Datos recientes"):
+        cols_show = [c for c in ['Close','EMA20','EMA50','RSI','MACD','BB_UPPER','BB_LOWER','ATR']
+                     if c in df.columns]
         st.dataframe(
-            pt_df[["Fecha","Tipo","Precio","Unidades","Total","PnL USD"]],
-            use_container_width=True, hide_index=True,
+            df[cols_show].tail(30).sort_index(ascending=False).style.format("{:.4f}"),
+            use_container_width=True,
+        )
+        csv = df[cols_show].to_csv().encode()
+        st.download_button("⬇️ Descargar CSV", csv, f"{ticker}_indicadores.csv", "text/csv")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — SEÑALES EN PARALELO
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.subheader("🌐 Señales del Mercado — Vista en Paralelo")
+    st.caption(f"Período: {period} · Caché 5 min — ordenado por puntuación")
+
+    todos  = {**ACCIONES, **CRYPTOS}
+    filas  = []
+    prog   = st.progress(0)
+    for i, (nm, sym) in enumerate(todos.items()):
+        prog.progress((i + 1) / len(todos))
+        try:
+            d = get_data(sym, period)
+            if d.empty or len(d) < 30:
+                continue
+            inf = generar_senal(d)
+            p   = float(d['Close'].iloc[-1])
+            pv  = float(d['Close'].iloc[-2]) if len(d) > 1 else p
+            chg_row = ((p / pv) - 1) * 100 if pv > 0 else 0
+            filas.append({
+                "Activo":   nm,
+                "Ticker":   sym,
+                "Precio":   p,
+                "Cambio %": round(chg_row, 2),
+                "RSI":      round(float(d['RSI'].iloc[-1]), 1),
+                "ATR":      round(float(d['ATR'].iloc[-1]), 4),
+                "Señal":    inf['senal'],
+                "Puntos":   inf['puntos'],
+            })
+        except Exception:
+            continue
+    prog.empty()
+
+    if filas:
+        df_radar = pd.DataFrame(filas).sort_values("Puntos", ascending=False)
+
+        def color_senal(val):
+            if "COMPRA FUERTE" in str(val): return "color:#00ff88;font-weight:bold"
+            if "COMPRA DÉBIL"  in str(val): return "color:#ffd700"
+            if "VENTA FUERTE"  in str(val): return "color:#ff4444;font-weight:bold"
+            if "VENTA DÉBIL"   in str(val): return "color:#ff8c00"
+            return "color:#aaaaaa"
+
+        def color_num(val):
+            try:
+                return "color:#00ff88" if float(val) > 0 else ("color:#ff4444" if float(val) < 0 else "")
+            except Exception:
+                return ""
+
+        st.dataframe(
+            df_radar.style
+                .applymap(color_senal, subset=["Señal"])
+                .applymap(color_num,   subset=["Cambio %", "Puntos"])
+                .format({"Precio": "{:,.4f}", "Cambio %": "{:+.2f}%",
+                         "RSI": "{:.1f}", "ATR": "{:.4f}"}),
+            use_container_width=True, height=620,
         )
 
-        if len(port["equity_curve"]) >= 2:
-            eq_pt = pd.DataFrame(port["equity_curve"])
-            fig_pt = go.Figure()
-            fig_pt.add_trace(go.Scatter(
-                x=eq_pt["Fecha"], y=eq_pt["Equity"],
-                fill="tozeroy", fillcolor="rgba(171,71,188,0.15)",
-                line=dict(color="#AB47BC", width=2), name="Equity Paper"))
-            fig_pt.add_hline(y=st.session_state.pt_capital,
-                             line_dash="dash", line_color="#546E7A", opacity=0.5)
-            fig_pt.update_layout(template="plotly_dark", height=250,
-                                 title="Curva de Equity Paper",
-                                 margin=dict(l=0, r=0, t=40, b=0))
-            st.plotly_chart(fig_pt, use_container_width=True)
+        fig_bar = px.bar(
+            df_radar, x="Activo", y="Puntos", color="Puntos",
+            color_continuous_scale=["#ff4444","#555555","#00ff88"],
+            title="Puntuación de Confluencia por Activo",
+            template="plotly_dark",
+        )
+        fig_bar.update_layout(paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                               coloraxis_showscale=False, height=380,
+                               xaxis_tickangle=-35)
+        st.plotly_chart(fig_bar, use_container_width=True)
 
-# ─────────────────────────────────────────────
-# FOOTER
-# ─────────────────────────────────────────────
-st.markdown("---")
-st.caption("⚠️ Solo para fines educativos. No constituye asesoramiento financiero.")
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — COMPARACIÓN RELATIVA
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.subheader(f"📉 Rendimiento relativo: {ticker} vs benchmark")
+
+    _, col_bench = st.columns([3, 1])
+    with col_bench:
+        bench_input = st.text_input("Benchmark", value=benchmark).upper().strip()
+    bench_usado = bench_input if bench_input else benchmark
+
+    with st.spinner("Cargando comparación..."):
+        s_activo = get_close_only(ticker,      period)
+        s_bench  = get_close_only(bench_usado, period)
+
+    if s_activo.empty or s_bench.empty:
+        st.warning("No se pudieron obtener datos para la comparación.")
+    else:
+        df_comp = pd.DataFrame({ticker: s_activo, bench_usado: s_bench}).dropna()
+        df_norm = df_comp / df_comp.iloc[0] * 100
+
+        fig_comp = go.Figure()
+        fig_comp.add_trace(go.Scatter(
+            x=df_norm.index, y=df_norm[ticker],
+            name=ticker, line=dict(color="#00cfff", width=2.2)))
+        fig_comp.add_trace(go.Scatter(
+            x=df_norm.index, y=df_norm[bench_usado],
+            name=bench_usado, line=dict(color="#ffd700", width=2, dash="dash")))
+        fig_comp.add_hline(y=100, line_color="rgba(255,255,255,0.15)", line_dash="dot")
+
+        diff = df_norm[ticker] - df_norm[bench_usado]
+        color_area = "rgba(0,255,136,0.1)" if float(diff.iloc[-1]) >= 0 else "rgba(255,68,68,0.1)"
+        base = df_norm[bench_usado]
+        fig_comp.add_trace(go.Scatter(
+            x=df_norm.index,
+            y=base + diff,
+            fill='tonexty',
+            fillcolor=color_area,
+            line=dict(width=0),
+            name="Diferencia",
+        ))
+
+        fig_comp.update_layout(
+            template="plotly_dark", height=460,
+            title=f"Rendimiento normalizado (base 100) — {period}",
+            paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            legend=dict(orientation="h"),
+        )
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+        ret_a = float(df_norm[ticker].iloc[-1]    - 100)
+        ret_b = float(df_norm[bench_usado].iloc[-1] - 100)
+        alpha = ret_a - ret_b
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric(f"Retorno {ticker}",     f"{ret_a:+.2f}%")
+        m2.metric(f"Retorno {bench_usado}", f"{ret_b:+.2f}%")
+        m3.metric("Alpha",                  f"{alpha:+.2f}%")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — CORRELACIÓN
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.subheader("🔗 Matriz de Correlación")
+
+    col_tipo_corr = st.radio(
+        "Conjunto", ["📈 Acciones", "₿ Criptomonedas"],
+        horizontal=True, key="corr_tipo")
+    preset_corr = ACCIONES if "Acciones" in col_tipo_corr else CRYPTOS
+
+    with st.spinner("Calculando correlaciones..."):
+        series_list = []
+        for nm, sym in preset_corr.items():
+            s = get_close_only(sym, period)
+            if not s.empty:
+                s.name = nm.split("(")[0].strip()
+                series_list.append(s)
+
+    if len(series_list) < 2:
+        st.warning("No hay suficientes datos.")
+    else:
+        df_corr = pd.concat(series_list, axis=1).dropna()
+        corr    = df_corr.pct_change().dropna().corr()
+
+        fig_corr = px.imshow(
+            corr,
+            color_continuous_scale="RdYlGn",
+            zmin=-1, zmax=1,
+            text_auto=".2f",
+            title=f"Correlación de retornos diarios — {period}",
+            template="plotly_dark",
+        )
+        fig_corr.update_layout(paper_bgcolor="#0d1117", height=540,
+                                coloraxis_colorbar=dict(title="ρ"))
+        fig_corr.update_traces(textfont_size=11)
+        st.plotly_chart(fig_corr, use_container_width=True)
+        st.caption("🟢 Alta correlación positiva · 🔴 Correlación negativa · Útil para diversificación de portafolio")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — PAPER TRADING & NOTAS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab5:
+
+    col_pt, col_notas = st.columns([3, 2])
+
+    # Paper Trading
+    with col_pt:
+        st.subheader("📒 Paper Trading")
+        st.caption("Operaciones simuladas — datos guardados en esta sesión")
+
+        with st.form("nueva_operacion", clear_on_submit=True):
+            st.markdown(f"**Activo:** `{ticker}` · Precio actual: `${price:,.4f}`")
+            c1, c2, c3 = st.columns(3)
+            entrada_pt = c1.number_input("Entrada ($)",    value=round(price, 4),    format="%.4f")
+            sl_pt      = c2.number_input("Stop Loss ($)",  value=round(info['sl'],4), format="%.4f")
+            tp_pt      = c3.number_input("Take Profit ($)", value=round(info['tp'],4), format="%.4f")
+            c4, c5     = st.columns(2)
+            capital_pt = c4.number_input("Capital ($)", value=1000.0, min_value=1.0, format="%.2f")
+            lado_pt    = c5.selectbox("Dirección", ["LONG", "SHORT"])
+            nota_op    = st.text_input("Nota (opcional)")
+            submitted  = st.form_submit_button("➕ Registrar operación")
+
+        if submitted:
+            riesgo  = abs(entrada_pt - sl_pt)
+            reward  = abs(tp_pt - entrada_pt)
+            rr      = round(reward / riesgo, 2) if riesgo > 0 else 0
+            tamanio = round(capital_pt * 0.02 / riesgo, 4) if riesgo > 0 else 0
+            st.session_state.paper_trades.append({
+                "Fecha":   datetime.now().strftime("%d/%m/%Y %H:%M"),
+                "Ticker":  ticker,
+                "Lado":    lado_pt,
+                "Entrada": entrada_pt,
+                "SL":      sl_pt,
+                "TP":      tp_pt,
+                "R/R":     rr,
+                "Tamaño":  tamanio,
+                "Capital": capital_pt,
+                "Estado":  "🟡 Abierta",
+                "Nota":    nota_op,
+            })
+            st.success(f"✅ Registrada · R/R: **{rr}** · Tamaño sugerido (2% riesgo): **{tamanio}** unidades")
+
+        trades = st.session_state.paper_trades
+        if trades:
+            def evaluar_estado(row):
+                try:
+                    if row['Ticker'] != ticker:
+                        return row['Estado']
+                    if row['Lado'] == "LONG":
+                        if price <= row['SL']: return "🔴 SL tocado"
+                        if price >= row['TP']: return "🟢 TP alcanzado"
+                    else:
+                        if price >= row['SL']: return "🔴 SL tocado"
+                        if price <= row['TP']: return "🟢 TP alcanzado"
+                except Exception:
+                    pass
+                return "🟡 Abierta"
+
+            df_trades = pd.DataFrame(trades)
+            df_trades['Estado'] = df_trades.apply(evaluar_estado, axis=1)
+
+            st.dataframe(df_trades, use_container_width=True, height=280)
+
+            total    = len(df_trades)
+            ganadas  = (df_trades['Estado'] == "🟢 TP alcanzado").sum()
+            perdidas = (df_trades['Estado'] == "🔴 SL tocado").sum()
+            winrate  = round(ganadas / (ganadas + perdidas) * 100, 1) if (ganadas + perdidas) > 0 else 0
+
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Total",         total)
+            s2.metric("✅ TP alcanzado", ganadas)
+            s3.metric("❌ SL tocado",   perdidas)
+            s4.metric("Win Rate",       f"{winrate}%")
+
+            if st.button("🗑️ Limpiar operaciones"):
+                st.session_state.paper_trades = []
+                st.rerun()
+        else:
+            st.info("Aún no hay operaciones. Registra una con el formulario de arriba.")
+
+    # Notas del Trader
+    with col_notas:
+        st.subheader("✏️ Notas del Trader")
+        st.caption(f"Nota activa: **{ticker}**")
+
+        nota_actual = st.session_state.notas.get(ticker, "")
+        nueva_nota  = st.text_area(
+            "Tesis, niveles clave, catalizadores...",
+            value=nota_actual,
+            height=220,
+            key=f"nota_{ticker}",
+        )
+        if st.button("💾 Guardar nota"):
+            st.session_state.notas[ticker] = nueva_nota
+            st.success("Nota guardada ✓")
+
+        notas_otras = {k: v for k, v in st.session_state.notas.items()
+                       if v.strip() and k != ticker}
+        if notas_otras:
+            st.markdown("---")
+            st.markdown("**Otras notas guardadas:**")
+            for sym_n, texto_n in notas_otras.items():
+                with st.expander(f"📌 {sym_n}"):
+                    st.write(texto_n)
