@@ -7,6 +7,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime
 from scipy.signal import argrelextrema
+import time
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -147,11 +148,35 @@ def generar_senal(df: pd.DataFrame) -> dict:
 # CARGA DE DATOS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _yf_download_safe(ticker: str, period: str, intentos: int = 3) -> pd.DataFrame:
+    """Descarga con retry y manejo explícito de YFRateLimitError."""
+    for intento in range(intentos):
+        try:
+            df = yf.download(ticker, period=period, progress=False,
+                             auto_adjust=True, timeout=15)
+            if not df.empty:
+                return df
+            # Fallback a Ticker.history
+            df2 = yf.Ticker(ticker).history(period=period)
+            if not df2.empty:
+                return df2
+            return pd.DataFrame()
+        except Exception as e:
+            nombre_error = type(e).__name__
+            if "RateLimit" in nombre_error or "TooManyRequests" in nombre_error:
+                if intento < intentos - 1:
+                    espera = 2 ** (intento + 1)   # 2s, 4s, 8s
+                    time.sleep(espera)
+                    continue
+                # Agotamos los reintentos
+                raise
+            # Cualquier otro error: re-lanzar
+            raise
+    return pd.DataFrame()
+
 @st.cache_data(ttl=300)
 def get_data(ticker: str, period: str) -> pd.DataFrame:
-    df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-    if df.empty:
-        df = yf.Ticker(ticker).history(period=period)
+    df = _yf_download_safe(ticker, period)
     if df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
@@ -172,7 +197,10 @@ def get_data(ticker: str, period: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def get_close_only(ticker: str, period: str) -> pd.Series:
-    df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+    try:
+        df = _yf_download_safe(ticker, period)
+    except Exception:
+        return pd.Series(dtype=float, name=ticker)
     if df.empty:
         return pd.Series(dtype=float, name=ticker)
     if isinstance(df.columns, pd.MultiIndex):
@@ -228,10 +256,26 @@ if not ticker:
     st.stop()
 
 with st.spinner(f"Analizando {ticker}..."):
-    df = get_data(ticker, period)
+    try:
+        df = get_data(ticker, period)
+    except Exception as e:
+        nombre_e = type(e).__name__
+        if "RateLimit" in nombre_e or "TooManyRequests" in nombre_e:
+            st.error(
+                "⚠️ **Yahoo Finance está limitando las peticiones** desde este servidor. "
+                "Esto es un límite temporal de la IP de Streamlit Cloud, no un error del código. "
+                "Espera 30-60 segundos y recarga la página, o prueba con otro ticker.",
+                icon="🚦",
+            )
+        else:
+            st.error(f"Error al descargar datos para **{ticker}**: {nombre_e}")
+        st.stop()
 
 if df.empty:
-    st.error(f"No se encontraron datos para **{ticker}**.")
+    st.error(
+        f"No se encontraron datos para **{ticker}**. "
+        "Verifica que el ticker sea válido (ej: AAPL, BTC-USD, ^IPSA)."
+    )
     st.stop()
 
 info  = generar_senal(df)
