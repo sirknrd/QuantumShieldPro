@@ -8,6 +8,8 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 from scipy.signal import argrelextrema
 import time
+import requests
+import json
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -57,6 +59,12 @@ if "paper_trades" not in st.session_state:
     st.session_state.paper_trades = []
 if "notas" not in st.session_state:
     st.session_state.notas = {}
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = {}   # {ticker: [{"role":..,"content":..}]}
+if "analisis_cache" not in st.session_state:
+    st.session_state.analisis_cache = {}  # {ticker+period: texto}
+if "noticias_cache" not in st.session_state:
+    st.session_state.noticias_cache = {}  # {ticker: texto}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICADORES
@@ -207,6 +215,88 @@ def get_close_only(ticker: str, period: str) -> pd.Series:
         df.columns = df.columns.get_level_values(0)
     return df['Close'].rename(ticker)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IA — Claude API helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL   = "claude-sonnet-4-20250514"
+CLAUDE_HEADERS = {
+    "Content-Type": "application/json",
+    "anthropic-version": "2023-06-01",
+}
+
+def _claude(system: str, user: str, max_tokens: int = 1000) -> str:
+    """Llamada simple a Claude. Retorna texto o mensaje de error."""
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    try:
+        resp = requests.post(CLAUDE_API_URL, headers=CLAUDE_HEADERS,
+                             json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["content"][0]["text"]
+    except requests.exceptions.HTTPError as e:
+        if resp.status_code == 401:
+            return "❌ API key inválida. Agrega ANTHROPIC_API_KEY en los secretos de Streamlit."
+        return f"❌ Error HTTP {resp.status_code}: {e}"
+    except Exception as e:
+        return f"❌ Error de conexión: {e}"
+
+def _claude_stream(system: str, messages: list, max_tokens: int = 1000):
+    """Streaming para el chat. Yield de chunks de texto."""
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": messages,
+        "stream": True,
+    }
+    try:
+        with requests.post(CLAUDE_API_URL, headers=CLAUDE_HEADERS,
+                           json=payload, timeout=60, stream=True) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                line = line.decode("utf-8")
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        if chunk.get("type") == "content_block_delta":
+                            yield chunk["delta"].get("text", "")
+                    except json.JSONDecodeError:
+                        continue
+    except Exception as e:
+        yield f"\n❌ Error de streaming: {e}"
+
+def _resumen_tecnico(ticker: str, df: pd.DataFrame, info: dict) -> str:
+    """Construye un resumen compacto del estado técnico para pasarle a Claude."""
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else last
+    chg  = ((float(last["Close"]) / float(prev["Close"])) - 1) * 100
+    return f"""
+Ticker: {ticker}
+Precio: ${float(last["Close"]):,.4f} ({chg:+.2f}% hoy)
+EMA20: {float(last["EMA20"]):,.4f} | EMA50: {float(last["EMA50"]):,.4f}
+RSI(14): {float(last["RSI"]):.1f}
+MACD: {float(last["MACD"]):.4f} | Señal MACD: {float(last["MACD_SIGNAL"]):.4f}
+BB Superior: {float(last["BB_UPPER"]):,.4f} | BB Inferior: {float(last["BB_LOWER"]):,.4f}
+ATR(14): {float(last["ATR"]):,.4f}
+Stop Loss sugerido: ${info["sl"]:,.4f} | Take Profit sugerido: ${info["tp"]:,.4f}
+Señal de confluencia: {info["senal"]} (puntuación: {info["puntos"]:+d})
+Razones: {"; ".join(info["razones"])}
+""".strip()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -241,6 +331,25 @@ with st.sidebar:
     mostrar_volumen = st.checkbox("Volumen",               value=True)
     mostrar_sr      = st.checkbox("Soporte/Resistencia",   value=True)
     mostrar_vanom   = st.checkbox("Volumen anómalo",       value=True)
+
+    st.markdown("---")
+    st.subheader("🤖 IA")
+    api_key_input = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        placeholder="sk-ant-...",
+        help="Necesaria para las funciones de IA. Obtén la tuya en console.anthropic.com",
+    )
+    if api_key_input:
+        CLAUDE_HEADERS["x-api-key"] = api_key_input
+        st.success("API key cargada ✓", icon="🔑")
+    else:
+        # Intentar desde st.secrets
+        try:
+            CLAUDE_HEADERS["x-api-key"] = st.secrets["ANTHROPIC_API_KEY"]
+            st.success("API key desde secrets ✓", icon="🔑")
+        except Exception:
+            st.warning("Sin API key — IA desactivada", icon="⚠️")
 
     st.markdown("---")
     st.caption("Datos vía Yahoo Finance · Caché 5 min")
@@ -288,12 +397,13 @@ chg   = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 e
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Análisis",
     "🌐 Señales del Mercado",
     "📉 Comparación Relativa",
     "🔗 Correlación",
     "📒 Paper Trading & Notas",
+    "🤖 Asistente IA",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -717,3 +827,186 @@ with tab5:
             for sym_n, texto_n in notas_otras.items():
                 with st.expander(f"📌 {sym_n}"):
                     st.write(texto_n)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — ASISTENTE IA
+# ══════════════════════════════════════════════════════════════════════════════
+with tab6:
+
+    ia_activa = "x-api-key" in CLAUDE_HEADERS and CLAUDE_HEADERS["x-api-key"]
+
+    if not ia_activa:
+        st.warning("Ingresa tu Anthropic API key en el panel izquierdo para activar las funciones de IA.")
+        st.info("Obtén una en [console.anthropic.com](https://console.anthropic.com) · El tier gratuito es suficiente para esta app.")
+        st.stop()
+
+    resumen_tecnico = _resumen_tecnico(ticker, df, info)
+
+    # ── Sección 1: Análisis narrativo ──────────────────────────────────────
+    st.subheader(f"🤖 Análisis narrativo — {ticker}")
+
+    cache_key_analisis = f"{ticker}_{period}"
+    col_an1, col_an2 = st.columns([1, 5])
+    with col_an1:
+        regenerar = st.button("🔄 Generar / Actualizar análisis")
+
+    if regenerar or cache_key_analisis not in st.session_state.analisis_cache:
+        with st.spinner("Claude está analizando los indicadores..."):
+            sistema_analisis = """Eres un analista técnico senior especializado en trading de acciones y criptomonedas.
+Tu tarea es leer un resumen de indicadores técnicos y generar un análisis narrativo claro, 
+conciso y profesional en español. Estructura tu respuesta así:
+1. **Contexto general** (1-2 oraciones sobre la tendencia)
+2. **Señales clave** (bullet points de los indicadores más relevantes)
+3. **Escenario alcista** (qué necesita pasar para confirmar subida)
+4. **Escenario bajista** (qué niveles vigilar para baja)
+5. **Conclusión** (1 oración directa)
+Sé directo, evita repetir los números del resumen textualmente."""
+
+            analisis_texto = _claude(
+                system=sistema_analisis,
+                user=f"Analiza este activo:\n\n{resumen_tecnico}",
+                max_tokens=700,
+            )
+            st.session_state.analisis_cache[cache_key_analisis] = analisis_texto
+
+    st.markdown(st.session_state.analisis_cache.get(cache_key_analisis, ""))
+
+    st.markdown("---")
+
+    # ── Sección 2: Noticias + Sentimiento ─────────────────────────────────
+    st.subheader(f"📰 Noticias recientes + Sentimiento — {ticker}")
+
+    col_n1, col_n2 = st.columns([1, 5])
+    with col_n1:
+        buscar_noticias = st.button("🔍 Buscar noticias y analizar")
+
+    if buscar_noticias or ticker not in st.session_state.noticias_cache:
+        with st.spinner("Buscando noticias y analizando sentimiento..."):
+            sistema_noticias = """Eres un analista financiero experto en análisis de sentimiento de mercado.
+Cuando el usuario te pida analizar noticias de un activo financiero, debes:
+1. Resumir el contexto de mercado actual de ese activo (basado en tu conocimiento)
+2. Identificar los principales catalizadores positivos y negativos recientes
+3. Dar una puntuación de sentimiento del -10 (muy bajista) al +10 (muy alcista) con justificación
+4. Mencionar eventos próximos relevantes (earnings, halvings, regulaciones, etc.) si los conoces
+Formato: usa emojis, sé visual y directo. Responde en español."""
+
+            noticias_texto = _claude(
+                system=sistema_noticias,
+                user=f"Analiza el sentimiento actual de mercado para {ticker}. Datos técnicos de contexto:\n{resumen_tecnico}",
+                max_tokens=700,
+            )
+            st.session_state.noticias_cache[ticker] = noticias_texto
+
+    if ticker in st.session_state.noticias_cache:
+        st.markdown(st.session_state.noticias_cache[ticker])
+
+    st.markdown("---")
+
+    # ── Sección 3: Generador de tesis ──────────────────────────────────────
+    st.subheader(f"📝 Generador de tesis de inversión — {ticker}")
+
+    col_t1, col_t2, col_t3 = st.columns([1, 1, 4])
+    with col_t1:
+        horizonte = st.selectbox("Horizonte", ["Corto plazo (días)", "Mediano plazo (semanas)", "Largo plazo (meses)"])
+    with col_t2:
+        perfil    = st.selectbox("Perfil de riesgo", ["Conservador", "Moderado", "Agresivo"])
+
+    generar_tesis = st.button("✍️ Generar tesis de inversión")
+
+    if generar_tesis:
+        with st.spinner("Generando tesis..."):
+            sistema_tesis = """Eres un gestor de portafolio profesional. Genera una tesis de inversión 
+estructurada, práctica y en español. Usa este formato exacto:
+
+## 🎯 Tesis: [COMPRA/VENTA/NEUTRAL] [Ticker]
+
+**Resumen ejecutivo** (2-3 oraciones)
+
+**📈 Argumentos a favor**
+- [bullet]
+
+**📉 Riesgos principales**  
+- [bullet]
+
+**🎯 Niveles clave**
+- Entrada ideal: $X
+- Stop Loss: $X  
+- Target 1: $X | Target 2: $X
+- R/R: X:1
+
+**📋 Plan de acción**
+[1-2 oraciones sobre cuándo y cómo entrar]
+
+Sé específico con los precios. Adapta el tono al perfil de riesgo indicado."""
+
+            tesis_texto = _claude(
+                system=sistema_tesis,
+                user=f"Genera una tesis de inversión para {ticker}.\nHorizonte: {horizonte}\nPerfil: {perfil}\nDatos técnicos:\n{resumen_tecnico}",
+                max_tokens=800,
+            )
+
+        st.markdown(tesis_texto)
+
+        # Ofrecer guardar como nota del trader
+        if st.button("💾 Guardar tesis como nota del trader"):
+            st.session_state.notas[ticker] = tesis_texto
+            st.success(f"Tesis guardada en notas de {ticker} ✓")
+
+    st.markdown("---")
+
+    # ── Sección 4: Chat con el gráfico ─────────────────────────────────────
+    st.subheader(f"💬 Chat con el asistente — {ticker}")
+    st.caption("Pregunta lo que quieras sobre este activo, su situación técnica o el mercado en general.")
+
+    # Inicializar historial del ticker
+    if ticker not in st.session_state.chat_history:
+        st.session_state.chat_history[ticker] = []
+
+    historial = st.session_state.chat_history[ticker]
+
+    # Mostrar mensajes anteriores
+    for msg in historial:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Input del usuario
+    prompt_chat = st.chat_input(f"Pregunta sobre {ticker}...")
+
+    if prompt_chat:
+        # Añadir mensaje del usuario
+        historial.append({"role": "user", "content": prompt_chat})
+        with st.chat_message("user"):
+            st.markdown(prompt_chat)
+
+        # Contexto del sistema para el chat
+        sistema_chat = f"""Eres un asistente experto en trading y análisis financiero que trabaja dentro de 
+QuantumShield Pro, una app de análisis técnico. Tienes acceso al contexto técnico actual del activo {ticker}.
+
+DATOS TÉCNICOS ACTUALES:
+{resumen_tecnico}
+
+Responde siempre en español, de forma clara y concisa. Si te preguntan sobre otros activos o temas 
+generales de trading, responde con tu conocimiento general. No des consejos financieros definitivos, 
+enfatiza que es análisis técnico educativo."""
+
+        # Construir mensajes para la API (últimos 10 para no saturar contexto)
+        mensajes_api = historial[-10:]
+
+        # Streaming de respuesta
+        with st.chat_message("assistant"):
+            respuesta_placeholder = st.empty()
+            respuesta_completa    = ""
+            for chunk in _claude_stream(sistema_chat, mensajes_api, max_tokens=600):
+                respuesta_completa += chunk
+                respuesta_placeholder.markdown(respuesta_completa + "▌")
+            respuesta_placeholder.markdown(respuesta_completa)
+
+        historial.append({"role": "assistant", "content": respuesta_completa})
+
+        # Limpiar chat
+        if len(historial) > 40:
+            st.session_state.chat_history[ticker] = historial[-40:]
+
+    if historial and st.button("🗑️ Limpiar chat", key="clear_chat"):
+        st.session_state.chat_history[ticker] = []
+        st.rerun()
