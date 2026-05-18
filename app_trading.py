@@ -221,7 +221,7 @@ def get_close_only(ticker: str, period: str) -> pd.Series:
 # ══════════════════════════════════════════════════════════════════════════════
 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL   = "claude-sonnet-4-20250514"
+CLAUDE_MODEL   = "claude-haiku-4-5-20251001"   # rápido y económico para trading
 CLAUDE_HEADERS = {
     "Content-Type": "application/json",
     "anthropic-version": "2023-06-01",
@@ -229,6 +229,8 @@ CLAUDE_HEADERS = {
 
 def _claude(system: str, user: str, max_tokens: int = 1000) -> str:
     """Llamada simple a Claude. Retorna texto o mensaje de error."""
+    if "x-api-key" not in CLAUDE_HEADERS or not CLAUDE_HEADERS["x-api-key"]:
+        return "❌ API key no configurada."
     payload = {
         "model": CLAUDE_MODEL,
         "max_tokens": max_tokens,
@@ -238,36 +240,59 @@ def _claude(system: str, user: str, max_tokens: int = 1000) -> str:
     try:
         resp = requests.post(CLAUDE_API_URL, headers=CLAUDE_HEADERS,
                              json=payload, timeout=30)
-        resp.raise_for_status()
+        if not resp.ok:
+            try:
+                detalle = resp.json().get("error", {}).get("message", resp.text[:200])
+            except Exception:
+                detalle = resp.text[:200]
+            if resp.status_code == 401:
+                return "❌ API key inválida o sin permisos. Verifica en console.anthropic.com"
+            if resp.status_code == 400:
+                return f"❌ Solicitud inválida: {detalle}"
+            return f"❌ Error HTTP {resp.status_code}: {detalle}"
         data = resp.json()
         return data["content"][0]["text"]
-    except requests.exceptions.HTTPError as e:
-        if resp.status_code == 401:
-            return "❌ API key inválida. Agrega ANTHROPIC_API_KEY en los secretos de Streamlit."
-        return f"❌ Error HTTP {resp.status_code}: {e}"
     except Exception as e:
         return f"❌ Error de conexión: {e}"
 
 def _claude_stream(system: str, messages: list, max_tokens: int = 1000):
     """Streaming para el chat. Yield de chunks de texto."""
+    if "x-api-key" not in CLAUDE_HEADERS or not CLAUDE_HEADERS["x-api-key"]:
+        yield "❌ API key no configurada."
+        return
+    # Filtrar mensajes: solo role user/assistant, content string
+    mensajes_limpios = [
+        {"role": m["role"], "content": str(m["content"])}
+        for m in messages
+        if m.get("role") in ("user", "assistant") and m.get("content")
+    ]
+    if not mensajes_limpios:
+        yield "❌ Sin mensajes para enviar."
+        return
     payload = {
         "model": CLAUDE_MODEL,
         "max_tokens": max_tokens,
         "system": system,
-        "messages": messages,
+        "messages": mensajes_limpios,
         "stream": True,
     }
     try:
         with requests.post(CLAUDE_API_URL, headers=CLAUDE_HEADERS,
                            json=payload, timeout=60, stream=True) as resp:
-            resp.raise_for_status()
+            if not resp.ok:
+                try:
+                    detalle = resp.json().get("error", {}).get("message", resp.text[:200])
+                except Exception:
+                    detalle = resp.text[:200]
+                yield f"\n❌ Error {resp.status_code}: {detalle}"
+                return
             for line in resp.iter_lines():
                 if not line:
                     continue
                 line = line.decode("utf-8")
                 if line.startswith("data: "):
                     data_str = line[6:]
-                    if data_str == "[DONE]":
+                    if data_str.strip() == "[DONE]":
                         break
                     try:
                         chunk = json.loads(data_str)
@@ -276,7 +301,7 @@ def _claude_stream(system: str, messages: list, max_tokens: int = 1000):
                     except json.JSONDecodeError:
                         continue
     except Exception as e:
-        yield f"\n❌ Error de streaming: {e}"
+        yield f"\n❌ Error de conexión: {e}"
 
 def _resumen_tecnico(ticker: str, df: pd.DataFrame, info: dict) -> str:
     """Construye un resumen compacto del estado técnico para pasarle a Claude."""
