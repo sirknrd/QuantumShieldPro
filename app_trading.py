@@ -173,8 +173,14 @@ def descargar_datos(ticker, dias):
             end=(today + timedelta(days=1)).strftime("%Y-%m-%d")
         )
     if isinstance(df.columns, pd.MultiIndex):
-        df = df.droplevel(0, axis=1)
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+        # yfinance nuevo: nivel 0 = campo, nivel 1 = ticker
+        # yfinance viejo: nivel 0 = ticker, nivel 1 = campo
+        if df.columns.get_level_values(0)[0] in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df.columns = df.columns.get_level_values(0)   # nuevo formato
+        else:
+            df.columns = df.columns.get_level_values(1)   # viejo formato
+    cols_disponibles = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
+    df = df[cols_disponibles].dropna()
     return df
 
 # ─────────────────────────────────────────
