@@ -184,23 +184,74 @@ def generar_senal(df: pd.DataFrame) -> dict:
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CARGA DE DATOS  ← FIX MULTIINDEX AQUÍ
+# CARGA DE DATOS — Twelve Data (principal) + yfinance (fallback)
 # ══════════════════════════════════════════════════════════════════════════════
 
-PERIOD_DAYS = {"1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 732}
+PERIOD_DAYS    = {"1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 732}
+PERIOD_OUTPUT  = {"1mo": 35, "3mo": 95, "6mo": 190, "1y": 370, "2y": 740}
+TD_API_KEY     = {"key": ""}   # se rellena desde el sidebar
+TD_BASE_URL    = "https://api.twelvedata.com/time_series"
 
-def _yf_download_safe(ticker: str, period: str, intentos: int = 3) -> pd.DataFrame:
+def _ticker_td(ticker: str) -> str:
+    """Convierte tickers al formato de Twelve Data (BTC-USD -> BTC/USD, ^IPSA -> IPSA)."""
+    t = ticker.replace("-USD", "/USD").replace("-", "/")
+    if t.startswith("^"):
+        t = t[1:]
+    return t
+
+def _td_download(ticker: str, period: str) -> pd.DataFrame:
+    """Descarga OHLCV desde Twelve Data. Retorna DataFrame vacio si falla o sin key."""
+    key = TD_API_KEY.get("key", "").strip()
+    if not key:
+        return pd.DataFrame()
+    sym      = _ticker_td(ticker)
+    outsize  = PERIOD_OUTPUT.get(period, 190)
+    params   = {
+        "symbol":     sym,
+        "interval":   "1day",
+        "outputsize": outsize,
+        "apikey":     key,
+        "format":     "JSON",
+        "order":      "ASC",
+    }
+    try:
+        resp = requests.get(TD_BASE_URL, params=params, timeout=15)
+        if not resp.ok:
+            return pd.DataFrame()
+        data = resp.json()
+        if data.get("status") == "error" or "values" not in data:
+            return pd.DataFrame()
+        values = data["values"]
+        df = pd.DataFrame(values)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df.set_index("datetime", inplace=True)
+        df.index.name = None
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.rename(columns={"open":"Open","high":"High","low":"Low",
+                            "close":"Close","volume":"Volume"}, inplace=True)
+        return df[["Open","High","Low","Close","Volume"]].dropna(subset=["Close"])
+    except Exception:
+        return pd.DataFrame()
+
+def _yf_fallback(ticker: str, period: str) -> pd.DataFrame:
+    """Fallback a yfinance cuando no hay key de Twelve Data o falla."""
     from datetime import datetime, timedelta
     dias  = PERIOD_DAYS.get(period, 183)
     today = datetime.today()
     start = (today - timedelta(days=dias)).strftime("%Y-%m-%d")
     end   = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    for intento in range(intentos):
+    for intento in range(3):
         try:
             df = yf.download(ticker, start=start, end=end,
                              progress=False, auto_adjust=True, timeout=15)
             if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    nivel0 = df.columns.get_level_values(0).tolist()
+                    nivel1 = df.columns.get_level_values(1).tolist()
+                    campos = {"Open","High","Low","Close","Volume"}
+                    df.columns = nivel0 if set(nivel0) & campos else nivel1
                 return df
             df2 = yf.Ticker(ticker).history(start=start, end=end)
             if not df2.empty:
@@ -209,62 +260,49 @@ def _yf_download_safe(ticker: str, period: str, intentos: int = 3) -> pd.DataFra
         except Exception as e:
             nombre_error = type(e).__name__
             if "RateLimit" in nombre_error or "TooManyRequests" in nombre_error:
-                if intento < intentos - 1:
+                if intento < 2:
                     time.sleep(2 ** (intento + 1))
                     continue
                 raise
             raise
     return pd.DataFrame()
 
-def _fix_columnas(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza columnas sin importar la versión de yfinance.
-    yfinance >= 0.2.40 devuelve MultiIndex (Price, Ticker).
-    yfinance <  0.2.40 devuelve MultiIndex (Ticker, Price) o índice simple.
-    """
-    if isinstance(df.columns, pd.MultiIndex):
-        nivel0 = df.columns.get_level_values(0).tolist()
-        nivel1 = df.columns.get_level_values(1).tolist()
-        campos = {'Open', 'High', 'Low', 'Close', 'Volume'}
-        if set(nivel0) & campos:          # nivel 0 ya son los campos
-            df.columns = nivel0
-        elif set(nivel1) & campos:        # nivel 1 son los campos
-            df.columns = nivel1
-        else:                             # último recurso: aplanar
-            df.columns = [str(c[0]) for c in df.columns]
+def _descargar_raw(ticker: str, period: str) -> pd.DataFrame:
+    """Intenta Twelve Data primero, cae en yfinance si falla o no hay key."""
+    df = _td_download(ticker, period)
+    if df.empty:
+        df = _yf_fallback(ticker, period)
     return df
 
 @st.cache_data(ttl=300)
 def get_data(ticker: str, period: str) -> pd.DataFrame:
-    df = _yf_download_safe(ticker, period)
+    df = _descargar_raw(ticker, period)
     if df.empty:
         return pd.DataFrame()
-    df = _fix_columnas(df)
-    df = df[[c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]].copy()
-    df.dropna(subset=['Close'], inplace=True)
+    df = df[[c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]].copy()
+    df.dropna(subset=["Close"], inplace=True)
 
-    close = df['Close']
-    df['EMA20']                                    = close.ewm(span=20, adjust=False).mean()
-    df['EMA50']                                    = close.ewm(span=50, adjust=False).mean()
-    df['RSI']                                      = calcular_rsi(close)
-    df['MACD'], df['MACD_SIGNAL'], df['MACD_HIST'] = calcular_macd(close)
-    df['BB_UPPER'], df['BB_MID'], df['BB_LOWER']   = calcular_bollinger(close)
-    df['ATR']                                      = calcular_atr(df)
-    df['ADX']                                      = calcular_adx(df)
-    if 'Volume' in df.columns:
-        df['VOL_ANOMALO'] = volumen_anomalo(df)
+    close = df["Close"]
+    df["EMA20"]                                    = close.ewm(span=20, adjust=False).mean()
+    df["EMA50"]                                    = close.ewm(span=50, adjust=False).mean()
+    df["RSI"]                                      = calcular_rsi(close)
+    df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = calcular_macd(close)
+    df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"]   = calcular_bollinger(close)
+    df["ATR"]                                      = calcular_atr(df)
+    df["ADX"]                                      = calcular_adx(df)
+    if "Volume" in df.columns:
+        df["VOL_ANOMALO"] = volumen_anomalo(df)
     return df
 
 @st.cache_data(ttl=300)
 def get_close_only(ticker: str, period: str) -> pd.Series:
     try:
-        df = _yf_download_safe(ticker, period)
+        df = _descargar_raw(ticker, period)
     except Exception:
         return pd.Series(dtype=float, name=ticker)
     if df.empty:
         return pd.Series(dtype=float, name=ticker)
-    df = _fix_columnas(df)
-    return df['Close'].rename(ticker)
+    return df["Close"].rename(ticker)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -508,6 +546,25 @@ with st.sidebar:
     mostrar_vanom   = st.checkbox("Volumen anómalo",       value=True)
 
     st.markdown("---")
+    st.subheader("📡 Datos — Twelve Data")
+    td_key_input = st.text_input(
+        "Twelve Data API Key",
+        type="password",
+        placeholder="tu_api_key...",
+        help="Gratis en twelvedata.com · 800 req/día · Sin tarjeta",
+    )
+    if td_key_input:
+        TD_API_KEY["key"] = td_key_input
+        st.success("Twelve Data listo ✓", icon="📡")
+    else:
+        try:
+            TD_API_KEY["key"] = st.secrets["TD_API_KEY"]
+            st.success("Twelve Data desde secrets ✓", icon="📡")
+        except Exception:
+            st.warning("Sin key → usando Yahoo Finance (fallback)", icon="⚠️")
+            st.markdown("[Obtener key gratis →](https://twelvedata.com/register)")
+
+    st.markdown("---")
     st.subheader("🤖 IA — Groq (gratis)")
     groq_key_input = st.text_input(
         "Groq API Key",
@@ -527,7 +584,8 @@ with st.sidebar:
             st.markdown("[Obtener clave gratis →](https://console.groq.com)")
 
     st.markdown("---")
-    st.caption("Datos vía Yahoo Finance · Caché 5 min")
+    fuente = "Twelve Data" if TD_API_KEY.get("key") else "Yahoo Finance (fallback)"
+    st.caption(f"Datos vía {fuente} · Caché 5 min")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATOS PRINCIPALES
@@ -546,8 +604,9 @@ with st.spinner(f"Analizando {ticker}..."):
         nombre_e = type(e).__name__
         if "RateLimit" in nombre_e or "TooManyRequests" in nombre_e:
             st.error(
-                "⚠️ **Yahoo Finance está limitando las peticiones** desde este servidor. "
-                "Espera 30-60 segundos y recarga la página, o prueba con otro ticker.",
+                "⚠️ **Límite de peticiones alcanzado.** "
+                "Si usas Twelve Data, revisa tu cuota en twelvedata.com. "
+                "Espera unos segundos y recarga la página.",
                 icon="🚦",
             )
         else:
