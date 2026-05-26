@@ -207,6 +207,17 @@ TD_API_KEY     = {"key": ""}   # se rellena desde el sidebar
 TD_BASE_URL    = "https://api.twelvedata.com/time_series"
 BINANCE_BASE   = "https://api.binance.com/api/v3/klines"
 BINANCE_INTERVALS = {"1mo": ("1d", 35), "3mo": ("1d", 95), "6mo": ("1d", 190), "1y": ("1d", 370), "2y": ("1d", 740)}
+# Para MTF: intervalos fijos independientes del período principal
+BINANCE_MTF = {
+    "4H":  ("4h",  180),   # ~30 días de velas 4H
+    "1D":  ("1d",  200),   # 200 días
+    "1W":  ("1w",  104),   # 2 años de velas semanales
+}
+YF_MTF = {
+    "4H":  ("4h",  "60d"),
+    "1D":  ("1d",  "1y"),
+    "1W":  ("1wk", "2y"),
+}
 
 def _binance_download(ticker: str, period: str) -> pd.DataFrame:
     """Descarga OHLCV desde Binance (gratuito, sin key, datos al segundo)."""
@@ -360,6 +371,64 @@ def get_close_only(ticker: str, period: str) -> pd.Series:
     return df["Close"].rename(ticker)
 
 
+@st.cache_data(ttl=120)
+def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
+    """Descarga datos para un timeframe específico (4H, 1D, 1W)."""
+    df = pd.DataFrame()
+
+    # Binance para crypto
+    if ticker in BINANCE_SYMBOLS:
+        sym      = BINANCE_SYMBOLS[ticker]
+        interval, limit = BINANCE_MTF[tf]
+        try:
+            resp = requests.get(BINANCE_BASE, params={
+                "symbol": sym, "interval": interval, "limit": limit,
+            }, timeout=10)
+            if resp.ok:
+                raw = resp.json()
+                if isinstance(raw, list) and raw:
+                    df = pd.DataFrame(raw, columns=[
+                        "open_time","Open","High","Low","Close","Volume",
+                        "close_time","qav","trades","tbbav","tbqav","ignore"
+                    ])
+                    for col in ["Open","High","Low","Close","Volume"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df.index = pd.to_datetime(df["open_time"], unit="ms")
+                    df.index.name = None
+                    df = df[["Open","High","Low","Close","Volume"]].dropna(subset=["Close"])
+        except Exception:
+            pass
+
+    # yfinance como fallback
+    if df.empty:
+        yf_interval, yf_period = YF_MTF[tf]
+        try:
+            raw = yf.download(ticker, period=yf_period, interval=yf_interval,
+                              progress=False, auto_adjust=True)
+            if not raw.empty:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    nivel0 = raw.columns.get_level_values(0).tolist()
+                    nivel1 = raw.columns.get_level_values(1).tolist()
+                    campos = {"Open","High","Low","Close","Volume"}
+                    raw.columns = nivel0 if set(nivel0) & campos else nivel1
+                df = raw[[c for c in ["Open","High","Low","Close","Volume"] if c in raw.columns]].dropna(subset=["Close"])
+        except Exception:
+            pass
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Calcular indicadores
+    close = df["Close"]
+    df["EMA20"]                                    = close.ewm(span=20, adjust=False).mean()
+    df["EMA50"]                                    = close.ewm(span=50, adjust=False).mean()
+    df["RSI"]                                      = calcular_rsi(close)
+    df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = calcular_macd(close)
+    df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"]   = calcular_bollinger(close)
+    df["ATR"]                                      = calcular_atr(df)
+    df["ADX"]                                      = calcular_adx(df)
+    return df
+
 # ══════════════════════════════════════════════════════════════════════════════
 # IA — Groq API (gratuito · llama-3.3-70b)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -465,7 +534,11 @@ Razones: {"; ".join(info["razones"])}
 # BACKTESTING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: int = -1) -> dict:
+def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: int = -1, comision_pct: float = 0.1) -> dict:
+    """
+    comision_pct: % cobrado por lado (entrada + salida = 2x).
+    Ejemplo: Binance 0.1% → 0.2% por operación completa.
+    """
     resultados = []
     en_posicion = False
     precio_entrada = 0.0
@@ -510,13 +583,15 @@ def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: 
                 senal_entrada  = f"+{pts_hoy}"
         else:
             if pts_hoy <= umbral_venta or i == len(df) - 2:
-                retorno  = (precio_sig - precio_entrada) / precio_entrada * 100
+                retorno_bruto = (precio_sig - precio_entrada) / precio_entrada * 100
+                retorno  = retorno_bruto - (comision_pct * 2)   # entrada + salida
                 duracion = (fecha_sig - fecha_entrada).days if hasattr(fecha_sig - fecha_entrada, 'days') else 1
                 resultados.append({
                     "Entrada":        fecha_entrada.strftime("%d/%m/%Y") if hasattr(fecha_entrada, 'strftime') else str(fecha_entrada),
                     "Salida":         fecha_sig.strftime("%d/%m/%Y")     if hasattr(fecha_sig,      'strftime') else str(fecha_sig),
                     "Precio entrada": round(precio_entrada, 4),
                     "Precio salida":  round(precio_sig, 4),
+                    "Retorno bruto %": round(retorno_bruto, 2),
                     "Retorno %":      round(retorno, 2),
                     "Días":           duracion,
                     "Señal entrada":  senal_entrada,
@@ -652,6 +727,15 @@ with st.sidebar:
             st.markdown("[Obtener clave gratis →](https://console.groq.com)")
 
     st.markdown("---")
+    st.subheader("🔄 Auto-Refresh")
+    auto_refresh  = st.checkbox("Activar auto-refresh", value=False)
+    refresh_secs  = st.selectbox("Intervalo", [30, 60, 120, 300],
+                                  format_func=lambda x: f"{x}s" if x < 60 else f"{x//60}min",
+                                  index=1)
+    if auto_refresh:
+        st.info(f"♻️ Recargando cada {refresh_secs}s", icon="⏱️")
+
+    st.markdown("---")
     fuente = "Twelve Data" if TD_API_KEY.get("key") else "Yahoo Finance (fallback)"
     st.caption(f"Datos vía {fuente} · Caché 5 min")
 
@@ -660,6 +744,38 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.title("🛡️ QuantumShield Pro — Trading Terminal")
+
+# ── Auto-refresh ──────────────────────────────────────────────
+if auto_refresh:
+    import streamlit.components.v1 as components
+    # Countdown visible + rerun automático
+    components.html(f"""
+    <div id="refresh-bar" style="
+        background:#1a1a2e;border:1px solid #00cfff33;
+        border-radius:8px;padding:8px 16px;
+        font-family:monospace;color:#00cfff;font-size:13px;
+        display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+      <span>⏱️ Auto-refresh en</span>
+      <span id="cnt" style="font-weight:bold;color:#00ff88">{refresh_secs}</span>
+      <span>segundos</span>
+      <div style="flex:1;background:#0d1117;border-radius:4px;height:6px;overflow:hidden;">
+        <div id="bar" style="height:100%;background:#00cfff;
+             animation:shrink {refresh_secs}s linear forwards;border-radius:4px;"></div>
+      </div>
+    </div>
+    <style>
+      @keyframes shrink {{from{{width:100%}}to{{width:0%}}}}
+    </style>
+    <script>
+      var secs = {refresh_secs};
+      var iv = setInterval(function(){{
+        secs--;
+        var el = document.getElementById('cnt');
+        if(el) el.textContent = secs;
+        if(secs <= 0){{ clearInterval(iv); window.location.reload(); }}
+      }}, 1000);
+    </script>
+    """, height=50)
 
 if not ticker:
     st.warning("Ingresa un ticker válido en el panel izquierdo.")
@@ -695,7 +811,7 @@ chg   = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 e
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📊 Análisis",
     "🌐 Señales del Mercado",
     "📉 Comparación Relativa",
@@ -703,6 +819,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📒 Paper Trading & Notas",
     "🤖 Asistente IA",
     "🧪 Backtesting",
+    "⏱️ Multi-Timeframe",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1320,13 +1437,20 @@ with tab7:
     st.subheader(f"🧪 Backtesting — {ticker}")
     st.caption("Simulación de la estrategia de confluencia sobre el historial de precio. No garantiza resultados futuros.")
 
-    col_bt1, col_bt2, col_bt3 = st.columns(3)
+    col_bt1, col_bt2, col_bt3, col_bt4 = st.columns(4)
     with col_bt1:
         bt_umbral_compra = st.slider("Umbral de compra (puntos mínimos)", 1, 4, 2)
     with col_bt2:
         bt_umbral_venta  = st.slider("Umbral de salida (puntos máximos)", -4, -1, -1)
     with col_bt3:
         bt_period_sel = st.selectbox("Período de backtest", ["6mo","1y","2y"], index=1, key="bt_period")
+    with col_bt4:
+        bt_comision = st.number_input(
+            "Comisión por operación (%)",
+            min_value=0.0, max_value=2.0, value=0.1, step=0.05,
+            help="Binance: 0.1% · Broker acciones: 0.05-0.2% · Por los dos lados = entrada+salida",
+            format="%.2f",
+        )
 
     if st.button("▶️ Ejecutar Backtest", type="primary"):
         with st.spinner("Simulando estrategia..."):
@@ -1334,7 +1458,7 @@ with tab7:
             if df_bt.empty or len(df_bt) < 60:
                 st.warning("No hay suficientes datos para el backtest (mínimo 60 velas).")
             else:
-                bt = backtest_estrategia(df_bt, bt_umbral_compra, bt_umbral_venta)
+                bt = backtest_estrategia(df_bt, bt_umbral_compra, bt_umbral_venta, bt_comision)
 
                 if bt['n_ops'] == 0:
                     st.info("La estrategia no generó ninguna operación. Prueba ajustando los umbrales.")
@@ -1439,10 +1563,155 @@ with tab7:
                         st.download_button("⬇️ Descargar CSV", csv_bt,
                                            f"{ticker}_backtest.csv", "text/csv")
 
+                    costo_total = round(bt_comision * 2 * bt['n_ops'], 2)
                     st.caption(
-                        "⚠️ El backtesting usa datos históricos y no garantiza rendimientos futuros. "
-                        "Los resultados asumen ejecución al precio de cierre del día siguiente a la señal, "
-                        "sin comisiones ni slippage."
+                        f"⚠️ Resultados con comisión de **{bt_comision}% por lado** ({bt_comision*2}% por operación completa) · "
+                        f"Costo total: **{costo_total:.2f}%** · "
+                        "No garantiza rendimientos futuros. Ejecución asumida al cierre del día siguiente."
                     )
     else:
         st.info("Configura los parámetros y haz clic en **▶️ Ejecutar Backtest** para simular la estrategia.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 8 — MULTI-TIMEFRAME
+# ══════════════════════════════════════════════════════════════════════════════
+with tab8:
+    st.subheader(f"⏱️ Análisis Multi-Timeframe — {ticker}")
+    st.caption("Compara la señal en 3 marcos temporales. Una señal alineada en los 3 es la más confiable.")
+
+    TFS = ["4H", "1D", "1W"]
+    TF_LABELS = {"4H": "4 Horas", "1D": "Diario", "1W": "Semanal"}
+
+    with st.spinner("Cargando 3 timeframes..."):
+        mtf_data = {}
+        mtf_info = {}
+        for tf in TFS:
+            d = get_data_mtf(ticker, tf)
+            if not d.empty and len(d) >= 30:
+                mtf_data[tf] = d
+                mtf_info[tf] = generar_senal(d)
+
+    if not mtf_data:
+        st.warning("No se pudieron obtener datos multi-timeframe para este activo.")
+    else:
+        # ── Semáforo de alineación ──────────────────────────────────
+        st.markdown("### 🚦 Alineación de Señales")
+        cols_tf = st.columns(len(TFS))
+        puntos_total = 0
+        tfs_disponibles = 0
+
+        for i, tf in enumerate(TFS):
+            with cols_tf[i]:
+                if tf in mtf_info:
+                    inf = mtf_info[tf]
+                    puntos_total += inf['puntos']
+                    tfs_disponibles += 1
+                    st.markdown(f"""
+                    <div style="background:#1a1a2e;border:2px solid {inf['color']};
+                        border-radius:12px;padding:16px;text-align:center;
+                        box-shadow:0 0 15px {inf['color']}44;">
+                      <div style="font-size:1.1rem;color:#aaa;margin-bottom:4px">{TF_LABELS[tf]}</div>
+                      <div style="font-size:1.3rem;font-weight:bold;color:{inf['color']}">{inf['senal']}</div>
+                      <div style="color:#888;font-size:.85rem;margin-top:6px">
+                        RSI: {inf['rsi']:.1f} · ADX: {inf['adx']:.1f} · Pts: {inf['puntos']:+d}
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div style="background:#1a1a2e;border:2px solid #333;
+                        border-radius:12px;padding:16px;text-align:center;">
+                      <div style="color:#666">{TF_LABELS[tf]}</div>
+                      <div style="color:#555">Sin datos</div>
+                    </div>""", unsafe_allow_html=True)
+
+        # Alineación general
+        st.markdown("---")
+        if tfs_disponibles > 0:
+            promedio = puntos_total / tfs_disponibles
+            if promedio >= 2:
+                alin_txt, alin_col = "🟢 ALCISTA — Señal alineada en múltiples timeframes", "#00ff88"
+            elif promedio <= -2:
+                alin_txt, alin_col = "🔴 BAJISTA — Señal alineada en múltiples timeframes", "#ff4444"
+            elif promedio >= 1:
+                alin_txt, alin_col = "🟡 TENDENCIA ALCISTA — No confirmada en todos los marcos", "#ffd700"
+            elif promedio <= -1:
+                alin_txt, alin_col = "🟠 TENDENCIA BAJISTA — No confirmada en todos los marcos", "#ff8c00"
+            else:
+                alin_txt, alin_col = "⚪ MIXTO — Sin consenso entre timeframes", "#aaaaaa"
+
+            st.markdown(f"""
+            <div style="background:#0d1117;border-left:4px solid {alin_col};
+                padding:14px 20px;border-radius:0 8px 8px 0;margin:8px 0;">
+              <span style="color:{alin_col};font-size:1.1rem;font-weight:bold">{alin_txt}</span>
+              <span style="color:#888;font-size:.85rem;margin-left:12px">
+                Puntuación promedio: {promedio:+.1f} / {tfs_disponibles} timeframes
+              </span>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Gráficos de los 3 timeframes ───────────────────────────
+        st.markdown("### 📈 Gráficos por Timeframe")
+
+        for tf in TFS:
+            if tf not in mtf_data:
+                continue
+            d   = mtf_data[tf]
+            inf = mtf_info[tf]
+
+            with st.expander(f"📊 {TF_LABELS[tf]} — {inf['senal']} (pts: {inf['puntos']:+d})", expanded=(tf == "1D")):
+                fig_tf = make_subplots(
+                    rows=3, cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.04,
+                    row_heights=[0.55, 0.22, 0.23],
+                )
+                # Velas
+                fig_tf.add_trace(go.Candlestick(
+                    x=d.index, open=d['Open'], high=d['High'],
+                    low=d['Low'], close=d['Close'], name="Precio",
+                    increasing_line_color="#00ff88", decreasing_line_color="#ff4444",
+                ), row=1, col=1)
+                # EMAs
+                fig_tf.add_trace(go.Scatter(x=d.index, y=d['EMA20'], name="EMA20",
+                    line=dict(color="#ffd700", width=1.2)), row=1, col=1)
+                fig_tf.add_trace(go.Scatter(x=d.index, y=d['EMA50'], name="EMA50",
+                    line=dict(color="#ff8c00", width=1.5)), row=1, col=1)
+                # BB
+                fig_tf.add_trace(go.Scatter(x=d.index, y=d['BB_UPPER'], name="BB Sup",
+                    line=dict(color="rgba(100,180,255,.5)", width=1, dash="dot")), row=1, col=1)
+                fig_tf.add_trace(go.Scatter(x=d.index, y=d['BB_LOWER'], name="BB Inf",
+                    line=dict(color="rgba(100,180,255,.5)", width=1, dash="dot"),
+                    fill='tonexty', fillcolor="rgba(100,180,255,.04)"), row=1, col=1)
+                # SL/TP
+                fig_tf.add_hline(y=inf['tp'], line_color="#00ff88", line_dash="dash",
+                                  annotation_text=f"TP {inf['tp']:,.2f}", row=1, col=1)
+                fig_tf.add_hline(y=inf['sl'], line_color="#ff4444", line_dash="dash",
+                                  annotation_text=f"SL {inf['sl']:,.2f}", row=1, col=1)
+                # RSI
+                fig_tf.add_trace(go.Scatter(x=d.index, y=d['RSI'], name="RSI",
+                    line=dict(color="#c77dff", width=1.5)), row=2, col=1)
+                fig_tf.add_hline(y=70, line_color="rgba(255,68,68,.5)", line_dash="dot", row=2, col=1)
+                fig_tf.add_hline(y=30, line_color="rgba(0,255,136,.5)", line_dash="dot", row=2, col=1)
+                # MACD
+                macd_c = ["#00ff88" if v >= 0 else "#ff4444" for v in d['MACD_HIST'].fillna(0)]
+                fig_tf.add_trace(go.Bar(x=d.index, y=d['MACD_HIST'], name="Hist",
+                    marker_color=macd_c), row=3, col=1)
+                fig_tf.add_trace(go.Scatter(x=d.index, y=d['MACD'], name="MACD",
+                    line=dict(color="#00cfff", width=1.2)), row=3, col=1)
+                fig_tf.add_trace(go.Scatter(x=d.index, y=d['MACD_SIGNAL'], name="Señal MACD",
+                    line=dict(color="#ff8c00", width=1.2)), row=3, col=1)
+
+                fig_tf.update_layout(
+                    template="plotly_dark", height=600,
+                    xaxis_rangeslider_visible=False,
+                    paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                    legend=dict(orientation="h", y=1.02),
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    title=f"{ticker} — {TF_LABELS[tf]}",
+                )
+                fig_tf.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+                fig_tf.update_xaxes(gridcolor="rgba(255,255,255,0.05)")
+                st.plotly_chart(fig_tf, use_container_width=True)
+
+        st.caption("💡 Estrategia óptima: buscar señales donde 1D y 1W coinciden, y usar 4H para afinar la entrada.")
