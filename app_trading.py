@@ -51,6 +51,20 @@ CRYPTOS = {
     "Polkadot (DOT)":     "DOT-USD",
 }
 
+# Mapa ticker app -> símbolo Binance (USDT)
+BINANCE_SYMBOLS = {
+    "BTC-USD":  "BTCUSDT",
+    "ETH-USD":  "ETHUSDT",
+    "SOL-USD":  "SOLUSDT",
+    "BNB-USD":  "BNBUSDT",
+    "XRP-USD":  "XRPUSDT",
+    "ADA-USD":  "ADAUSDT",
+    "AVAX-USD": "AVAXUSDT",
+    "DOGE-USD": "DOGEUSDT",
+    "LINK-USD": "LINKUSDT",
+    "DOT-USD":  "DOTUSDT",
+}
+
 BENCHMARK_ACCIONES = "SPY"
 BENCHMARK_CRYPTO   = "BTC-USD"
 
@@ -191,6 +205,39 @@ PERIOD_DAYS    = {"1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 732}
 PERIOD_OUTPUT  = {"1mo": 35, "3mo": 95, "6mo": 190, "1y": 370, "2y": 740}
 TD_API_KEY     = {"key": ""}   # se rellena desde el sidebar
 TD_BASE_URL    = "https://api.twelvedata.com/time_series"
+BINANCE_BASE   = "https://api.binance.com/api/v3/klines"
+BINANCE_INTERVALS = {"1mo": ("1d", 35), "3mo": ("1d", 95), "6mo": ("1d", 190), "1y": ("1d", 370), "2y": ("1d", 740)}
+
+def _binance_download(ticker: str, period: str) -> pd.DataFrame:
+    """Descarga OHLCV desde Binance (gratuito, sin key, datos al segundo)."""
+    sym = BINANCE_SYMBOLS.get(ticker)
+    if not sym:
+        return pd.DataFrame()
+    interval, limit = BINANCE_INTERVALS.get(period, ("1d", 190))
+    try:
+        resp = requests.get(BINANCE_BASE, params={
+            "symbol": sym, "interval": interval,
+            "limit": limit,
+        }, timeout=10)
+        if not resp.ok:
+            return pd.DataFrame()
+        raw = resp.json()
+        if not isinstance(raw, list) or not raw:
+            return pd.DataFrame()
+        df = pd.DataFrame(raw, columns=[
+            "open_time","Open","High","Low","Close","Volume",
+            "close_time","qav","trades","tbbav","tbqav","ignore"
+        ])
+        df["Open"]  = pd.to_numeric(df["Open"],  errors="coerce")
+        df["High"]  = pd.to_numeric(df["High"],  errors="coerce")
+        df["Low"]   = pd.to_numeric(df["Low"],   errors="coerce")
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        df["Volume"]= pd.to_numeric(df["Volume"],errors="coerce")
+        df.index = pd.to_datetime(df["open_time"], unit="ms")
+        df.index.name = None
+        return df[["Open","High","Low","Close","Volume"]].dropna(subset=["Close"])
+    except Exception:
+        return pd.DataFrame()
 
 def _ticker_td(ticker: str) -> str:
     """Convierte tickers al formato de Twelve Data (BTC-USD -> BTC/USD, ^IPSA -> IPSA)."""
@@ -268,7 +315,15 @@ def _yf_fallback(ticker: str, period: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _descargar_raw(ticker: str, period: str) -> pd.DataFrame:
-    """Intenta Twelve Data primero, cae en yfinance si falla o no hay key."""
+    """
+    Orden de prioridad:
+      Crypto  → Binance (gratis, tiempo real) → Twelve Data → yfinance
+      Acciones→ Twelve Data → yfinance
+    """
+    if ticker in BINANCE_SYMBOLS:
+        df = _binance_download(ticker, period)
+        if not df.empty:
+            return df
     df = _td_download(ticker, period)
     if df.empty:
         df = _yf_fallback(ticker, period)
@@ -471,7 +526,8 @@ def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: 
 
     if not resultados:
         return {"ops": pd.DataFrame(), "win_rate": 0, "retorno_total": 0,
-                "retorno_bh": 0, "n_ops": 0, "promedio_op": 0, "max_ganancia": 0, "max_perdida": 0}
+                "retorno_bh": 0, "n_ops": 0, "promedio_op": 0, "max_ganancia": 0, "max_perdida": 0,
+                "sharpe": 0, "max_drawdown": 0}
 
     df_ops   = pd.DataFrame(resultados)
     n_ops    = len(df_ops)
@@ -479,15 +535,27 @@ def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: 
     win_rate = round(ganadas / n_ops * 100, 1) if n_ops > 0 else 0
     ret_bh   = round((float(df['Close'].iloc[-1]) / float(df['Close'].iloc[50]) - 1) * 100, 2)
 
+    # Sharpe ratio (asume tasa libre de riesgo = 0, retornos por operación)
+    retornos = df_ops['Retorno %']
+    sharpe = round(retornos.mean() / retornos.std() * np.sqrt(n_ops), 2) if retornos.std() > 0 else 0
+
+    # Max Drawdown sobre la curva de equity acumulada
+    equity   = retornos.cumsum()
+    peak     = equity.cummax()
+    drawdown = equity - peak
+    max_dd   = round(float(drawdown.min()), 2)
+
     return {
         "ops": df_ops,
         "win_rate": win_rate,
-        "retorno_total": round(df_ops['Retorno %'].sum(), 2),
+        "retorno_total": round(retornos.sum(), 2),
         "retorno_bh": ret_bh,
         "n_ops": n_ops,
-        "promedio_op": round(df_ops['Retorno %'].mean(), 2),
-        "max_ganancia": round(df_ops['Retorno %'].max(), 2),
-        "max_perdida":  round(df_ops['Retorno %'].min(), 2),
+        "promedio_op": round(retornos.mean(), 2),
+        "max_ganancia": round(retornos.max(), 2),
+        "max_perdida":  round(retornos.min(), 2),
+        "sharpe":       sharpe,
+        "max_drawdown": max_dd,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -641,6 +709,15 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 # TAB 1 — ANÁLISIS PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
+
+    # Banner fuente de datos
+    es_crypto = ticker in BINANCE_SYMBOLS
+    if es_crypto:
+        st.success("📡 Datos en tiempo real vía **Binance** (sin delay)", icon="⚡")
+    elif TD_API_KEY.get("key"):
+        st.info("📡 Datos vía **Twelve Data**", icon="📊")
+    else:
+        st.warning("📡 Datos vía **Yahoo Finance** (posible delay de 1 día) — agrega Twelve Data key para acciones en tiempo real", icon="⚠️")
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Precio",      f"${price:,.4f}",       f"{chg:+.2f}%")
@@ -1011,18 +1088,45 @@ with tab5:
 
             df_trades = pd.DataFrame(trades)
             df_trades['Estado'] = df_trades.apply(evaluar_estado, axis=1)
+
+            # Calcular P&L estimado por operación
+            def calc_pnl(row):
+                try:
+                    precio_actual_op = price if row['Ticker'] == ticker else row['Entrada']
+                    if row['Estado'] == "🟢 TP alcanzado":
+                        precio_cierre = row['TP']
+                    elif row['Estado'] == "🔴 SL tocado":
+                        precio_cierre = row['SL']
+                    else:
+                        precio_cierre = precio_actual_op
+                    if row['Lado'] == "LONG":
+                        pct = (precio_cierre - row['Entrada']) / row['Entrada'] * 100
+                    else:
+                        pct = (row['Entrada'] - precio_cierre) / row['Entrada'] * 100
+                    pnl_usd = row['Capital'] * pct / 100
+                    return round(pnl_usd, 2), round(pct, 2)
+                except Exception:
+                    return 0.0, 0.0
+
+            pnl_data = df_trades.apply(lambda r: calc_pnl(r), axis=1)
+            df_trades['P&L $']  = [x[0] for x in pnl_data]
+            df_trades['P&L %']  = [x[1] for x in pnl_data]
+
             st.dataframe(df_trades, use_container_width=True, height=280)
 
             total    = len(df_trades)
             ganadas  = (df_trades['Estado'] == "🟢 TP alcanzado").sum()
             perdidas = (df_trades['Estado'] == "🔴 SL tocado").sum()
             winrate  = round(ganadas / (ganadas + perdidas) * 100, 1) if (ganadas + perdidas) > 0 else 0
+            pnl_total = df_trades['P&L $'].sum()
+            pnl_color = "normal" if pnl_total >= 0 else "inverse"
 
-            s1, s2, s3, s4 = st.columns(4)
+            s1, s2, s3, s4, s5 = st.columns(5)
             s1.metric("Total",          total)
             s2.metric("✅ TP alcanzado", ganadas)
             s3.metric("❌ SL tocado",    perdidas)
             s4.metric("Win Rate",        f"{winrate}%")
+            s5.metric("P&L Total",       f"${pnl_total:+,.2f}", delta_color=pnl_color)
 
             if st.button("🗑️ Limpiar operaciones"):
                 st.session_state.paper_trades = []
@@ -1235,14 +1339,22 @@ with tab7:
                 if bt['n_ops'] == 0:
                     st.info("La estrategia no generó ninguna operación. Prueba ajustando los umbrales.")
                 else:
-                    b1, b2, b3, b4, b5, b6 = st.columns(6)
-                    b1.metric("Operaciones",        bt['n_ops'])
-                    b2.metric("Win Rate",            f"{bt['win_rate']}%")
-                    b3.metric("Retorno estrategia",  f"{bt['retorno_total']:+.2f}%",
+                    b1, b2, b3, b4 = st.columns(4)
+                    b1.metric("Operaciones",       bt['n_ops'])
+                    b2.metric("Win Rate",           f"{bt['win_rate']}%")
+                    b3.metric("Retorno estrategia", f"{bt['retorno_total']:+.2f}%",
                               delta=f"{bt['retorno_total'] - bt['retorno_bh']:+.2f}% vs B&H")
-                    b4.metric("Buy & Hold",          f"{bt['retorno_bh']:+.2f}%")
-                    b5.metric("Mejor operación",     f"{bt['max_ganancia']:+.2f}%")
-                    b6.metric("Peor operación",      f"{bt['max_perdida']:+.2f}%")
+                    b4.metric("Buy & Hold",         f"{bt['retorno_bh']:+.2f}%")
+
+                    b5, b6, b7, b8 = st.columns(4)
+                    b5.metric("Mejor operación",  f"{bt['max_ganancia']:+.2f}%")
+                    b6.metric("Peor operación",   f"{bt['max_perdida']:+.2f}%")
+                    sharpe_color = "normal" if bt['sharpe'] >= 1 else "inverse"
+                    b7.metric("Sharpe Ratio",     f"{bt['sharpe']:.2f}",
+                              delta="Bueno ✅" if bt['sharpe'] >= 1 else ("Aceptable ⚠️" if bt['sharpe'] >= 0.5 else "Bajo ❌"),
+                              delta_color=sharpe_color)
+                    b8.metric("Max Drawdown",     f"{bt['max_drawdown']:+.2f}%",
+                              delta_color="inverse")
 
                     st.markdown("---")
                     df_ops = bt['ops'].copy()
@@ -1260,12 +1372,23 @@ with tab7:
                                      annotation_text=f"Buy & Hold {bt['retorno_bh']:+.1f}%",
                                      annotation_font_color="#ffd700")
                     fig_eq.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_dash="dot")
+                    # Banda de drawdown máximo
+                    eq_vals   = df_ops['Retorno acumulado %'].values
+                    peak_vals = np.maximum.accumulate(eq_vals)
+                    dd_vals   = eq_vals - peak_vals
+                    fig_eq.add_trace(go.Scatter(
+                        x=df_ops['Op'], y=dd_vals,
+                        name="Drawdown", fill='tozeroy',
+                        fillcolor='rgba(255,68,68,0.12)',
+                        line=dict(color='rgba(255,68,68,0.5)', width=1),
+                    ))
                     fig_eq.update_layout(
-                        template="plotly_dark", height=340,
-                        title="Curva de equity acumulada",
+                        template="plotly_dark", height=380,
+                        title="Curva de equity + Drawdown",
                         xaxis_title="Número de operación",
                         yaxis_title="Retorno acumulado %",
                         paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                        legend=dict(orientation="h"),
                     )
                     st.plotly_chart(fig_eq, use_container_width=True)
 
