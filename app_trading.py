@@ -187,14 +187,22 @@ def generar_senal(df: pd.DataFrame) -> dict:
 # CARGA DE DATOS  ← FIX MULTIINDEX AQUÍ
 # ══════════════════════════════════════════════════════════════════════════════
 
+PERIOD_DAYS = {"1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 732}
+
 def _yf_download_safe(ticker: str, period: str, intentos: int = 3) -> pd.DataFrame:
+    from datetime import datetime, timedelta
+    dias  = PERIOD_DAYS.get(period, 183)
+    today = datetime.today()
+    start = (today - timedelta(days=dias)).strftime("%Y-%m-%d")
+    end   = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
     for intento in range(intentos):
         try:
-            df = yf.download(ticker, period=period, progress=False,
-                             auto_adjust=True, timeout=15)
+            df = yf.download(ticker, start=start, end=end,
+                             progress=False, auto_adjust=True, timeout=15)
             if not df.empty:
                 return df
-            df2 = yf.Ticker(ticker).history(period=period)
+            df2 = yf.Ticker(ticker).history(start=start, end=end)
             if not df2.empty:
                 return df2
             return pd.DataFrame()
