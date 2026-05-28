@@ -818,6 +818,149 @@ def registrar_senal(ticker: str, info: dict, precio: float):
         st.session_state.signal_history[ticker] = hist[-50:]
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FINVIZ — Patrones chartistas (scraping homepage)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Descripciones de cada patrón en español
+PATTERN_INFO = {
+    "Trendline Supp.":  {
+        "emoji": "📈", "bias": "alcista",
+        "desc": "El precio rebotó al alza desde una línea de tendencia ascendente. Indica soporte dinámico y continuación de la tendencia alcista.",
+        "accion": "Buscar entradas LONG cerca de la línea, con SL por debajo de ella.",
+    },
+    "Trendline Resist.": {
+        "emoji": "📉", "bias": "bajista",
+        "desc": "El precio chocó contra una línea de tendencia descendente. Indica resistencia dinámica y probable continuación bajista.",
+        "accion": "Posible entrada SHORT en el rechazo, o esperar ruptura confirmada para LONG.",
+    },
+    "Horizontal S/R": {
+        "emoji": "↔️", "bias": "neutro",
+        "desc": "El precio está en un nivel horizontal clave que actuó como soporte y resistencia en el pasado.",
+        "accion": "Esperar reacción clara en el nivel. Ruptura con volumen confirma la dirección.",
+    },
+    "Wedge Up": {
+        "emoji": "🔺", "bias": "bajista",
+        "desc": "Cuña ascendente — máximos y mínimos suben pero el rango se estrecha. Patrón de agotamiento alcista, suele romper a la baja.",
+        "accion": "Esperar ruptura de la línea inferior. Objetivo = altura de la cuña.",
+    },
+    "Wedge": {
+        "emoji": "🔷", "bias": "neutro",
+        "desc": "Cuña simétrica — precio se comprime entre dos líneas convergentes. La ruptura puede ser en cualquier dirección.",
+        "accion": "Operar la ruptura en la dirección que ocurra, con volumen de confirmación.",
+    },
+    "Wedge Down": {
+        "emoji": "🔻", "bias": "alcista",
+        "desc": "Cuña descendente — máximos y mínimos bajan pero el rango se estrecha. Patrón de agotamiento bajista, suele romper al alza.",
+        "accion": "Esperar ruptura de la línea superior. Objetivo = altura de la cuña.",
+    },
+    "Triangle Asc.": {
+        "emoji": "△", "bias": "alcista",
+        "desc": "Triángulo ascendente — resistencia horizontal + mínimos crecientes. Compradores acumulando presión. Suele romper al alza.",
+        "accion": "Entrada en ruptura del techo horizontal con volumen. SL bajo el último mínimo.",
+    },
+    "Triangle Desc.": {
+        "emoji": "▽", "bias": "bajista",
+        "desc": "Triángulo descendente — soporte horizontal + máximos decrecientes. Vendedores dominando. Suele romper a la baja.",
+        "accion": "Entrada SHORT en ruptura del soporte con volumen. SL sobre el último máximo.",
+    },
+    "Channel Up": {
+        "emoji": "📊", "bias": "alcista",
+        "desc": "Canal ascendente — precio sube entre dos líneas paralelas. Tendencia alcista establecida.",
+        "accion": "Comprar en rebotes en la línea inferior del canal. Toma de ganancias en línea superior.",
+    },
+    "Channel": {
+        "emoji": "📊", "bias": "neutro",
+        "desc": "Canal lateral — precio oscila entre soporte y resistencia horizontales. Mercado en rango.",
+        "accion": "Comprar cerca del soporte, vender cerca de la resistencia. Operar la ruptura cuando ocurra.",
+    },
+    "Channel Down": {
+        "emoji": "📉", "bias": "bajista",
+        "desc": "Canal descendente — precio baja entre dos líneas paralelas. Tendencia bajista establecida.",
+        "accion": "Evitar compras. SHORT en rebotes a la línea superior. Esperar ruptura alcista para cambio de tendencia.",
+    },
+    "Double Top": {
+        "emoji": "🔔", "bias": "bajista",
+        "desc": "Doble techo — el precio alcanzó dos máximos similares sin poder superarlos. Señal de inversión bajista muy fiable.",
+        "accion": "Entrada SHORT en ruptura del cuello (mínimo entre los dos techos). Objetivo = distancia techo-cuello.",
+    },
+    "Multiple Top": {
+        "emoji": "🔔🔔", "bias": "bajista",
+        "desc": "Múltiples techos — tres o más intentos fallidos de superar un nivel. Resistencia muy fuerte, señal bajista.",
+        "accion": "SHORT en la zona de resistencia con SL justo por encima. Mayor confiabilidad que el doble techo.",
+    },
+    "Double Bottom": {
+        "emoji": "🏔️", "bias": "alcista",
+        "desc": "Doble suelo — el precio tocó dos mínimos similares sin poder bajar más. Señal de inversión alcista muy fiable.",
+        "accion": "Entrada LONG en ruptura del cuello (máximo entre los dos suelos). Objetivo = distancia suelo-cuello.",
+    },
+    "Multiple Bottom": {
+        "emoji": "🏔️🏔️", "bias": "alcista",
+        "desc": "Múltiples suelos — tres o más rebotes desde el mismo nivel. Soporte muy fuerte, señal alcista.",
+        "accion": "LONG en la zona de soporte con SL justo por debajo. Mayor confiabilidad que el doble suelo.",
+    },
+    "Head&Shoulders": {
+        "emoji": "👤", "bias": "bajista",
+        "desc": "Hombro-Cabeza-Hombro — patrón de inversión bajista clásico. Tres picos donde el central es el más alto.",
+        "accion": "SHORT en ruptura del cuello con volumen. Objetivo = distancia cabeza-cuello proyectada hacia abajo.",
+    },
+}
+
+PATTERN_BIAS_COLOR = {
+    "alcista": "#00ff88",
+    "bajista": "#ff4444",
+    "neutro":  "#ffd700",
+}
+
+@st.cache_data(ttl=900)
+def finviz_patterns() -> dict:
+    """
+    Scrape los patrones chartistas del homepage de Finviz.
+    Retorna {patron: [ticker1, ticker2, ...]}
+    """
+    result = {}
+    if not BS4_OK:
+        return result
+    try:
+        resp = requests.get("https://finviz.com/", headers=FINVIZ_HEADERS, timeout=12)
+        if not resp.ok:
+            return result
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Buscar todas las tablas de patrones
+        # Finviz las pone en tablas con celdas de tickers y la última columna es el patrón
+        for tabla in soup.find_all("table"):
+            filas = tabla.find_all("tr")
+            for fila in filas:
+                celdas = fila.find_all("td")
+                if not celdas:
+                    continue
+                # La última celda suele ser el enlace del patrón
+                ultima = celdas[-1]
+                enlace = ultima.find("a")
+                if not enlace:
+                    continue
+                patron_texto = enlace.get_text(strip=True)
+                if patron_texto not in PATTERN_INFO:
+                    continue
+                # Las celdas anteriores son tickers
+                tickers_fila = []
+                for celda in celdas[:-1]:
+                    t_link = celda.find("a")
+                    if t_link:
+                        sym = t_link.get_text(strip=True).upper()
+                        if sym and re.match(r'^[A-Z]{1,5}$', sym):
+                            tickers_fila.append(sym)
+                if tickers_fila:
+                    result.setdefault(patron_texto, []).extend(tickers_fila)
+
+        # Deduplicar
+        for k in result:
+            result[k] = list(dict.fromkeys(result[k]))
+        return result
+    except Exception:
+        return result
+
+# ══════════════════════════════════════════════════════════════════════════════
 # VALIDACIÓN DE TICKER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -997,7 +1140,7 @@ chg   = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 e
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "📊 Análisis",
     "🌐 Señales del Mercado",
     "📉 Comparación Relativa",
@@ -1008,6 +1151,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "⏱️ Multi-Timeframe",
     "🔍 Screener",
     "📰 Noticias & Fundamentales",
+    "🕯️ Patrones Chartistas",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2265,3 +2409,161 @@ with tab10:
             distancia = ((nivel - precio_actual_ref) / precio_actual_ref * 100)
             color_tag = "🟢" if nivel < precio_actual_ref else "🔴"
             st.write(f"{color_tag} **Fib {nombre}** — ${nivel:,.4f} ({distancia:+.1f}%)")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 11 — PATRONES CHARTISTAS (Finviz)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab11:
+    st.subheader("🕯️ Patrones Chartistas — Detectados hoy por Finviz")
+    st.caption(
+        "Patrones técnicos detectados automáticamente por Finviz en el mercado de acciones USA. "
+        "Actualización cada 15 minutos. Solo acciones USA — no aplica a crypto."
+    )
+
+    col_p_ctrl1, col_p_ctrl2, col_p_ctrl3 = st.columns([1, 1, 2])
+    with col_p_ctrl1:
+        filtro_bias = st.multiselect(
+            "Filtrar por sesgo",
+            ["alcista", "bajista", "neutro"],
+            default=["alcista", "bajista"],
+            key="filt_bias",
+        )
+    with col_p_ctrl2:
+        buscar_patron = st.text_input("Buscar ticker", placeholder="AAPL", key="buscar_patron").upper().strip()
+    with col_p_ctrl3:
+        mostrar_guia = st.checkbox("Mostrar guía de patrones", value=False, key="mostrar_guia")
+
+    if not BS4_OK:
+        st.warning("Instala `beautifulsoup4` en requirements.txt para activar esta función.", icon="⚠️")
+        st.stop()
+
+    with st.spinner("Cargando patrones desde Finviz..."):
+        patrones = finviz_patterns()
+
+    if not patrones:
+        st.info(
+            "No se pudieron obtener patrones de Finviz en este momento. "
+            "Puede deberse a un bloqueo temporal del servidor. Intenta en unos minutos.",
+            icon="⏳",
+        )
+    else:
+        # Construir DataFrame consolidado
+        filas_p = []
+        for patron, tickers_list in patrones.items():
+            info_p = PATTERN_INFO.get(patron, {})
+            for t in tickers_list:
+                if buscar_patron and buscar_patron not in t:
+                    continue
+                filas_p.append({
+                    "Patrón":  patron,
+                    "Emoji":   info_p.get("emoji", "•"),
+                    "Sesgo":   info_p.get("bias", "neutro"),
+                    "Ticker":  t,
+                })
+
+        if not filas_p:
+            st.info("No hay resultados con los filtros actuales.")
+        else:
+            df_p = pd.DataFrame(filas_p)
+            if filtro_bias:
+                df_p = df_p[df_p["Sesgo"].isin(filtro_bias)]
+
+            # ── Resumen por patrón ─────────────────────────────────
+            st.markdown("### 📋 Resumen por Patrón")
+
+            patrones_filtrados = df_p["Patrón"].unique()
+            cols_por_fila = 2
+            patron_list   = list(patrones_filtrados)
+
+            for row_i in range(0, len(patron_list), cols_por_fila):
+                cols_p = st.columns(cols_por_fila)
+                for col_i, patron in enumerate(patron_list[row_i:row_i+cols_por_fila]):
+                    info_p  = PATTERN_INFO.get(patron, {})
+                    bias    = info_p.get("bias", "neutro")
+                    color_p = PATTERN_BIAS_COLOR.get(bias, "#aaaaaa")
+                    emoji_p = info_p.get("emoji", "•")
+                    tickers_patron = df_p[df_p["Patrón"] == patron]["Ticker"].tolist()
+                    tickers_str    = "  ·  ".join(tickers_patron)
+
+                    with cols_p[col_i]:
+                        st.markdown(f"""
+                        <div style="background:#1a1a2e;border-left:4px solid {color_p};
+                            border-radius:0 8px 8px 0;padding:12px 16px;margin-bottom:10px;">
+                          <div style="font-size:1rem;font-weight:bold;color:{color_p}">
+                            {emoji_p} {patron}
+                            <span style="font-size:.75rem;color:#888;margin-left:8px;
+                                background:#0d1117;padding:2px 8px;border-radius:10px;">
+                              {bias.upper()}
+                            </span>
+                          </div>
+                          <div style="color:#ccc;font-size:.85rem;margin-top:6px;line-height:1.5">
+                            {info_p.get('desc','')[:120]}…
+                          </div>
+                          <div style="margin-top:8px;font-size:.82rem;color:#00cfff;
+                              font-family:monospace;letter-spacing:.5px;">
+                            {tickers_str if tickers_str else '—'}
+                          </div>
+                        </div>""", unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ── Tabla completa ─────────────────────────────────────
+            st.markdown("### 📊 Tabla Completa")
+
+            def _css_bias(val):
+                if val == "alcista": return "color:#00ff88;font-weight:bold"
+                if val == "bajista": return "color:#ff4444;font-weight:bold"
+                return "color:#ffd700"
+
+            _cm_p = "map" if hasattr(df_p.style, "map") else "applymap"
+            styled_p = df_p[["Emoji","Patrón","Sesgo","Ticker"]].style
+            styled_p = getattr(styled_p, _cm_p)(_css_bias, subset=["Sesgo"])
+            st.dataframe(styled_p, use_container_width=True, height=420)
+
+            total_encontrados = len(df_p)
+            alcistas_n = (df_p["Sesgo"] == "alcista").sum()
+            bajistas_n = (df_p["Sesgo"] == "bajista").sum()
+            neutros_n  = (df_p["Sesgo"] == "neutro").sum()
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total patrones",  total_encontrados)
+            m2.metric("🟢 Alcistas",     alcistas_n)
+            m3.metric("🔴 Bajistas",     bajistas_n)
+            m4.metric("🟡 Neutros",      neutros_n)
+
+    st.markdown("---")
+
+    # ── Guía de patrones ──────────────────────────────────────────
+    if mostrar_guia:
+        st.markdown("### 📚 Guía Completa de Patrones")
+        st.caption("Qué significa cada patrón y cómo operarlo.")
+
+        GRUPOS = {
+            "📈 Patrones Alcistas": ["Trendline Supp.", "Wedge Down", "Triangle Asc.",
+                                      "Channel Up", "Double Bottom", "Multiple Bottom"],
+            "📉 Patrones Bajistas": ["Trendline Resist.", "Wedge Up", "Triangle Desc.",
+                                      "Channel Down", "Double Top", "Multiple Top", "Head&Shoulders"],
+            "↔️ Patrones Neutros":  ["Horizontal S/R", "Wedge", "Channel"],
+        }
+
+        for grupo, lista_patrones in GRUPOS.items():
+            st.markdown(f"#### {grupo}")
+            for patron in lista_patrones:
+                info_g = PATTERN_INFO.get(patron, {})
+                if not info_g:
+                    continue
+                color_g = PATTERN_BIAS_COLOR.get(info_g.get("bias","neutro"), "#aaa")
+                with st.expander(f"{info_g.get('emoji','')} **{patron}**", expanded=False):
+                    st.markdown(f"""
+                    <div style="border-left:3px solid {color_g};padding:8px 14px;margin:4px 0">
+                      <p style="color:#ccc;margin:0 0 8px">{info_g.get('desc','')}</p>
+                      <p style="color:{color_g};margin:0">
+                        <strong>Cómo operar:</strong> {info_g.get('accion','')}
+                      </p>
+                    </div>""", unsafe_allow_html=True)
+            st.markdown("")
+
+    st.caption(
+        "⚠️ Patrones detectados algorítmicamente por Finviz sobre precios de cierre. "
+        "No constituyen recomendaciones de inversión. Siempre confirmar con volumen y otros indicadores."
+    )
