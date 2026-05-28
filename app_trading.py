@@ -804,17 +804,17 @@ def registrar_senal(ticker: str, info: dict, precio: float):
     """Guarda la señal actual en el historial si es diferente a la última."""
     hist = st.session_state.signal_history.setdefault(ticker, [])
     nueva_senal = info["senal"]
-    if not hist or hist[-1]["senal"] != nueva_senal:
+    ultima_senal = hist[-1]["Señal"] if hist else None
+    if ultima_senal != nueva_senal:
         hist.append({
-            "Fecha":   datetime.now().strftime("%d/%m/%Y %H:%M"),
-            "Ticker":  ticker,
-            "Señal":   nueva_senal,
-            "Puntos":  info["puntos"],
-            "Precio":  round(precio, 4),
-            "RSI":     round(info["rsi"], 1),
-            "ADX":     round(info["adx"], 1),
+            "Fecha":  datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "Ticker": ticker,
+            "Señal":  nueva_senal,
+            "Puntos": info["puntos"],
+            "Precio": round(precio, 4),
+            "RSI":    round(info["rsi"], 1),
+            "ADX":    round(info["adx"], 1),
         })
-        # Máximo 50 registros por ticker
         st.session_state.signal_history[ticker] = hist[-50:]
 
 # ══════════════════════════════════════════════════════════════════════════════
