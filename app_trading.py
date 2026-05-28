@@ -911,79 +911,178 @@ PATTERN_BIAS_COLOR = {
     "neutro":  "#ffd700",
 }
 
-# Mapeo código URL Finviz → nombre de patrón en PATTERN_INFO
-SIGNAL_CODE_MAP = {
-    "ta_p_tlsupport":      "Trendline Supp.",
-    "ta_p_tlresistance":   "Trendline Resist.",
-    "ta_p_horizontal":     "Horizontal S/R",
-    "ta_p_wedgeup":        "Wedge Up",
-    "ta_p_wedge":          "Wedge",
-    "ta_p_wedgedown":      "Wedge Down",
-    "ta_p_wedgeresistance":"Triangle Asc.",
-    "ta_p_wedgesupport":   "Triangle Desc.",
-    "ta_p_channelup":      "Channel Up",
-    "ta_p_channel":        "Channel",
-    "ta_p_channeldown":    "Channel Down",
-    "ta_p_doubletop":      "Double Top",
-    "ta_p_multipletop":    "Multiple Top",
-    "ta_p_doublebottom":   "Double Bottom",
-    "ta_p_multiplebottom": "Multiple Bottom",
-    "ta_p_headandshoulders":"Head&Shoulders",
-}
+# ══════════════════════════════════════════════════════════════════════════════
+# DETECCIÓN DE PATRONES CHARTISTAS — sobre datos OHLCV propios
+# ══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=900)
-def finviz_patterns() -> dict:
+def _linreg(y: np.ndarray):
+    """Regresión lineal simple. Retorna (pendiente, intercepto)."""
+    x = np.arange(len(y), dtype=float)
+    m = (len(x) * np.dot(x, y) - x.sum() * y.sum()) /         (len(x) * (x**2).sum() - x.sum()**2 + 1e-12)
+    b = (y.sum() - m * x.sum()) / len(x)
+    return m, b
+
+def detectar_patrones(df: pd.DataFrame) -> list:
     """
-    Scrape los patrones chartistas del homepage de Finviz.
-    Identifica patrones por código de URL (robusto ante cambios de texto).
-    Retorna {patron: [ticker1, ticker2, ...]}
+    Detecta patrones chartistas sobre OHLCV.
+    Retorna lista de {"patron", "confianza", "descripcion_corta", "fecha_inicio", "fecha_fin"}
     """
-    result = {}
-    if not BS4_OK:
-        return result
-    try:
-        resp = requests.get("https://finviz.com/", headers=FINVIZ_HEADERS, timeout=12)
-        if not resp.ok:
-            return result
-        soup = BeautifulSoup(resp.text, "html.parser")
+    if len(df) < 30:
+        return []
 
-        # Buscar todos los enlaces que apunten a screener con señal de patrón
-        # href contiene: screener?v=210&s=ta_p_XXXX o screener?v=210&s=ta_p_XXXX&...
-        for enlace in soup.find_all("a", href=True):
-            href = enlace["href"]
-            # Identificar código de señal
-            codigo = None
-            for code in SIGNAL_CODE_MAP:
-                if code in href:
-                    codigo = code
-                    break
-            if not codigo:
-                continue
+    close  = df["Close"].values.astype(float)
+    high   = df["High"].values.astype(float)
+    low    = df["Low"].values.astype(float)
+    idx    = df.index
+    n      = len(close)
+    orden  = max(5, n // 20)
+    patrones = []
 
-            patron_nombre = SIGNAL_CODE_MAP[codigo]
+    # ── Extremos locales ────────────────────────────────────
+    idx_max = argrelextrema(close, np.greater, order=orden)[0]
+    idx_min = argrelextrema(close, np.less,    order=orden)[0]
 
-            # Los tickers están en la misma fila (<tr>) que este enlace
-            fila = enlace.find_parent("tr")
-            if not fila:
-                continue
+    # ── 1. Double Top ────────────────────────────────────────
+    if len(idx_max) >= 2:
+        t1, t2 = idx_max[-2], idx_max[-1]
+        if abs(close[t1] - close[t2]) / close[t1] < 0.03 and t2 - t1 > orden:
+            val_entre = close[t1:t2].min() if t2 > t1 else close[t1]
+            if (close[t1] - val_entre) / close[t1] > 0.04:
+                patrones.append({
+                    "patron": "Double Top", "confianza": "Alta",
+                    "desc": f"Dos techos similares en ${close[t1]:,.2f} y ${close[t2]:,.2f}. Señal de inversión bajista.",
+                    "fecha_ini": idx[t1], "fecha_fin": idx[t2],
+                })
 
-            tickers_fila = []
-            for celda in fila.find_all("td"):
-                t_link = celda.find("a", href=lambda h: h and "stock?t=" in h)
-                if t_link:
-                    sym = t_link.get_text(strip=True).upper()
-                    if sym and re.match(r"^[A-Z]{1,6}$", sym):
-                        tickers_fila.append(sym)
+    # ── 2. Double Bottom ─────────────────────────────────────
+    if len(idx_min) >= 2:
+        b1, b2 = idx_min[-2], idx_min[-1]
+        if abs(close[b1] - close[b2]) / close[b1] < 0.03 and b2 - b1 > orden:
+            val_entre = close[b1:b2].max() if b2 > b1 else close[b1]
+            if (val_entre - close[b1]) / close[b1] > 0.04:
+                patrones.append({
+                    "patron": "Double Bottom", "confianza": "Alta",
+                    "desc": f"Dos suelos similares en ${close[b1]:,.2f} y ${close[b2]:,.2f}. Señal de inversión alcista.",
+                    "fecha_ini": idx[b1], "fecha_fin": idx[b2],
+                })
 
-            if tickers_fila:
-                result.setdefault(patron_nombre, []).extend(tickers_fila)
+    # ── 3. Head & Shoulders ──────────────────────────────────
+    if len(idx_max) >= 3:
+        h1, hc, h2 = idx_max[-3], idx_max[-2], idx_max[-1]
+        if close[hc] > close[h1] and close[hc] > close[h2]:
+            diff = abs(close[h1] - close[h2]) / close[hc]
+            if diff < 0.05:
+                patrones.append({
+                    "patron": "Head&Shoulders", "confianza": "Media",
+                    "desc": f"Hombro izq ${close[h1]:,.2f}, cabeza ${close[hc]:,.2f}, hombro der ${close[h2]:,.2f}. Inversión bajista.",
+                    "fecha_ini": idx[h1], "fecha_fin": idx[h2],
+                })
 
-        # Deduplicar manteniendo orden
-        for k in result:
-            result[k] = list(dict.fromkeys(result[k]))
-        return result
-    except Exception:
-        return result
+    # ── 4. Inverse Head & Shoulders ──────────────────────────
+    if len(idx_min) >= 3:
+        s1, sc, s2 = idx_min[-3], idx_min[-2], idx_min[-1]
+        if close[sc] < close[s1] and close[sc] < close[s2]:
+            diff = abs(close[s1] - close[s2]) / abs(close[sc])
+            if diff < 0.05:
+                patrones.append({
+                    "patron": "Inv. Head&Shoulders", "confianza": "Media",
+                    "desc": f"Hombro izq ${close[s1]:,.2f}, cabeza ${close[sc]:,.2f}, hombro der ${close[s2]:,.2f}. Inversión alcista.",
+                    "fecha_ini": idx[s1], "fecha_fin": idx[s2],
+                })
+
+    # ── 5. Canal / Tendencia ─────────────────────────────────
+    ventana = min(60, n)
+    seg_high = high[-ventana:]
+    seg_low  = low[-ventana:]
+    seg_close = close[-ventana:]
+    m_h, _ = _linreg(seg_high)
+    m_l, _ = _linreg(seg_low)
+    m_c, _ = _linreg(seg_close)
+    # Ancho relativo del canal
+    ancho = (seg_high.mean() - seg_low.mean()) / seg_close.mean()
+
+    if ancho < 0.15:  # canal definido
+        if m_h > 0.001 and m_l > 0.001:
+            patrones.append({
+                "patron": "Channel Up", "confianza": "Media",
+                "desc": "Canal alcista: precio sube entre dos líneas paralelas. Comprar en soporte del canal.",
+                "fecha_ini": idx[-ventana], "fecha_fin": idx[-1],
+            })
+        elif m_h < -0.001 and m_l < -0.001:
+            patrones.append({
+                "patron": "Channel Down", "confianza": "Media",
+                "desc": "Canal bajista: precio baja entre dos líneas paralelas. Evitar compras, operar rebotes.",
+                "fecha_ini": idx[-ventana], "fecha_fin": idx[-1],
+            })
+        elif abs(m_h) < 0.001 and abs(m_l) < 0.001:
+            patrones.append({
+                "patron": "Channel", "confianza": "Media",
+                "desc": "Canal lateral: precio oscila en rango horizontal. Comprar soporte, vender resistencia.",
+                "fecha_ini": idx[-ventana], "fecha_fin": idx[-1],
+            })
+
+    # ── 6. Cuñas ─────────────────────────────────────────────
+    ventana_w = min(40, n)
+    seg_h2 = high[-ventana_w:]
+    seg_l2 = low[-ventana_w:]
+    mh2, _ = _linreg(seg_h2)
+    ml2, _ = _linreg(seg_l2)
+    convergencia = abs(mh2 - ml2) > 0.0005 and np.sign(mh2) == np.sign(ml2)
+
+    if convergencia:
+        if mh2 > 0 and ml2 > 0 and mh2 < ml2 * 0.8:
+            patrones.append({
+                "patron": "Wedge Up", "confianza": "Media",
+                "desc": "Cuña ascendente: máximos y mínimos suben pero convergen. Agotamiento alcista — posible ruptura a la baja.",
+                "fecha_ini": idx[-ventana_w], "fecha_fin": idx[-1],
+            })
+        elif mh2 < 0 and ml2 < 0 and ml2 < mh2 * 0.8:
+            patrones.append({
+                "patron": "Wedge Down", "confianza": "Media",
+                "desc": "Cuña descendente: máximos y mínimos bajan pero convergen. Agotamiento bajista — posible ruptura al alza.",
+                "fecha_ini": idx[-ventana_w], "fecha_fin": idx[-1],
+            })
+
+    # ── 7. Triángulos ────────────────────────────────────────
+    ventana_t = min(50, n)
+    seg_ht = high[-ventana_t:]
+    seg_lt = low[-ventana_t:]
+    mht, _ = _linreg(seg_ht)
+    mlt, _ = _linreg(seg_lt)
+
+    if mht < -0.0003 and abs(mlt) < 0.0002:
+        patrones.append({
+            "patron": "Triangle Desc.", "confianza": "Media",
+            "desc": "Triángulo descendente: resistencia horizontal + máximos decrecientes. Suele romper a la baja.",
+            "fecha_ini": idx[-ventana_t], "fecha_fin": idx[-1],
+        })
+    elif mlt > 0.0003 and abs(mht) < 0.0002:
+        patrones.append({
+            "patron": "Triangle Asc.", "confianza": "Media",
+            "desc": "Triángulo ascendente: soporte horizontal + mínimos crecientes. Suele romper al alza.",
+            "fecha_ini": idx[-ventana_t], "fecha_fin": idx[-1],
+        })
+
+    # ── 8. Trendline Soporte/Resistencia ─────────────────────
+    ult20_close = close[-20:]
+    m20, _ = _linreg(ult20_close)
+    precio_actual = close[-1]
+    bb_mid = df["BB_MID"].values[-1] if "BB_MID" in df.columns else precio_actual
+
+    if precio_actual > bb_mid and m20 > 0:
+        patrones.append({
+            "patron": "Trendline Supp.", "confianza": "Baja",
+            "desc": "Precio rebotando sobre su línea de tendencia ascendente. Soporte dinámico activo.",
+            "fecha_ini": idx[-20], "fecha_fin": idx[-1],
+        })
+    elif precio_actual < bb_mid and m20 < 0:
+        patrones.append({
+            "patron": "Trendline Resist.", "confianza": "Baja",
+            "desc": "Precio rechazado por línea de tendencia descendente. Resistencia dinámica activa.",
+            "fecha_ini": idx[-20], "fecha_fin": idx[-1],
+        })
+
+    return patrones
 
 # ══════════════════════════════════════════════════════════════════════════════
 # VALIDACIÓN DE TICKER
@@ -2439,156 +2538,148 @@ with tab10:
 # TAB 11 — PATRONES CHARTISTAS (Finviz)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab11:
-    st.subheader("🕯️ Patrones Chartistas — Detectados hoy por Finviz")
+    st.subheader(f"🕯️ Patrones Chartistas — {ticker}")
     st.caption(
-        "Patrones técnicos detectados automáticamente por Finviz en el mercado de acciones USA. "
-        "Actualización cada 15 minutos. Solo acciones USA — no aplica a crypto."
+        "Detección automática sobre datos OHLCV reales. "
+        "Funciona para acciones y crypto. Basado en análisis de precio, tendencias y extremos locales."
     )
 
-    col_p_ctrl1, col_p_ctrl2, col_p_ctrl3 = st.columns([1, 1, 2])
-    with col_p_ctrl1:
-        filtro_bias = st.multiselect(
-            "Filtrar por sesgo",
-            ["alcista", "bajista", "neutro"],
-            default=["alcista", "bajista"],
-            key="filt_bias",
-        )
-    with col_p_ctrl2:
-        buscar_patron = st.text_input("Buscar ticker", placeholder="AAPL", key="buscar_patron").upper().strip()
-    with col_p_ctrl3:
-        mostrar_guia = st.checkbox("Mostrar guía de patrones", value=False, key="mostrar_guia")
+    col_p1, col_p2 = st.columns([3, 2])
 
-    if not BS4_OK:
-        st.warning("Instala `beautifulsoup4` en requirements.txt para activar esta función.", icon="⚠️")
-        st.stop()
+    with col_p1:
+        # ── Patrones detectados ───────────────────────────────
+        st.markdown("#### 🔍 Patrones Detectados")
+        patrones_detectados = detectar_patrones(df)
 
-    with st.spinner("Cargando patrones desde Finviz..."):
-        patrones = finviz_patterns()
-
-    if not patrones:
-        st.info(
-            "No se pudieron obtener patrones de Finviz en este momento. "
-            "Puede deberse a un bloqueo temporal del servidor. Intenta en unos minutos.",
-            icon="⏳",
-        )
-    else:
-        # Construir DataFrame consolidado
-        filas_p = []
-        for patron, tickers_list in patrones.items():
-            info_p = PATTERN_INFO.get(patron, {})
-            for t in tickers_list:
-                if buscar_patron and buscar_patron not in t:
-                    continue
-                filas_p.append({
-                    "Patrón":  patron,
-                    "Emoji":   info_p.get("emoji", "•"),
-                    "Sesgo":   info_p.get("bias", "neutro"),
-                    "Ticker":  t,
-                })
-
-        if not filas_p:
-            st.info("No hay resultados con los filtros actuales.")
+        if not patrones_detectados:
+            st.info("No se detectaron patrones claros en el período actual. Prueba con un período más largo.")
         else:
-            df_p = pd.DataFrame(filas_p)
-            if filtro_bias:
-                df_p = df_p[df_p["Sesgo"].isin(filtro_bias)]
+            for pat in patrones_detectados:
+                nombre = pat["patron"]
+                info_p = PATTERN_INFO.get(nombre, {})
+                bias   = info_p.get("bias", "neutro")
+                color_p = PATTERN_BIAS_COLOR.get(bias, "#aaaaaa")
+                emoji_p = info_p.get("emoji", "•")
+                confianza_color = {"Alta":"#00ff88","Media":"#ffd700","Baja":"#ff8c00"}.get(pat["confianza"],"#aaa")
 
-            # ── Resumen por patrón ─────────────────────────────────
-            st.markdown("### 📋 Resumen por Patrón")
+                fecha_ini_str = pat["fecha_ini"].strftime("%d/%m/%Y") if hasattr(pat["fecha_ini"],"strftime") else str(pat["fecha_ini"])
+                fecha_fin_str = pat["fecha_fin"].strftime("%d/%m/%Y") if hasattr(pat["fecha_fin"],"strftime") else str(pat["fecha_fin"])
 
-            patrones_filtrados = df_p["Patrón"].unique()
-            cols_por_fila = 2
-            patron_list   = list(patrones_filtrados)
+                st.markdown(f"""
+                <div style="background:#1a1a2e;border-left:4px solid {color_p};
+                    border-radius:0 10px 10px 0;padding:14px 18px;margin-bottom:10px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-size:1.05rem;font-weight:bold;color:{color_p}">
+                      {emoji_p} {nombre}
+                    </span>
+                    <span style="font-size:.75rem;background:#0d1117;padding:3px 10px;
+                        border-radius:10px;color:{confianza_color}">
+                      Confianza: {pat["confianza"]}
+                    </span>
+                  </div>
+                  <div style="color:#ccc;font-size:.88rem;margin-top:8px;line-height:1.6">
+                    {pat["desc"]}
+                  </div>
+                  <div style="color:#666;font-size:.78rem;margin-top:6px">
+                    📅 {fecha_ini_str} → {fecha_fin_str}
+                  </div>
+                </div>""", unsafe_allow_html=True)
 
-            for row_i in range(0, len(patron_list), cols_por_fila):
-                cols_p = st.columns(cols_por_fila)
-                for col_i, patron in enumerate(patron_list[row_i:row_i+cols_por_fila]):
-                    info_p  = PATTERN_INFO.get(patron, {})
-                    bias    = info_p.get("bias", "neutro")
-                    color_p = PATTERN_BIAS_COLOR.get(bias, "#aaaaaa")
-                    emoji_p = info_p.get("emoji", "•")
-                    tickers_patron = df_p[df_p["Patrón"] == patron]["Ticker"].tolist()
-                    tickers_str    = "  ·  ".join(tickers_patron)
+                # Acción sugerida del PATTERN_INFO
+                accion = info_p.get("accion","")
+                if accion:
+                    st.markdown(f"💡 **Cómo operar:** {accion}")
+                st.markdown("")
 
-                    with cols_p[col_i]:
-                        st.markdown(f"""
-                        <div style="background:#1a1a2e;border-left:4px solid {color_p};
-                            border-radius:0 8px 8px 0;padding:12px 16px;margin-bottom:10px;">
-                          <div style="font-size:1rem;font-weight:bold;color:{color_p}">
-                            {emoji_p} {patron}
-                            <span style="font-size:.75rem;color:#888;margin-left:8px;
-                                background:#0d1117;padding:2px 8px;border-radius:10px;">
-                              {bias.upper()}
-                            </span>
-                          </div>
-                          <div style="color:#ccc;font-size:.85rem;margin-top:6px;line-height:1.5">
-                            {info_p.get('desc','')[:120]}…
-                          </div>
-                          <div style="margin-top:8px;font-size:.82rem;color:#00cfff;
-                              font-family:monospace;letter-spacing:.5px;">
-                            {tickers_str if tickers_str else '—'}
-                          </div>
-                        </div>""", unsafe_allow_html=True)
+        st.markdown("---")
 
-            st.markdown("---")
+        # ── Escaneo multi-activo ──────────────────────────────
+        st.markdown("#### 🌐 Escaneo de Patrones — Todos los Activos")
+        if st.button("▶️ Escanear patrones en todos los activos", key="scan_patterns"):
+            todos_activos = {**ACCIONES, **CRYPTOS}
+            resultados_pat = []
+            prog_pat = st.progress(0, text="Escaneando patrones...")
+            total_pat = len(todos_activos)
+            completados_pat = 0
 
-            # ── Tabla completa ─────────────────────────────────────
-            st.markdown("### 📊 Tabla Completa")
+            def _scan_patron(nm_sym):
+                nm, sym = nm_sym
+                try:
+                    d = get_data(sym, "3mo")
+                    if d.empty or len(d) < 30:
+                        return []
+                    pats = detectar_patrones(d)
+                    return [{"Activo": nm, "Ticker": sym, "Patrón": p["patron"],
+                             "Sesgo": PATTERN_INFO.get(p["patron"],{}).get("bias","neutro"),
+                             "Confianza": p["confianza"]} for p in pats]
+                except Exception:
+                    return []
 
-            def _css_bias(val):
-                if val == "alcista": return "color:#00ff88;font-weight:bold"
-                if val == "bajista": return "color:#ff4444;font-weight:bold"
-                return "color:#ffd700"
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futuros_p = {ex.submit(_scan_patron, item): item for item in todos_activos.items()}
+                for fut in as_completed(futuros_p):
+                    completados_pat += 1
+                    prog_pat.progress(completados_pat / total_pat,
+                                      text=f"Escaneando... {completados_pat}/{total_pat}")
+                    for r in fut.result():
+                        resultados_pat.append(r)
+            prog_pat.empty()
 
-            _cm_p = "map" if hasattr(df_p.style, "map") else "applymap"
-            styled_p = df_p[["Emoji","Patrón","Sesgo","Ticker"]].style
-            styled_p = getattr(styled_p, _cm_p)(_css_bias, subset=["Sesgo"])
-            st.dataframe(styled_p, use_container_width=True, height=420)
+            if resultados_pat:
+                df_scan = pd.DataFrame(resultados_pat).sort_values(
+                    ["Sesgo","Confianza"], ascending=[True, True]
+                )
+                def _css_s(val):
+                    if val == "alcista": return "color:#00ff88;font-weight:bold"
+                    if val == "bajista": return "color:#ff4444;font-weight:bold"
+                    return "color:#ffd700"
+                _cm_s = "map" if hasattr(df_scan.style,"map") else "applymap"
+                st.dataframe(
+                    getattr(df_scan.style,_cm_s)(_css_s, subset=["Sesgo"]),
+                    use_container_width=True, height=400
+                )
+                a_n = (df_scan["Sesgo"]=="alcista").sum()
+                b_n = (df_scan["Sesgo"]=="bajista").sum()
+                n_n = (df_scan["Sesgo"]=="neutro").sum()
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Total",len(df_scan)); c2.metric("🟢 Alcistas",a_n)
+                c3.metric("🔴 Bajistas",b_n);    c4.metric("🟡 Neutros",n_n)
+            else:
+                st.info("No se detectaron patrones en ningún activo con los datos disponibles.")
+        else:
+            st.info("Haz clic en **▶️ Escanear** para detectar patrones en todos los activos del universo.")
 
-            total_encontrados = len(df_p)
-            alcistas_n = (df_p["Sesgo"] == "alcista").sum()
-            bajistas_n = (df_p["Sesgo"] == "bajista").sum()
-            neutros_n  = (df_p["Sesgo"] == "neutro").sum()
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total patrones",  total_encontrados)
-            m2.metric("🟢 Alcistas",     alcistas_n)
-            m3.metric("🔴 Bajistas",     bajistas_n)
-            m4.metric("🟡 Neutros",      neutros_n)
-
-    st.markdown("---")
-
-    # ── Guía de patrones ──────────────────────────────────────────
-    if mostrar_guia:
-        st.markdown("### 📚 Guía Completa de Patrones")
-        st.caption("Qué significa cada patrón y cómo operarlo.")
+    with col_p2:
+        # ── Guía de patrones ──────────────────────────────────
+        st.markdown("#### 📚 Guía de Patrones")
 
         GRUPOS = {
-            "📈 Patrones Alcistas": ["Trendline Supp.", "Wedge Down", "Triangle Asc.",
-                                      "Channel Up", "Double Bottom", "Multiple Bottom"],
-            "📉 Patrones Bajistas": ["Trendline Resist.", "Wedge Up", "Triangle Desc.",
-                                      "Channel Down", "Double Top", "Multiple Top", "Head&Shoulders"],
-            "↔️ Patrones Neutros":  ["Horizontal S/R", "Wedge", "Channel"],
+            "📈 Alcistas": ["Trendline Supp.", "Wedge Down", "Triangle Asc.",
+                            "Channel Up", "Double Bottom", "Inv. Head&Shoulders"],
+            "📉 Bajistas": ["Trendline Resist.", "Wedge Up", "Triangle Desc.",
+                            "Channel Down", "Double Top", "Head&Shoulders"],
+            "↔️ Neutros":  ["Horizontal S/R", "Wedge", "Channel"],
         }
 
-        for grupo, lista_patrones in GRUPOS.items():
-            st.markdown(f"#### {grupo}")
-            for patron in lista_patrones:
-                info_g = PATTERN_INFO.get(patron, {})
-                if not info_g:
-                    continue
-                color_g = PATTERN_BIAS_COLOR.get(info_g.get("bias","neutro"), "#aaa")
-                with st.expander(f"{info_g.get('emoji','')} **{patron}**", expanded=False):
+        for grupo, lista_p in GRUPOS.items():
+            with st.expander(grupo, expanded=False):
+                for nombre_p in lista_p:
+                    info_g = PATTERN_INFO.get(nombre_p, {})
+                    if not info_g:
+                        continue
+                    color_g = PATTERN_BIAS_COLOR.get(info_g.get("bias","neutro"), "#aaa")
                     st.markdown(f"""
-                    <div style="border-left:3px solid {color_g};padding:8px 14px;margin:4px 0">
-                      <p style="color:#ccc;margin:0 0 8px">{info_g.get('desc','')}</p>
-                      <p style="color:{color_g};margin:0">
-                        <strong>Cómo operar:</strong> {info_g.get('accion','')}
+                    <div style="border-left:3px solid {color_g};padding:8px 12px;margin:6px 0;border-radius:0 6px 6px 0">
+                      <p style="color:{color_g};font-weight:bold;margin:0 0 4px">
+                        {info_g.get("emoji","")} {nombre_p}
+                      </p>
+                      <p style="color:#ccc;font-size:.82rem;margin:0 0 4px">{info_g.get("desc","")}</p>
+                      <p style="color:#888;font-size:.78rem;margin:0">
+                        ➤ {info_g.get("accion","")}
                       </p>
                     </div>""", unsafe_allow_html=True)
-            st.markdown("")
 
     st.caption(
-        "⚠️ Patrones detectados algorítmicamente por Finviz sobre precios de cierre. "
-        "No constituyen recomendaciones de inversión. Siempre confirmar con volumen y otros indicadores."
+        "⚠️ Detección algoritmica sobre datos históricos. No garantiza rendimientos futuros. "
+        "Confirmar siempre con volumen, contexto de mercado y otros indicadores antes de operar."
     )
