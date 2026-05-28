@@ -911,10 +911,31 @@ PATTERN_BIAS_COLOR = {
     "neutro":  "#ffd700",
 }
 
+# Mapeo código URL Finviz → nombre de patrón en PATTERN_INFO
+SIGNAL_CODE_MAP = {
+    "ta_p_tlsupport":      "Trendline Supp.",
+    "ta_p_tlresistance":   "Trendline Resist.",
+    "ta_p_horizontal":     "Horizontal S/R",
+    "ta_p_wedgeup":        "Wedge Up",
+    "ta_p_wedge":          "Wedge",
+    "ta_p_wedgedown":      "Wedge Down",
+    "ta_p_wedgeresistance":"Triangle Asc.",
+    "ta_p_wedgesupport":   "Triangle Desc.",
+    "ta_p_channelup":      "Channel Up",
+    "ta_p_channel":        "Channel",
+    "ta_p_channeldown":    "Channel Down",
+    "ta_p_doubletop":      "Double Top",
+    "ta_p_multipletop":    "Multiple Top",
+    "ta_p_doublebottom":   "Double Bottom",
+    "ta_p_multiplebottom": "Multiple Bottom",
+    "ta_p_headandshoulders":"Head&Shoulders",
+}
+
 @st.cache_data(ttl=900)
 def finviz_patterns() -> dict:
     """
     Scrape los patrones chartistas del homepage de Finviz.
+    Identifica patrones por código de URL (robusto ante cambios de texto).
     Retorna {patron: [ticker1, ticker2, ...]}
     """
     result = {}
@@ -926,34 +947,38 @@ def finviz_patterns() -> dict:
             return result
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Buscar todas las tablas de patrones
-        # Finviz las pone en tablas con celdas de tickers y la última columna es el patrón
-        for tabla in soup.find_all("table"):
-            filas = tabla.find_all("tr")
-            for fila in filas:
-                celdas = fila.find_all("td")
-                if not celdas:
-                    continue
-                # La última celda suele ser el enlace del patrón
-                ultima = celdas[-1]
-                enlace = ultima.find("a")
-                if not enlace:
-                    continue
-                patron_texto = enlace.get_text(strip=True)
-                if patron_texto not in PATTERN_INFO:
-                    continue
-                # Las celdas anteriores son tickers
-                tickers_fila = []
-                for celda in celdas[:-1]:
-                    t_link = celda.find("a")
-                    if t_link:
-                        sym = t_link.get_text(strip=True).upper()
-                        if sym and re.match(r'^[A-Z]{1,5}$', sym):
-                            tickers_fila.append(sym)
-                if tickers_fila:
-                    result.setdefault(patron_texto, []).extend(tickers_fila)
+        # Buscar todos los enlaces que apunten a screener con señal de patrón
+        # href contiene: screener?v=210&s=ta_p_XXXX o screener?v=210&s=ta_p_XXXX&...
+        for enlace in soup.find_all("a", href=True):
+            href = enlace["href"]
+            # Identificar código de señal
+            codigo = None
+            for code in SIGNAL_CODE_MAP:
+                if code in href:
+                    codigo = code
+                    break
+            if not codigo:
+                continue
 
-        # Deduplicar
+            patron_nombre = SIGNAL_CODE_MAP[codigo]
+
+            # Los tickers están en la misma fila (<tr>) que este enlace
+            fila = enlace.find_parent("tr")
+            if not fila:
+                continue
+
+            tickers_fila = []
+            for celda in fila.find_all("td"):
+                t_link = celda.find("a", href=lambda h: h and "stock?t=" in h)
+                if t_link:
+                    sym = t_link.get_text(strip=True).upper()
+                    if sym and re.match(r"^[A-Z]{1,6}$", sym):
+                        tickers_fila.append(sym)
+
+            if tickers_fila:
+                result.setdefault(patron_nombre, []).extend(tickers_fila)
+
+        # Deduplicar manteniendo orden
         for k in result:
             result[k] = list(dict.fromkeys(result[k]))
         return result
