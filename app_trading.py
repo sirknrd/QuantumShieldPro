@@ -1285,6 +1285,92 @@ with tab2:
                                xaxis_tickangle=-35)
         st.plotly_chart(fig_bar, use_container_width=True)
 
+        # ── Mapa de Calor (Treemap estilo Finviz) ──────────────────
+        st.markdown("---")
+        st.markdown("### 🗺️ Mapa de Calor — Cambio % del Día")
+
+        col_hm1, col_hm2 = st.columns([3, 1])
+        with col_hm2:
+            hm_tipo = st.radio("Vista", ["Acciones + Crypto", "Solo Acciones", "Solo Crypto"],
+                               key="hm_tipo")
+            hm_color = st.radio("Color por", ["Cambio % día", "Puntuación señal"],
+                                key="hm_color")
+
+        if hm_tipo == "Solo Acciones":
+            df_hm = df_radar[~df_radar["Ticker"].str.contains("-USD")]
+        elif hm_tipo == "Solo Crypto":
+            df_hm = df_radar[df_radar["Ticker"].str.contains("-USD")]
+        else:
+            df_hm = df_radar.copy()
+
+        if not df_hm.empty:
+            df_hm = df_hm.copy()
+            df_hm["Sector"] = df_hm["Ticker"].apply(
+                lambda t: "Crypto" if "-USD" in t else "Acciones"
+            )
+            df_hm["Label"] = df_hm.apply(
+                lambda r: f"{r['Ticker'].replace('-USD','')}<br>{r['Cambio %']:+.2f}%",
+                axis=1
+            )
+
+            valor_color = "Cambio %" if hm_color == "Cambio % día" else "Puntos"
+            escala = (
+                [[0,"#ff2222"],[0.35,"#aa2222"],[0.48,"#333333"],
+                 [0.52,"#333333"],[0.65,"#22aa44"],[1,"#00ff88"]]
+                if hm_color == "Cambio % día"
+                else
+                [[0,"#ff4444"],[0.4,"#555555"],[0.5,"#555555"],[1,"#00ff88"]]
+            )
+
+            fig_hm = go.Figure(go.Treemap(
+                ids=df_hm["Ticker"],
+                labels=df_hm["Label"],
+                parents=df_hm["Sector"],
+                values=[1] * len(df_hm),
+                customdata=df_hm[["Precio","Cambio %","Señal","RSI","ADX"]].values,
+                hovertemplate=(
+                    "<b>%{id}</b><br>"
+                    "Precio: $%{customdata[0]:,.4f}<br>"
+                    "Cambio: %{customdata[1]:+.2f}%<br>"
+                    "Señal: %{customdata[2]}<br>"
+                    "RSI: %{customdata[3]:.1f} | ADX: %{customdata[4]:.1f}"
+                    "<extra></extra>"
+                ),
+                marker=dict(
+                    colors=df_hm[valor_color],
+                    colorscale=escala,
+                    cmid=0,
+                    line=dict(width=2, color="#0d1117"),
+                    pad=dict(t=20, l=3, r=3, b=3),
+                ),
+                textfont=dict(size=12, color="white"),
+                pathbar=dict(visible=True),
+                tiling=dict(packing="squarify", pad=4),
+            ))
+
+            # Agregar fila raíz vacía para que el treemap agrupe por sector
+            fig_hm.add_trace(go.Treemap(
+                ids=["Acciones", "Crypto"],
+                labels=["Acciones", "Crypto"],
+                parents=["", ""],
+                values=[1, 1],
+                visible=False,
+            ))
+
+            fig_hm.update_layout(
+                template="plotly_dark",
+                height=520,
+                paper_bgcolor="#0d1117",
+                margin=dict(l=0, r=0, t=10, b=0),
+                font=dict(color="white"),
+            )
+            with col_hm1:
+                st.plotly_chart(fig_hm, use_container_width=True)
+            st.caption(
+                "🟢 Verde = subida / señal alcista  ·  🔴 Rojo = bajada / señal bajista  ·  "
+                "Hover para ver detalles  ·  Tamaño igual para todos los activos"
+            )
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — COMPARACIÓN RELATIVA
 # ══════════════════════════════════════════════════════════════════════════════
