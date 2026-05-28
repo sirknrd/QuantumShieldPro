@@ -12,6 +12,11 @@ import requests
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    from bs4 import BeautifulSoup
+    BS4_OK = True
+except ImportError:
+    BS4_OK = False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -81,6 +86,10 @@ if "analisis_cache" not in st.session_state:
     st.session_state.analisis_cache = {}
 if "noticias_cache" not in st.session_state:
     st.session_state.noticias_cache = {}
+if "signal_history" not in st.session_state:
+    st.session_state.signal_history = {}   # {ticker: [{fecha, precio, senal, puntos}]}
+if "finviz_cache" not in st.session_state:
+    st.session_state.finviz_cache = {}     # {ticker: {news:[], fundamentals:{}}}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICADORES
@@ -634,6 +643,181 @@ def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: 
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FINVIZ — Noticias + Fundamentales (scraping gratuito)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FINVIZ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+@st.cache_data(ttl=600)
+def finviz_scrape(ticker: str) -> dict:
+    """
+    Extrae noticias recientes y datos fundamentales de Finviz.
+    Funciona solo para acciones USA (no crypto).
+    Retorna {"news": [...], "fundamentals": {...}, "ok": bool}
+    """
+    result = {"news": [], "fundamentals": {}, "ok": False}
+    if not BS4_OK:
+        return result
+    # Finviz solo tiene datos para acciones USA, no crypto ni índices
+    if "-USD" in ticker or ticker.startswith("^"):
+        return result
+    try:
+        url  = f"https://finviz.com/quote.ashx?t={ticker}&p=d"
+        resp = requests.get(url, headers=FINVIZ_HEADERS, timeout=10)
+        if not resp.ok:
+            return result
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # ── Fundamentales ──────────────────────────────────────
+        fundamentals = {}
+        tabla = soup.find("table", class_="snapshot-table2")
+        if not tabla:
+            tabla = soup.find("table", {"class": lambda c: c and "snapshot" in c})
+        if tabla:
+            celdas = tabla.find_all("td")
+            for i in range(0, len(celdas) - 1, 2):
+                key = celdas[i].get_text(strip=True)
+                val = celdas[i+1].get_text(strip=True)
+                if key and val:
+                    fundamentals[key] = val
+
+        # ── Noticias ───────────────────────────────────────────
+        noticias = []
+        tabla_news = soup.find("table", id="news-table")
+        if tabla_news:
+            filas = tabla_news.find_all("tr")
+            fecha_actual = ""
+            for fila in filas[:20]:
+                celdas = fila.find_all("td")
+                if len(celdas) < 2:
+                    continue
+                fecha_td = celdas[0].get_text(strip=True)
+                if any(c.isalpha() for c in fecha_td):
+                    partes    = fecha_td.split()
+                    fecha_actual = partes[0] if len(partes) > 1 else fecha_actual
+                    hora      = partes[-1] if len(partes) > 1 else fecha_td
+                else:
+                    hora = fecha_td
+                enlace = celdas[1].find("a")
+                fuente = celdas[1].find("span")
+                if enlace:
+                    noticias.append({
+                        "fecha":  f"{fecha_actual} {hora}".strip(),
+                        "titulo": enlace.get_text(strip=True),
+                        "url":    enlace.get("href", "#"),
+                        "fuente": fuente.get_text(strip=True) if fuente else "",
+                    })
+
+        result["news"]         = noticias
+        result["fundamentals"] = fundamentals
+        result["ok"]           = bool(fundamentals or noticias)
+        return result
+    except Exception:
+        return result
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIBONACCI — Niveles de retroceso automáticos
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calcular_fibonacci(df: pd.DataFrame) -> dict:
+    """Calcula niveles de retroceso Fibonacci del período completo."""
+    maximo = float(df['High'].max())
+    minimo = float(df['Low'].min())
+    rango  = maximo - minimo
+    niveles = {
+        "0%":    maximo,
+        "23.6%": maximo - 0.236 * rango,
+        "38.2%": maximo - 0.382 * rango,
+        "50%":   maximo - 0.500 * rango,
+        "61.8%": maximo - 0.618 * rango,
+        "78.6%": maximo - 0.786 * rango,
+        "100%":  minimo,
+    }
+    return niveles
+
+FIBONACCI_COLORES = {
+    "0%":    "rgba(255,255,255,0.5)",
+    "23.6%": "rgba(255,215,0,0.6)",
+    "38.2%": "rgba(0,207,255,0.6)",
+    "50%":   "rgba(0,255,136,0.7)",
+    "61.8%": "rgba(0,207,255,0.6)",
+    "78.6%": "rgba(255,140,0,0.6)",
+    "100%":  "rgba(255,255,255,0.5)",
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DIVERGENCIAS RSI
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detectar_divergencias(df: pd.DataFrame, ventana: int = 5) -> list:
+    """
+    Detecta divergencias alcistas y bajistas entre precio y RSI.
+    Retorna lista de {tipo, fecha1, fecha2, precio1, precio2, rsi1, rsi2}
+    """
+    if 'RSI' not in df.columns or len(df) < ventana * 3:
+        return []
+
+    close = df['Close'].values
+    rsi   = df['RSI'].values
+    idx   = df.index
+    divs  = []
+
+    idx_min_precio = argrelextrema(close, np.less,    order=ventana)[0]
+    idx_max_precio = argrelextrema(close, np.greater, order=ventana)[0]
+
+    # Divergencia alcista: precio hace mínimo más bajo, RSI hace mínimo más alto
+    for i in range(1, len(idx_min_precio)):
+        i1, i2 = idx_min_precio[i-1], idx_min_precio[i]
+        if close[i2] < close[i1] and rsi[i2] > rsi[i1] and not np.isnan(rsi[i1]) and not np.isnan(rsi[i2]):
+            divs.append({
+                "tipo":   "alcista",
+                "fecha1": idx[i1], "fecha2": idx[i2],
+                "precio1": close[i1], "precio2": close[i2],
+                "rsi1":    rsi[i1],   "rsi2":    rsi[i2],
+            })
+
+    # Divergencia bajista: precio hace máximo más alto, RSI hace máximo más bajo
+    for i in range(1, len(idx_max_precio)):
+        i1, i2 = idx_max_precio[i-1], idx_max_precio[i]
+        if close[i2] > close[i1] and rsi[i2] < rsi[i1] and not np.isnan(rsi[i1]) and not np.isnan(rsi[i2]):
+            divs.append({
+                "tipo":   "bajista",
+                "fecha1": idx[i1], "fecha2": idx[i2],
+                "precio1": close[i1], "precio2": close[i2],
+                "rsi1":    rsi[i1],   "rsi2":    rsi[i2],
+            })
+
+    # Solo las 3 más recientes de cada tipo
+    alcistas = [d for d in divs if d["tipo"] == "alcista"][-3:]
+    bajistas = [d for d in divs if d["tipo"] == "bajista"][-3:]
+    return alcistas + bajistas
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HISTORIAL DE SEÑALES — Registro automático en sesión
+# ══════════════════════════════════════════════════════════════════════════════
+
+def registrar_senal(ticker: str, info: dict, precio: float):
+    """Guarda la señal actual en el historial si es diferente a la última."""
+    hist = st.session_state.signal_history.setdefault(ticker, [])
+    nueva_senal = info["senal"]
+    if not hist or hist[-1]["senal"] != nueva_senal:
+        hist.append({
+            "Fecha":   datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "Ticker":  ticker,
+            "Señal":   nueva_senal,
+            "Puntos":  info["puntos"],
+            "Precio":  round(precio, 4),
+            "RSI":     round(info["rsi"], 1),
+            "ADX":     round(info["adx"], 1),
+        })
+        # Máximo 50 registros por ticker
+        st.session_state.signal_history[ticker] = hist[-50:]
+
+# ══════════════════════════════════════════════════════════════════════════════
 # VALIDACIÓN DE TICKER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -687,6 +871,8 @@ with st.sidebar:
     mostrar_volumen = st.checkbox("Volumen",               value=True)
     mostrar_sr      = st.checkbox("Soporte/Resistencia",   value=True)
     mostrar_vanom   = st.checkbox("Volumen anómalo",       value=True)
+    mostrar_fib     = st.checkbox("Fibonacci",             value=False)
+    mostrar_divs    = st.checkbox("Divergencias RSI",      value=True)
 
     st.markdown("---")
     st.subheader("📡 Datos — Twelve Data")
@@ -811,7 +997,7 @@ chg   = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 e
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "📊 Análisis",
     "🌐 Señales del Mercado",
     "📉 Comparación Relativa",
@@ -820,12 +1006,17 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🤖 Asistente IA",
     "🧪 Backtesting",
     "⏱️ Multi-Timeframe",
+    "🔍 Screener",
+    "📰 Noticias & Fundamentales",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — ANÁLISIS PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
+
+    # Registrar señal en historial
+    registrar_senal(ticker, info, price)
 
     # Banner fuente de datos
     es_crypto = ticker in BINANCE_SYMBOLS
@@ -945,6 +1136,46 @@ with tab1:
         line=dict(color="#00cfff", width=1.2)), row=macd_row, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MACD_SIGNAL'], name="Señal",
         line=dict(color="#ff8c00", width=1.2)), row=macd_row, col=1)
+
+    # ── Fibonacci ──────────────────────────────────────────
+    if mostrar_fib:
+        fib_niveles = calcular_fibonacci(df)
+        for nombre, nivel in fib_niveles.items():
+            color = FIBONACCI_COLORES.get(nombre, "rgba(255,255,255,0.4)")
+            fig.add_hline(
+                y=nivel, line_color=color, line_dash="dot", line_width=1,
+                annotation_text=f"Fib {nombre} ${nivel:,.2f}",
+                annotation_font_color=color,
+                annotation_position="top left",
+                row=1, col=1,
+            )
+
+    # ── Divergencias RSI ───────────────────────────────────
+    if mostrar_divs:
+        divergencias = detectar_divergencias(df)
+        for div in divergencias:
+            color_div = "#00ff88" if div["tipo"] == "alcista" else "#ff4444"
+            # Línea en precio
+            fig.add_shape(type="line",
+                x0=div["fecha1"], x1=div["fecha2"],
+                y0=div["precio1"], y1=div["precio2"],
+                line=dict(color=color_div, width=2, dash="dot"),
+                row=1, col=1)
+            # Línea en RSI
+            fig.add_shape(type="line",
+                x0=div["fecha1"], x1=div["fecha2"],
+                y0=div["rsi1"], y1=div["rsi2"],
+                line=dict(color=color_div, width=2, dash="dot"),
+                row=rsi_row, col=1)
+            # Anotación
+            emoji = "🔺" if div["tipo"] == "alcista" else "🔻"
+            fig.add_annotation(
+                x=div["fecha2"], y=div["precio2"],
+                text=f"{emoji} Div {div['tipo'][:3].upper()}",
+                font=dict(color=color_div, size=10),
+                showarrow=True, arrowhead=2,
+                arrowcolor=color_div, arrowsize=0.8,
+                row=1, col=1)
 
     fig.update_layout(
         template="plotly_dark", height=880,
@@ -1715,3 +1946,236 @@ with tab8:
                 st.plotly_chart(fig_tf, use_container_width=True)
 
         st.caption("💡 Estrategia óptima: buscar señales donde 1D y 1W coinciden, y usar 4H para afinar la entrada.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 9 — SCREENER AUTOMÁTICO
+# ══════════════════════════════════════════════════════════════════════════════
+with tab9:
+    st.subheader("🔍 Screener Automático")
+    st.caption("Escanea todos los activos y muestra solo los que tienen señal relevante ahora.")
+
+    col_sc1, col_sc2, col_sc3 = st.columns(3)
+    with col_sc1:
+        filtro_senal = st.multiselect(
+            "Filtrar por señal",
+            ["🟢 COMPRA FUERTE", "🟡 COMPRA DÉBIL", "🔴 VENTA FUERTE",
+             "🟠 VENTA DÉBIL", "⚪ NEUTRAL"],
+            default=["🟢 COMPRA FUERTE", "🔴 VENTA FUERTE"],
+        )
+    with col_sc2:
+        filtro_adx = st.slider("ADX mínimo (fuerza tendencia)", 0, 40, 20,
+                               help="ADX > 25 = tendencia fuerte")
+    with col_sc3:
+        filtro_tipo = st.radio("Tipo de activo", ["Todos", "Solo Acciones", "Solo Crypto"],
+                               horizontal=True)
+
+    ejecutar_screener = st.button("▶️ Ejecutar Screener", type="primary")
+
+    if ejecutar_screener:
+        if filtro_tipo == "Solo Acciones":
+            universo = ACCIONES
+        elif filtro_tipo == "Solo Crypto":
+            universo = CRYPTOS
+        else:
+            universo = {**ACCIONES, **CRYPTOS}
+
+        resultados_sc = []
+        prog_sc = st.progress(0, text="Escaneando mercado...")
+        total_sc = len(universo)
+        completados_sc = 0
+
+        def _scan(nm_sym):
+            nm, sym = nm_sym
+            try:
+                d = get_data(sym, "3mo")
+                if d.empty or len(d) < 30:
+                    return None
+                inf = generar_senal(d)
+                p   = float(d["Close"].iloc[-1])
+                pv  = float(d["Close"].iloc[-2]) if len(d) > 1 else p
+                chg_sc = ((p / pv) - 1) * 100 if pv > 0 else 0
+                return {
+                    "Activo":   nm,
+                    "Ticker":   sym,
+                    "Precio":   round(p, 4),
+                    "Cambio %": round(chg_sc, 2),
+                    "Señal":    inf["senal"],
+                    "Puntos":   inf["puntos"],
+                    "RSI":      round(inf["rsi"], 1),
+                    "ADX":      round(inf["adx"], 1),
+                    "SL":       round(inf["sl"], 4),
+                    "TP":       round(inf["tp"], 4),
+                }
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futuros_sc = {ex.submit(_scan, item): item for item in universo.items()}
+            for fut in as_completed(futuros_sc):
+                completados_sc += 1
+                prog_sc.progress(completados_sc / total_sc,
+                                 text=f"Escaneando... {completados_sc}/{total_sc}")
+                r = fut.result()
+                if r:
+                    resultados_sc.append(r)
+        prog_sc.empty()
+
+        if resultados_sc:
+            df_sc = pd.DataFrame(resultados_sc)
+
+            # Aplicar filtros
+            if filtro_senal:
+                df_sc = df_sc[df_sc["Señal"].isin(filtro_senal)]
+            if filtro_adx > 0:
+                df_sc = df_sc[df_sc["ADX"] >= filtro_adx]
+
+            df_sc = df_sc.sort_values("Puntos", ascending=False)
+
+            if df_sc.empty:
+                st.info("Ningún activo cumple los filtros actuales. Prueba reduciendo ADX mínimo o ampliando los tipos de señal.")
+            else:
+                st.success(f"✅ {len(df_sc)} activos encontrados con los filtros aplicados")
+
+                def _css_senal(val):
+                    if "COMPRA FUERTE" in str(val): return "color:#00ff88;font-weight:bold"
+                    if "COMPRA DÉBIL"  in str(val): return "color:#ffd700"
+                    if "VENTA FUERTE"  in str(val): return "color:#ff4444;font-weight:bold"
+                    if "VENTA DÉBIL"   in str(val): return "color:#ff8c00"
+                    return "color:#aaa"
+
+                def _css_num(val):
+                    try:
+                        return "color:#00ff88" if float(val) > 0 else ("color:#ff4444" if float(val) < 0 else "")
+                    except Exception:
+                        return ""
+
+                _cm = "map" if hasattr(df_sc.style, "map") else "applymap"
+                styled_sc = df_sc.style.format({
+                    "Precio": "{:,.4f}", "Cambio %": "{:+.2f}%",
+                    "RSI": "{:.1f}", "ADX": "{:.1f}",
+                    "SL": "{:,.4f}", "TP": "{:,.4f}",
+                })
+                styled_sc = getattr(styled_sc, _cm)(_css_senal, subset=["Señal"])
+                styled_sc = getattr(styled_sc, _cm)(_css_num, subset=["Cambio %", "Puntos"])
+                st.dataframe(styled_sc, use_container_width=True, height=500)
+
+                # Mini gráfico de barras
+                fig_sc = px.bar(
+                    df_sc, x="Activo", y="Puntos", color="Puntos",
+                    color_continuous_scale=["#ff4444","#333","#00ff88"],
+                    template="plotly_dark", height=300,
+                    title="Puntuación de Confluencia — Resultados Screener",
+                )
+                fig_sc.update_layout(paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                                     coloraxis_showscale=False, xaxis_tickangle=-30)
+                st.plotly_chart(fig_sc, use_container_width=True)
+        else:
+            st.warning("No se pudieron obtener datos para el screener.")
+    else:
+        st.info("Configura los filtros y haz clic en **▶️ Ejecutar Screener** para escanear el mercado.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 10 — NOTICIAS & FUNDAMENTALES (Finviz + Historial de Señales)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab10:
+    st.subheader(f"📰 Noticias & Fundamentales — {ticker}")
+
+    col_nf1, col_nf2 = st.columns([3, 2])
+
+    with col_nf1:
+        st.markdown("#### 📰 Noticias recientes (Finviz)")
+
+        es_accion_usa = "-USD" not in ticker and not ticker.startswith("^")
+        if not BS4_OK:
+            st.warning("Instala `beautifulsoup4` en requirements.txt para activar esta función.", icon="⚠️")
+        elif not es_accion_usa:
+            st.info("Las noticias de Finviz solo están disponibles para acciones USA. Para crypto, usa el Asistente IA.")
+        else:
+            with st.spinner("Cargando noticias desde Finviz..."):
+                fv = finviz_scrape(ticker)
+
+            if fv["ok"] and fv["news"]:
+                for noticia in fv["news"][:15]:
+                    col_fecha, col_texto = st.columns([1, 4])
+                    with col_fecha:
+                        st.caption(noticia["fecha"])
+                        if noticia["fuente"]:
+                            st.caption(f"*{noticia['fuente']}*")
+                    with col_texto:
+                        st.markdown(f"[{noticia['titulo']}]({noticia['url']})")
+                    st.divider()
+            else:
+                st.info("No se encontraron noticias para este ticker en Finviz. Puede deberse a un bloqueo temporal.")
+
+        st.markdown("---")
+        st.markdown("#### 📊 Historial de Señales — Esta Sesión")
+        hist_ticker = st.session_state.signal_history.get(ticker, [])
+        if hist_ticker:
+            df_hist = pd.DataFrame(hist_ticker[::-1])   # más reciente primero
+
+            def _css_hist(val):
+                if "COMPRA FUERTE" in str(val): return "color:#00ff88;font-weight:bold"
+                if "COMPRA DÉBIL"  in str(val): return "color:#ffd700"
+                if "VENTA FUERTE"  in str(val): return "color:#ff4444;font-weight:bold"
+                if "VENTA DÉBIL"   in str(val): return "color:#ff8c00"
+                return "color:#aaa"
+
+            _cm2 = "map" if hasattr(df_hist.style, "map") else "applymap"
+            styled_hist = df_hist.style.format({"Precio": "{:,.4f}", "Puntos": "{:+d}"})
+            styled_hist = getattr(styled_hist, _cm2)(_css_hist, subset=["Señal"])
+            st.dataframe(styled_hist, use_container_width=True)
+
+            if st.button("🗑️ Limpiar historial", key="clear_hist"):
+                st.session_state.signal_history[ticker] = []
+                st.rerun()
+        else:
+            st.info("El historial se llena automáticamente cada vez que la señal cambia. Navega entre activos para verlo aquí.")
+
+    with col_nf2:
+        st.markdown("#### 📈 Datos Fundamentales (Finviz)")
+
+        if not BS4_OK:
+            st.warning("Requiere `beautifulsoup4`", icon="⚠️")
+        elif not es_accion_usa:
+            st.info("Solo disponible para acciones USA.")
+        else:
+            if "fv" not in dir():
+                with st.spinner("Cargando fundamentales..."):
+                    fv = finviz_scrape(ticker)
+
+            if fv["ok"] and fv["fundamentals"]:
+                fund = fv["fundamentals"]
+                # Campos más relevantes para trading
+                CAMPOS = [
+                    ("Market Cap",  "Market Cap"),
+                    ("P/E",         "P/E"),
+                    ("Fwd P/E",     "Forward P/E"),
+                    ("EPS (ttm)",   "EPS (ttm)"),
+                    ("EPS next Y",  "EPS next Y"),
+                    ("ROE",         "ROE"),
+                    ("Beta",        "Beta"),
+                    ("52W High",    "52W High"),
+                    ("52W Low",     "52W Low"),
+                    ("Avg Volume",  "Avg Volume"),
+                    ("Short Float", "Short Float"),
+                    ("Analyst Rec.", "Recom"),
+                    ("Target Price","Target Price"),
+                    ("Earnings",    "Earnings"),
+                ]
+                for label, key in CAMPOS:
+                    val = fund.get(key, fund.get(label, "-"))
+                    if val and val != "-":
+                        col_k, col_v = st.columns([2, 1])
+                        col_k.caption(label)
+                        col_v.markdown(f"**{val}**")
+            else:
+                st.info("Datos fundamentales no disponibles para este activo.")
+
+        st.markdown("---")
+        st.markdown("#### 📌 Niveles Fibonacci Actuales")
+        fib = calcular_fibonacci(df)
+        precio_actual_ref = price
+        for nombre, nivel in fib.items():
+            distancia = ((nivel - precio_actual_ref) / precio_actual_ref * 100)
+            color_tag = "🟢" if nivel < precio_actual_ref else "🔴"
+            st.write(f"{color_tag} **Fib {nombre}** — ${nivel:,.4f} ({distancia:+.1f}%)")
