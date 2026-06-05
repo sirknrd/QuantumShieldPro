@@ -74,22 +74,86 @@ BENCHMARK_ACCIONES = "SPY"
 BENCHMARK_CRYPTO   = "BTC-USD"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PERSISTENCIA — Guardar/cargar portafolio y notas en JSON local
+# ══════════════════════════════════════════════════════════════════════════════
+import os
+
+PORTFOLIO_FILE = "qsp_portfolio.json"
+
+def _cargar_portfolio() -> dict:
+    """Carga portafolio y notas desde archivo JSON local."""
+    if os.path.exists(PORTFOLIO_FILE):
+        try:
+            with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {
+                    "paper_trades":   data.get("paper_trades", []),
+                    "notas":          data.get("notas", {}),
+                    "signal_history": data.get("signal_history", {}),
+                }
+        except Exception:
+            pass
+    return {"paper_trades": [], "notas": {}, "signal_history": {}}
+
+def guardar_portfolio():
+    """Guarda portafolio y notas en archivo JSON local (silencioso)."""
+    try:
+        data = {
+            "paper_trades":   st.session_state.get("paper_trades", []),
+            "notas":          st.session_state.get("notas", {}),
+            "signal_history": st.session_state.get("signal_history", {}),
+            "guardado_en":    datetime.now().strftime("%d/%m/%Y %H:%M"),
+        }
+        with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+def portfolio_a_json() -> str:
+    """Serializa el portafolio a JSON string para descarga."""
+    data = {
+        "paper_trades":   st.session_state.get("paper_trades", []),
+        "notas":          st.session_state.get("notas", {}),
+        "signal_history": st.session_state.get("signal_history", {}),
+        "exportado_en":   datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "version":        "QuantumShield Pro 1.0",
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+def importar_portfolio_json(contenido: str) -> tuple:
+    """Importa portafolio desde JSON string. Retorna (ok, mensaje)."""
+    try:
+        data = json.loads(contenido)
+        if "paper_trades" not in data:
+            return False, "Archivo inválido: no contiene datos de portafolio."
+        st.session_state.paper_trades   = data.get("paper_trades", [])
+        st.session_state.notas          = data.get("notas", {})
+        st.session_state.signal_history = data.get("signal_history", {})
+        guardar_portfolio()
+        return True, f"Importado: {len(st.session_state.paper_trades)} posiciones, {len(st.session_state.notas)} notas."
+    except Exception as e:
+        return False, f"Error al importar: {e}"
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE — Paper Trading & Notas
 # ══════════════════════════════════════════════════════════════════════════════
+_datos_guardados = _cargar_portfolio()
+
 if "paper_trades" not in st.session_state:
-    st.session_state.paper_trades = []
+    st.session_state.paper_trades = _datos_guardados["paper_trades"]
 if "notas" not in st.session_state:
-    st.session_state.notas = {}
+    st.session_state.notas = _datos_guardados["notas"]
+if "signal_history" not in st.session_state:
+    st.session_state.signal_history = _datos_guardados["signal_history"]
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = {}
 if "analisis_cache" not in st.session_state:
     st.session_state.analisis_cache = {}
 if "noticias_cache" not in st.session_state:
     st.session_state.noticias_cache = {}
-if "signal_history" not in st.session_state:
-    st.session_state.signal_history = {}   # {ticker: [{fecha, precio, senal, puntos}]}
 if "finviz_cache" not in st.session_state:
-    st.session_state.finviz_cache = {}     # {ticker: {news:[], fundamentals:{}}}
+    st.session_state.finviz_cache = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICADORES
@@ -2006,6 +2070,7 @@ with tab5:
                 "Estado":  "🟡 Abierta",
                 "Nota":    nota_op,
             })
+            guardar_portfolio()
             st.success(f"✅ Registrada · R/R: **{rr}** · Tamaño sugerido (2% riesgo): **{tamanio}** unidades")
 
         trades = st.session_state.paper_trades
@@ -2083,6 +2148,7 @@ with tab5:
         )
         if st.button("💾 Guardar nota"):
             st.session_state.notas[ticker] = nueva_nota
+            guardar_portfolio()
             st.success("Nota guardada ✓")
 
         notas_otras = {k: v for k, v in st.session_state.notas.items()
@@ -3106,6 +3172,75 @@ with tab12:
                     pass
 
         st.markdown("---")
+
+        # ── Persistencia ──────────────────────────────────────────
+        st.markdown("#### 💾 Guardar / Exportar Portafolio")
+
+        col_pers1, col_pers2, col_pers3 = st.columns(3)
+
+        with col_pers1:
+            st.markdown("**💾 Guardar local**")
+            st.caption("Guarda en `qsp_portfolio.json` en el servidor. Persiste entre sesiones en despliegue local.")
+            if st.button("💾 Guardar ahora", key="save_port_btn"):
+                ok = guardar_portfolio()
+                if ok:
+                    st.success("Portafolio guardado ✓")
+                else:
+                    st.warning("No se pudo guardar en disco (normal en Streamlit Cloud). Usa Exportar.")
+
+            # Indicador de último guardado
+            if os.path.exists(PORTFOLIO_FILE):
+                t_mod = os.path.getmtime(PORTFOLIO_FILE)
+                dt_mod = datetime.fromtimestamp(t_mod).strftime("%d/%m/%Y %H:%M")
+                st.caption(f"Último guardado: {dt_mod}")
+            else:
+                st.caption("Sin archivo local todavía.")
+
+        with col_pers2:
+            st.markdown("**📤 Exportar JSON**")
+            st.caption("Descarga el portafolio completo como archivo JSON. Funciona en cualquier entorno.")
+            json_export = portfolio_a_json()
+            st.download_button(
+                label="📥 Descargar portafolio.json",
+                data=json_export,
+                file_name=f"qsp_portfolio_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                key="download_port",
+            )
+
+        with col_pers3:
+            st.markdown("**📥 Importar JSON**")
+            st.caption("Restaura un portafolio exportado previamente.")
+            archivo_importar = st.file_uploader(
+                "Subir archivo .json",
+                type=["json"],
+                key="upload_port",
+                label_visibility="collapsed",
+            )
+            if archivo_importar is not None:
+                contenido = archivo_importar.read().decode("utf-8")
+                ok_imp, msg_imp = importar_portfolio_json(contenido)
+                if ok_imp:
+                    st.success(msg_imp)
+                    st.rerun()
+                else:
+                    st.error(msg_imp)
+
+        st.markdown("---")
         if st.button("🗑️ Limpiar todo el portafolio", key="clear_port"):
             st.session_state.paper_trades = []
+            guardar_portfolio()
             st.rerun()
+
+        # ── Info sobre persistencia ────────────────────────────────
+        with st.expander("ℹ️ ¿Cómo funciona la persistencia?", expanded=False):
+            st.markdown("""
+**Local (tu PC):** El archivo `qsp_portfolio.json` se guarda en la misma carpeta del app.
+Se carga automáticamente cada vez que abres el app. No se pierde al recargar.
+
+**Streamlit Cloud:** Los archivos en disco se borran al reiniciar el servidor (cada ~24h o en cada deploy).
+**Solución:** Exporta el JSON y guárdalo en tu PC. Cuando el app se reinicie, impórtalo de nuevo.
+
+**Alternativa automática para Cloud:** Guarda el archivo `qsp_portfolio.json` en tu repositorio de GitHub
+y el app lo cargará automáticamente en cada deploy. Solo asegúrate de hacer commit del archivo.
+            """)
