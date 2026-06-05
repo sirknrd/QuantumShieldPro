@@ -138,6 +138,148 @@ def calcular_adx(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
     dx       = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
     return dx.rolling(periodo).mean()
 
+def calcular_stoch_rsi(serie: pd.Series, periodo_rsi=14, periodo_stoch=14,
+                       suavizado_k=3, suavizado_d=3):
+    """Stochastic RSI — versión más sensible del RSI. Retorna %K y %D."""
+    rsi  = calcular_rsi(serie, periodo_rsi)
+    min_rsi = rsi.rolling(periodo_stoch).min()
+    max_rsi = rsi.rolling(periodo_stoch).max()
+    rango   = (max_rsi - min_rsi).replace(0, np.nan)
+    k_raw   = (rsi - min_rsi) / rango * 100
+    k       = k_raw.rolling(suavizado_k).mean()
+    d       = k.rolling(suavizado_d).mean()
+    return k, d
+
+def detectar_velas_japonesas(df: pd.DataFrame) -> list:
+    """
+    Detecta patrones de velas japonesas en las últimas 5 velas.
+    Retorna lista de {nombre, fecha, tipo, descripcion, accion}
+    """
+    if len(df) < 5:
+        return []
+    patrones = []
+    o = df['Open'].values.astype(float)
+    h = df['High'].values.astype(float)
+    l = df['Low'].values.astype(float)
+    c = df['Close'].values.astype(float)
+    idx = df.index
+
+    for i in range(max(1, len(df)-5), len(df)):
+        cuerpo  = abs(c[i] - o[i])
+        rango_v = h[i] - l[i]
+        if rango_v == 0: continue
+        sombra_sup = h[i] - max(c[i], o[i])
+        sombra_inf = min(c[i], o[i]) - l[i]
+        alcista    = c[i] > o[i]
+        rel_cuerpo = cuerpo / rango_v
+
+        # Doji
+        if rel_cuerpo < 0.1:
+            patrones.append({"nombre":"Doji","fecha":idx[i],"tipo":"neutro",
+                "desc":"Apertura y cierre casi iguales. Indecisión del mercado — posible cambio de tendencia.",
+                "accion":"Esperar confirmación en la siguiente vela."})
+            continue
+
+        # Hammer (martillo) — tendencia bajista previa
+        if sombra_inf > cuerpo * 2 and sombra_sup < cuerpo * 0.5 and i > 0 and c[i-1] < o[i-1]:
+            patrones.append({"nombre":"Hammer 🔨","fecha":idx[i],"tipo":"alcista",
+                "desc":"Sombra inferior larga tras tendencia bajista. Los compradores rechazaron los mínimos.",
+                "accion":"Señal de reversión alcista. Buscar entrada LONG con confirmación."})
+
+        # Shooting Star (estrella fugaz) — tendencia alcista previa
+        elif sombra_sup > cuerpo * 2 and sombra_inf < cuerpo * 0.5 and i > 0 and c[i-1] > o[i-1]:
+            patrones.append({"nombre":"Shooting Star ⭐","fecha":idx[i],"tipo":"bajista",
+                "desc":"Sombra superior larga tras tendencia alcista. Los vendedores rechazaron los máximos.",
+                "accion":"Señal de reversión bajista. Vigilar entrada SHORT o toma de ganancias."})
+
+        # Marubozu alcista
+        elif alcista and rel_cuerpo > 0.9:
+            patrones.append({"nombre":"Marubozu Alcista","fecha":idx[i],"tipo":"alcista",
+                "desc":"Vela sin sombras — compradores dominaron toda la sesión. Fuerte momentum alcista.",
+                "accion":"Continuación probable. Mantener o incrementar posición LONG."})
+
+        # Marubozu bajista
+        elif not alcista and rel_cuerpo > 0.9:
+            patrones.append({"nombre":"Marubozu Bajista","fecha":idx[i],"tipo":"bajista",
+                "desc":"Vela sin sombras — vendedores dominaron toda la sesión. Fuerte momentum bajista.",
+                "accion":"Continuación probable. Evitar compras o considerar SHORT."})
+
+        # Engulfing alcista
+        if i > 0 and alcista and not (c[i-1] > o[i-1]):
+            if c[i] > o[i-1] and o[i] < c[i-1]:
+                patrones.append({"nombre":"Engulfing Alcista","fecha":idx[i],"tipo":"alcista",
+                    "desc":"Vela alcista que envuelve completamente la bajista anterior. Cambio de control a compradores.",
+                    "accion":"Alta probabilidad de reversión. Entrada LONG en apertura siguiente."})
+
+        # Engulfing bajista
+        elif i > 0 and not alcista and (c[i-1] > o[i-1]):
+            if o[i] > c[i-1] and c[i] < o[i-1]:
+                patrones.append({"nombre":"Engulfing Bajista","fecha":idx[i],"tipo":"bajista",
+                    "desc":"Vela bajista que envuelve completamente la alcista anterior. Cambio de control a vendedores.",
+                    "accion":"Alta probabilidad de reversión. Entrada SHORT o cierre de LONG."})
+
+        # Spinning Top
+        elif 0.1 <= rel_cuerpo <= 0.3 and sombra_sup > cuerpo and sombra_inf > cuerpo:
+            patrones.append({"nombre":"Spinning Top","fecha":idx[i],"tipo":"neutro",
+                "desc":"Cuerpo pequeño con sombras largas. Equilibrio entre compradores y vendedores.",
+                "accion":"Mercado indeciso. Esperar vela confirmatoria."})
+
+    # Morning Star (3 velas)
+    if len(df) >= 3:
+        i = len(df) - 1
+        cuerpo_1 = abs(c[i-2] - o[i-2])
+        cuerpo_2 = abs(c[i-1] - o[i-1])
+        cuerpo_3 = abs(c[i]   - o[i])
+        if (c[i-2] < o[i-2] and         # vela 1 bajista grande
+            cuerpo_2 < cuerpo_1 * 0.4 and  # vela 2 pequeña
+            c[i] > o[i] and              # vela 3 alcista
+            c[i] > (o[i-2] + c[i-2]) / 2):  # cierra sobre la mitad de vela 1
+            patrones.append({"nombre":"Morning Star ⭐","fecha":idx[i],"tipo":"alcista",
+                "desc":"Patrón de 3 velas: bajista grande + indecisión + alcista. Reversión alcista fuerte.",
+                "accion":"Una de las señales más confiables. Entrada LONG con SL bajo el mínimo de la vela 2."})
+
+    # Evening Star (3 velas)
+    if len(df) >= 3:
+        i = len(df) - 1
+        cuerpo_1 = abs(c[i-2] - o[i-2])
+        cuerpo_2 = abs(c[i-1] - o[i-1])
+        if (c[i-2] > o[i-2] and
+            cuerpo_2 < cuerpo_1 * 0.4 and
+            c[i] < o[i] and
+            c[i] < (o[i-2] + c[i-2]) / 2):
+            patrones.append({"nombre":"Evening Star 🌙","fecha":idx[i],"tipo":"bajista",
+                "desc":"Patrón de 3 velas: alcista grande + indecisión + bajista. Reversión bajista fuerte.",
+                "accion":"Señal de distribución. Cerrar LONG o entrar SHORT con confirmación."})
+
+    return patrones[-6:]  # máximo 6 patrones más recientes
+
+def calcular_volume_profile(df: pd.DataFrame, bins: int = 20) -> pd.DataFrame:
+    """
+    Calcula el perfil de volumen: distribución del volumen por nivel de precio.
+    Retorna DataFrame con {precio_mid, volumen, poc (bool)}
+    """
+    if 'Volume' not in df.columns or df['Volume'].sum() == 0:
+        return pd.DataFrame()
+    precio_min = float(df['Low'].min())
+    precio_max = float(df['High'].max())
+    rangos     = np.linspace(precio_min, precio_max, bins + 1)
+    vol_por_nivel = np.zeros(bins)
+    for _, row in df.iterrows():
+        # Distribuir el volumen de cada vela entre los niveles que toca
+        idx_low  = np.searchsorted(rangos, float(row['Low']),  side='left')
+        idx_high = np.searchsorted(rangos, float(row['High']), side='right')
+        idx_low  = max(0, min(idx_low,  bins - 1))
+        idx_high = max(0, min(idx_high, bins))
+        n_niveles = max(1, idx_high - idx_low)
+        vol_por_nivel[idx_low:idx_high] += float(row['Volume']) / n_niveles
+    precio_mid = (rangos[:-1] + rangos[1:]) / 2
+    poc_idx    = np.argmax(vol_por_nivel)   # Point of Control = nivel con más volumen
+    return pd.DataFrame({
+        'precio': precio_mid,
+        'volumen': vol_por_nivel,
+        'poc': [i == poc_idx for i in range(bins)],
+    })
+
 def detectar_soportes_resistencias(df: pd.DataFrame, orden: int = 10):
     close    = df['Close'].values
     idx_max  = argrelextrema(close, np.greater, order=orden)[0]
@@ -365,6 +507,7 @@ def get_data(ticker: str, period: str) -> pd.DataFrame:
     df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"]   = calcular_bollinger(close)
     df["ATR"]                                      = calcular_atr(df)
     df["ADX"]                                      = calcular_adx(df)
+    df["STOCH_K"], df["STOCH_D"]                   = calcular_stoch_rsi(close)
     if "Volume" in df.columns:
         df["VOL_ANOMALO"] = volumen_anomalo(df)
     return df
@@ -1140,6 +1283,9 @@ with st.sidebar:
     mostrar_vanom   = st.checkbox("Volumen anómalo",       value=True)
     mostrar_fib     = st.checkbox("Fibonacci",             value=False)
     mostrar_divs    = st.checkbox("Divergencias RSI",      value=True)
+    mostrar_velas   = st.checkbox("Velas japonesas",       value=True)
+    mostrar_stoch   = st.checkbox("Stochastic RSI",        value=True)
+    mostrar_vp      = st.checkbox("Volume Profile",        value=False)
 
     st.markdown("---")
     st.subheader("📡 Datos — Twelve Data")
@@ -1264,7 +1410,7 @@ chg   = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 e
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
     "📊 Análisis",
     "🌐 Señales del Mercado",
     "📉 Comparación Relativa",
@@ -1276,6 +1422,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "🔍 Screener",
     "📰 Noticias & Fundamentales",
     "🕯️ Patrones Chartistas",
+    "💼 Portafolio",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1323,14 +1470,47 @@ with tab1:
         for r in info['razones']:
             st.markdown(f"- {r}")
 
+    # ── Velas japonesas ───────────────────────────────────────
+    if mostrar_velas:
+        velas_detectadas = detectar_velas_japonesas(df)
+        if velas_detectadas:
+            st.markdown("##### 🕯️ Patrones de Velas Recientes")
+            cols_v = st.columns(min(len(velas_detectadas), 3))
+            for vi, vela in enumerate(velas_detectadas[:3]):
+                color_v = {"alcista":"#00ff88","bajista":"#ff4444","neutro":"#ffd700"}.get(vela["tipo"],"#aaa")
+                fecha_v = vela["fecha"].strftime("%d/%m") if hasattr(vela["fecha"],"strftime") else str(vela["fecha"])
+                with cols_v[vi]:
+                    st.markdown(f"""
+                    <div style="background:#1a1a2e;border-left:3px solid {color_v};
+                        border-radius:0 6px 6px 0;padding:8px 12px;font-size:.82rem">
+                      <div style="color:{color_v};font-weight:bold">{vela['nombre']}</div>
+                      <div style="color:#888">{fecha_v}</div>
+                      <div style="color:#ccc;margin-top:4px">{vela['desc'][:80]}…</div>
+                    </div>""", unsafe_allow_html=True)
+
     tiene_vol   = mostrar_volumen and 'Volume' in df.columns
-    rows_n      = 4 if tiene_vol else 3
-    row_heights = [0.48, 0.13, 0.20, 0.19] if tiene_vol else [0.55, 0.22, 0.23]
+    tiene_stoch = mostrar_stoch and 'STOCH_K' in df.columns
+    # Calcular número de filas del gráfico dinámicamente
+    rows_n = 1  # velas siempre
+    rows_n += 1 if tiene_vol else 0
+    rows_n += 1  # RSI siempre
+    rows_n += 1  # MACD siempre
+    rows_n += 1 if tiene_stoch else 0
+
+    _h = []
+    _h.append(0.42 if tiene_vol else 0.50)
+    if tiene_vol: _h.append(0.10)
+    _h.append(0.16)
+    _h.append(0.16)
+    if tiene_stoch: _h.append(0.16)
+    # Normalizar
+    total_h = sum(_h)
+    row_heights = [x/total_h for x in _h]
 
     fig = make_subplots(
         rows=rows_n, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.03,
+        vertical_spacing=0.025,
         row_heights=row_heights,
     )
 
@@ -1373,9 +1553,10 @@ with tab1:
     fig.add_hline(y=info['sl'], line_color="#ff4444", line_dash="dash",
                   annotation_text=f"SL {info['sl']:,.2f}", row=1, col=1)
 
+    fila_actual = 1  # velas en fila 1
     if tiene_vol:
-        rsi_row  = 3
-        macd_row = 4
+        fila_actual += 1
+        vol_row = fila_actual
         colors_vol = []
         for i in range(len(df)):
             is_anom = bool(df['VOL_ANOMALO'].iloc[i]) if 'VOL_ANOMALO' in df.columns else False
@@ -1387,10 +1568,13 @@ with tab1:
         fig.add_trace(go.Bar(
             x=df.index, y=df['Volume'], name="Volumen",
             marker_color=colors_vol,
-        ), row=2, col=1)
+        ), row=vol_row, col=1)
+    fila_actual += 1; rsi_row  = fila_actual
+    fila_actual += 1; macd_row = fila_actual
+    if tiene_stoch:
+        fila_actual += 1; stoch_row = fila_actual
     else:
-        rsi_row  = 2
-        macd_row = 3
+        stoch_row = None
 
     fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name="RSI",
         line=dict(color="#c77dff", width=1.5)), row=rsi_row, col=1)
@@ -1404,6 +1588,20 @@ with tab1:
         line=dict(color="#00cfff", width=1.2)), row=macd_row, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['MACD_SIGNAL'], name="Señal",
         line=dict(color="#ff8c00", width=1.2)), row=macd_row, col=1)
+
+    # ── Stochastic RSI ─────────────────────────────────────
+    if tiene_stoch and stoch_row:
+        fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_K'], name="%K",
+            line=dict(color="#00cfff", width=1.5)), row=stoch_row, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_D'], name="%D",
+            line=dict(color="#ff8c00", width=1.5)), row=stoch_row, col=1)
+        fig.add_hrect(y0=80, y1=100, fillcolor="rgba(255,68,68,0.07)",
+                      line_width=0, row=stoch_row, col=1)
+        fig.add_hrect(y0=0,  y1=20,  fillcolor="rgba(0,255,136,0.07)",
+                      line_width=0, row=stoch_row, col=1)
+        fig.add_hline(y=80, line_color="rgba(255,68,68,.5)",  line_dash="dot", row=stoch_row, col=1)
+        fig.add_hline(y=20, line_color="rgba(0,255,136,.5)", line_dash="dot", row=stoch_row, col=1)
+        fig.update_yaxes(title_text="StochRSI", row=stoch_row, col=1)
 
     # ── Fibonacci ──────────────────────────────────────────
     if mostrar_fib:
@@ -1458,6 +1656,44 @@ with tab1:
 
     if mostrar_vanom and mostrar_volumen:
         st.caption("⬜ blanco / 🟠 naranja en volumen = anomalía (>2× media 20 períodos) — posible punto de inflexión")
+
+    # ── Volume Profile ─────────────────────────────────────
+    if mostrar_vp and 'Volume' in df.columns:
+        st.markdown("##### 📊 Volume Profile — Distribución del Volumen por Precio")
+        vp = calcular_volume_profile(df, bins=24)
+        if not vp.empty:
+            poc_precio = float(vp[vp['poc']]['precio'].values[0])
+            col_vp1, col_vp2 = st.columns([1, 3])
+            with col_vp1:
+                st.metric("POC (Point of Control)", f"${poc_precio:,.4f}",
+                          help="Nivel de precio con mayor volumen negociado — actúa como imán de precio")
+                dist_poc = ((price - poc_precio) / poc_precio * 100)
+                st.metric("Distancia al POC", f"{dist_poc:+.2f}%")
+                poc_bias = "🟢 Precio sobre POC (soporte)" if price > poc_precio else "🔴 Precio bajo POC (resistencia)"
+                st.info(poc_bias)
+            with col_vp2:
+                colors_vp = ["#ff6b35" if row['poc'] else "#00cfff"
+                             for _, row in vp.iterrows()]
+                fig_vp = go.Figure(go.Bar(
+                    x=vp['volumen'], y=vp['precio'],
+                    orientation='h',
+                    marker_color=colors_vp,
+                    name="Volumen",
+                ))
+                fig_vp.add_hline(y=price, line_color="white", line_dash="dot",
+                                  annotation_text=f"Precio ${price:,.2f}", line_width=1.5)
+                fig_vp.add_hline(y=poc_precio, line_color="#ff6b35", line_dash="dash",
+                                  annotation_text=f"POC ${poc_precio:,.2f}", line_width=2)
+                fig_vp.update_layout(
+                    template="plotly_dark", height=320,
+                    paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                    xaxis_title="Volumen", yaxis_title="Precio",
+                    showlegend=False, margin=dict(l=0,r=0,t=10,b=0),
+                )
+                fig_vp.update_yaxes(gridcolor="rgba(255,255,255,0.05)")
+                st.plotly_chart(fig_vp, use_container_width=True)
+            st.caption("🟠 Naranja = POC (Point of Control) — nivel de mayor actividad. Funciona como soporte/resistencia dinámico."
+)
 
     with st.expander("📊 Datos recientes"):
         cols_show = [c for c in ['Close','EMA20','EMA50','RSI','MACD','BB_UPPER','BB_LOWER','ATR']
@@ -2683,3 +2919,193 @@ with tab11:
         "⚠️ Detección algoritmica sobre datos históricos. No garantiza rendimientos futuros. "
         "Confirmar siempre con volumen, contexto de mercado y otros indicadores antes de operar."
     )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 12 — PORTAFOLIO CONSOLIDADO
+# ══════════════════════════════════════════════════════════════════════════════
+with tab12:
+    st.subheader("💼 Portafolio Consolidado")
+    st.caption("Visión unificada de todas tus posiciones paper abiertas, P&L en tiempo real y exposición.")
+
+    trades_all = st.session_state.paper_trades
+    if not trades_all:
+        st.info("No tienes posiciones registradas. Ve a **📒 Paper Trading & Notas** y registra operaciones.")
+    else:
+        # ── Obtener precios actuales de todos los tickers del portafolio ──
+        tickers_port = list(set(t["Ticker"] for t in trades_all))
+        precios_port = {}
+        with st.spinner("Actualizando precios del portafolio..."):
+            for sym in tickers_port:
+                try:
+                    d = get_data(sym, "1mo")
+                    if not d.empty:
+                        precios_port[sym] = float(d['Close'].iloc[-1])
+                except Exception:
+                    precios_port[sym] = None
+
+        # ── Calcular P&L para cada posición ───────────────────────────
+        filas_port = []
+        for t in trades_all:
+            px_actual = precios_port.get(t["Ticker"])
+            if px_actual is None:
+                px_actual = t["Entrada"]
+
+            if t["Lado"] == "LONG":
+                if px_actual >= t["TP"]:   estado, px_cierre = "🟢 TP",   t["TP"]
+                elif px_actual <= t["SL"]: estado, px_cierre = "🔴 SL",   t["SL"]
+                else:                      estado, px_cierre = "🟡 Abierta", px_actual
+                pct = (px_cierre - t["Entrada"]) / t["Entrada"] * 100
+            else:
+                if px_actual <= t["TP"]:   estado, px_cierre = "🟢 TP",   t["TP"]
+                elif px_actual >= t["SL"]: estado, px_cierre = "🔴 SL",   t["SL"]
+                else:                      estado, px_cierre = "🟡 Abierta", px_actual
+                pct = (t["Entrada"] - px_cierre) / t["Entrada"] * 100
+
+            pnl_usd = round(t["Capital"] * pct / 100, 2)
+            filas_port.append({
+                "Ticker":   t["Ticker"],
+                "Lado":     t["Lado"],
+                "Entrada $": t["Entrada"],
+                "Actual $":  round(px_actual, 4),
+                "SL $":      t["SL"],
+                "TP $":      t["TP"],
+                "Capital $": t["Capital"],
+                "P&L %":     round(pct, 2),
+                "P&L $":     pnl_usd,
+                "Estado":    estado,
+                "Fecha":     t.get("Fecha","—"),
+            })
+
+        df_port = pd.DataFrame(filas_port)
+
+        # ── KPIs globales ──────────────────────────────────────────────
+        pnl_total    = df_port["P&L $"].sum()
+        capital_total= df_port["Capital $"].sum()
+        pnl_pct_total= round(pnl_total / capital_total * 100, 2) if capital_total > 0 else 0
+        abiertas     = (df_port["Estado"] == "🟡 Abierta").sum()
+        tp_alc       = (df_port["Estado"] == "🟢 TP").sum()
+        sl_toc       = (df_port["Estado"] == "🔴 SL").sum()
+        winrate_port = round(tp_alc / (tp_alc + sl_toc) * 100, 1) if (tp_alc + sl_toc) > 0 else 0
+
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1.metric("Posiciones",      len(df_port))
+        k2.metric("Capital Total",   f"${capital_total:,.0f}")
+        k3.metric("P&L Total $",     f"${pnl_total:+,.2f}",
+                  delta_color="normal" if pnl_total >= 0 else "inverse")
+        k4.metric("P&L Total %",     f"{pnl_pct_total:+.2f}%",
+                  delta_color="normal" if pnl_pct_total >= 0 else "inverse")
+        k5.metric("Win Rate",        f"{winrate_port}%")
+        k6.metric("🟡 Abiertas",     abiertas)
+
+        st.markdown("---")
+
+        col_port1, col_port2 = st.columns([3, 2])
+
+        with col_port1:
+            # ── Tabla de posiciones ────────────────────────────────
+            st.markdown("#### 📋 Posiciones")
+
+            def _css_port(val):
+                try:
+                    v = float(val)
+                    return "color:#00ff88" if v > 0 else ("color:#ff4444" if v < 0 else "")
+                except Exception:
+                    if "🟢" in str(val): return "color:#00ff88;font-weight:bold"
+                    if "🔴" in str(val): return "color:#ff4444;font-weight:bold"
+                    return ""
+
+            _cm_port = "map" if hasattr(df_port.style,"map") else "applymap"
+            styled_port = df_port.style.format({
+                "Entrada $":  "{:,.4f}",
+                "Actual $":   "{:,.4f}",
+                "SL $":       "{:,.4f}",
+                "TP $":       "{:,.4f}",
+                "Capital $":  "{:,.2f}",
+                "P&L %":      "{:+.2f}%",
+                "P&L $":      "${:+,.2f}",
+            })
+            styled_port = getattr(styled_port, _cm_port)(_css_port, subset=["P&L %","P&L $","Estado"])
+            st.dataframe(styled_port, use_container_width=True, height=340)
+
+            # ── Curva P&L acumulada ────────────────────────────────
+            if len(df_port) > 1:
+                df_port_sorted = df_port.copy()
+                df_port_sorted["P&L acum $"] = df_port_sorted["P&L $"].cumsum()
+                fig_port_eq = go.Figure()
+                colors_port = ["#00ff88" if v >= 0 else "#ff4444"
+                               for v in df_port_sorted["P&L $"]]
+                fig_port_eq.add_trace(go.Bar(
+                    x=df_port_sorted["Ticker"],
+                    y=df_port_sorted["P&L $"],
+                    marker_color=colors_port,
+                    name="P&L por posición",
+                ))
+                fig_port_eq.add_trace(go.Scatter(
+                    x=df_port_sorted["Ticker"],
+                    y=df_port_sorted["P&L acum $"],
+                    mode="lines+markers",
+                    line=dict(color="#00cfff", width=2),
+                    name="P&L acumulado",
+                ))
+                fig_port_eq.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_dash="dot")
+                fig_port_eq.update_layout(
+                    template="plotly_dark", height=260,
+                    title="P&L por posición y acumulado",
+                    paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                    legend=dict(orientation="h"),
+                    margin=dict(l=0,r=0,t=30,b=0),
+                )
+                st.plotly_chart(fig_port_eq, use_container_width=True)
+
+        with col_port2:
+            # ── Exposición por activo ──────────────────────────────
+            st.markdown("#### 🥧 Exposición por Activo")
+            exp_ticker = df_port.groupby("Ticker")["Capital $"].sum().reset_index()
+            fig_pie_port = go.Figure(go.Pie(
+                labels=exp_ticker["Ticker"],
+                values=exp_ticker["Capital $"],
+                hole=0.5,
+                textinfo="label+percent",
+                marker=dict(line=dict(color="#0d1117", width=2)),
+            ))
+            fig_pie_port.update_layout(
+                template="plotly_dark", height=280,
+                paper_bgcolor="#0d1117",
+                showlegend=False,
+                margin=dict(l=0,r=0,t=10,b=0),
+            )
+            st.plotly_chart(fig_pie_port, use_container_width=True)
+
+            # ── Exposición LONG vs SHORT ───────────────────────────
+            st.markdown("#### ⚖️ Exposición LONG vs SHORT")
+            long_cap  = df_port[df_port["Lado"]=="LONG"]["Capital $"].sum()
+            short_cap = df_port[df_port["Lado"]=="SHORT"]["Capital $"].sum()
+            fig_ls = go.Figure(go.Bar(
+                x=["LONG","SHORT"],
+                y=[long_cap, short_cap],
+                marker_color=["#00ff88","#ff4444"],
+                text=[f"${long_cap:,.0f}", f"${short_cap:,.0f}"],
+                textposition="outside",
+            ))
+            fig_ls.update_layout(
+                template="plotly_dark", height=200,
+                paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                showlegend=False, margin=dict(l=0,r=0,t=10,b=10),
+            )
+            st.plotly_chart(fig_ls, use_container_width=True)
+
+            # ── Señal actual de cada ticker ────────────────────────
+            st.markdown("#### 🎯 Señal Actual por Posición")
+            for sym in tickers_port:
+                try:
+                    d = get_data(sym, "3mo")
+                    if d.empty: continue
+                    inf = generar_senal(d)
+                    st.markdown(f"`{sym}` → **{inf['senal']}** (pts: {inf['puntos']:+d})")
+                except Exception:
+                    pass
+
+        st.markdown("---")
+        if st.button("🗑️ Limpiar todo el portafolio", key="clear_port"):
+            st.session_state.paper_trades = []
+            st.rerun()
