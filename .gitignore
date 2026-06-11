@@ -6,17 +6,21 @@ __pycache__/
 venv/
 ENV/
 .env
-
+ 
 # --- Streamlit ---
 .streamlit/static
 .streamlit/component_sources
-
+ 
 # --- Datos y Logs ---
 *.csv
 *.log
 .DS_Store
 Thumbs.db
-
+ 
 # --- IDEs ---
 .vscode/
 .idea/
+ 
+# --- Portafolio local (NUNCA subir: contiene tus trades y notas) ---
+qsp_portfolio.json
+ 
