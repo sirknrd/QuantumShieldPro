@@ -358,17 +358,22 @@ def volumen_anomalo(df: pd.DataFrame, factor: float = 2.0) -> pd.Series:
     vol_media = df['Volume'].rolling(20).mean()
     return df['Volume'] > (factor * vol_media)
 
-def generar_senal(df: pd.DataFrame) -> dict:
-    ultima  = df.iloc[-1]
+def calcular_puntos(fila) -> tuple:
+    """
+    Score de confluencia de UNA fila (vela). Única fuente de verdad:
+    la usan tanto la señal en vivo como el backtest, para que ambos
+    evalúen exactamente la misma estrategia (incluido el filtro ADX).
+    Retorna (puntos, razones, rsi_val, adx_val).
+    """
     puntos  = 0
     razones = []
 
-    if float(ultima['Close']) > float(ultima['EMA50']):
+    if float(fila['Close']) > float(fila['EMA50']):
         puntos += 1; razones.append("✅ Precio sobre EMA50 (alcista)")
     else:
         puntos -= 1; razones.append("❌ Precio bajo EMA50 (bajista)")
 
-    rsi_val = float(ultima['RSI'])
+    rsi_val = float(fila['RSI'])
     if rsi_val < 30:
         puntos += 2; razones.append(f"✅ RSI sobrevendido ({rsi_val:.1f}) — posible rebote")
     elif rsi_val > 70:
@@ -376,15 +381,31 @@ def generar_senal(df: pd.DataFrame) -> dict:
     elif 40 <= rsi_val <= 60:
         puntos += 1; razones.append(f"✅ RSI en zona neutral ({rsi_val:.1f})")
 
-    if float(ultima['MACD']) > float(ultima['MACD_SIGNAL']):
+    if float(fila['MACD']) > float(fila['MACD_SIGNAL']):
         puntos += 1; razones.append("✅ MACD sobre señal (impulso alcista)")
     else:
         puntos -= 1; razones.append("❌ MACD bajo señal (impulso bajista)")
 
-    if float(ultima['Close']) < float(ultima['BB_LOWER']):
+    if float(fila['Close']) < float(fila['BB_LOWER']):
         puntos += 1; razones.append("✅ Precio bajo BB inferior (sobreventa)")
-    elif float(ultima['Close']) > float(ultima['BB_UPPER']):
+    elif float(fila['Close']) > float(fila['BB_UPPER']):
         puntos -= 1; razones.append("❌ Precio sobre BB superior (sobrecompra)")
+
+    # Filtro ADX — se aplica ANTES de clasificar la señal
+    adx_val = float(fila['ADX']) if 'ADX' in fila.index and not pd.isna(fila['ADX']) else 0
+    if adx_val >= 25:
+        razones.append(f"✅ ADX {adx_val:.1f} — tendencia fuerte (señal más confiable)")
+    elif adx_val >= 15:
+        razones.append(f"⚠️ ADX {adx_val:.1f} — tendencia moderada")
+    else:
+        puntos = max(-1, min(1, puntos))
+        razones.append(f"⚠️ ADX {adx_val:.1f} — sin tendencia clara (señal poco confiable)")
+
+    return puntos, razones, rsi_val, adx_val
+
+def generar_senal(df: pd.DataFrame) -> dict:
+    ultima = df.iloc[-1]
+    puntos, razones, rsi_val, adx_val = calcular_puntos(ultima)
 
     if   puntos >= 3:  senal, color = "🟢 COMPRA FUERTE", "#00ff88"
     elif puntos >= 1:  senal, color = "🟡 COMPRA DÉBIL",  "#ffd700"
@@ -393,16 +414,7 @@ def generar_senal(df: pd.DataFrame) -> dict:
     else:              senal, color = "⚪ NEUTRAL",        "#aaaaaa"
 
     atr_val = float(ultima['ATR']) if not pd.isna(ultima['ATR']) else 0
-    adx_val = float(ultima['ADX']) if 'ADX' in ultima.index and not pd.isna(ultima['ADX']) else 0
     precio  = float(ultima['Close'])
-
-    if adx_val >= 25:
-        razones.append(f"✅ ADX {adx_val:.1f} — tendencia fuerte (señal más confiable)")
-    elif adx_val >= 15:
-        razones.append(f"⚠️ ADX {adx_val:.1f} — tendencia moderada")
-    else:
-        puntos = max(-1, min(1, puntos))
-        razones.append(f"⚠️ ADX {adx_val:.1f} — sin tendencia clara (señal poco confiable)")
 
     return {
         "senal": senal, "color": color, "puntos": puntos,
@@ -418,7 +430,6 @@ def generar_senal(df: pd.DataFrame) -> dict:
 
 PERIOD_DAYS    = {"1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 732}
 PERIOD_OUTPUT  = {"1mo": 35, "3mo": 95, "6mo": 190, "1y": 370, "2y": 740}
-TD_API_KEY     = {"key": ""}   # se rellena desde el sidebar
 TD_BASE_URL    = "https://api.twelvedata.com/time_series"
 BINANCE_BASE   = "https://api.binance.com/api/v3/klines"
 BINANCE_INTERVALS = {"1mo": ("1d", 35), "3mo": ("1d", 95), "6mo": ("1d", 190), "1y": ("1d", 370), "2y": ("1d", 740)}
@@ -472,9 +483,9 @@ def _ticker_td(ticker: str) -> str:
         t = t[1:]
     return t
 
-def _td_download(ticker: str, period: str) -> pd.DataFrame:
+def _td_download(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
     """Descarga OHLCV desde Twelve Data. Retorna DataFrame vacio si falla o sin key."""
-    key = TD_API_KEY.get("key", "").strip()
+    key = (td_key or "").strip()
     if not key:
         return pd.DataFrame()
     sym      = _ticker_td(ticker)
@@ -540,7 +551,7 @@ def _yf_fallback(ticker: str, period: str) -> pd.DataFrame:
             raise
     return pd.DataFrame()
 
-def _descargar_raw(ticker: str, period: str) -> pd.DataFrame:
+def _descargar_raw(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
     """
     Orden de prioridad:
       Crypto  → Binance (gratis, tiempo real) → Twelve Data → yfinance
@@ -550,14 +561,17 @@ def _descargar_raw(ticker: str, period: str) -> pd.DataFrame:
         df = _binance_download(ticker, period)
         if not df.empty:
             return df
-    df = _td_download(ticker, period)
+    df = _td_download(ticker, period, td_key)
     if df.empty:
         df = _yf_fallback(ticker, period)
     return df
 
 @st.cache_data(ttl=300)
-def get_data(ticker: str, period: str) -> pd.DataFrame:
-    df = _descargar_raw(ticker, period)
+def get_data(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
+    try:
+        df = _descargar_raw(ticker, period, td_key)
+    except Exception:
+        return pd.DataFrame()
     if df.empty:
         return pd.DataFrame()
     df = df[[c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]].copy()
@@ -577,9 +591,9 @@ def get_data(ticker: str, period: str) -> pd.DataFrame:
     return df
 
 @st.cache_data(ttl=300)
-def get_close_only(ticker: str, period: str) -> pd.Series:
+def get_close_only(ticker: str, period: str, td_key: str = "") -> pd.Series:
     try:
-        df = _descargar_raw(ticker, period)
+        df = _descargar_raw(ticker, period, td_key)
     except Exception:
         return pd.Series(dtype=float, name=ticker)
     if df.empty:
@@ -651,10 +665,16 @@ def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL   = "llama-3.3-70b-versatile"
-GROQ_HEADERS = {"Content-Type": "application/json"}
+def _groq_headers() -> dict:
+    """Headers construidos por sesión (la key NO vive en un global compartido)."""
+    h = {"Content-Type": "application/json"}
+    k = st.session_state.get("groq_api_key", "").strip()
+    if k:
+        h["Authorization"] = f"Bearer {k}"
+    return h
 
 def _ia_activa() -> bool:
-    return bool(GROQ_HEADERS.get("Authorization", "").replace("Bearer ", "").strip())
+    return bool(st.session_state.get("groq_api_key", "").strip())
 
 def _groq(system: str, user: str, max_tokens: int = 1000) -> str:
     if not _ia_activa():
@@ -668,7 +688,7 @@ def _groq(system: str, user: str, max_tokens: int = 1000) -> str:
         ],
     }
     try:
-        resp = requests.post(GROQ_API_URL, headers=GROQ_HEADERS, json=payload, timeout=30)
+        resp = requests.post(GROQ_API_URL, headers=_groq_headers(), json=payload, timeout=30)
         if not resp.ok:
             try:
                 detalle = resp.json().get("error", {}).get("message", resp.text[:300])
@@ -702,7 +722,7 @@ def _groq_stream(system: str, messages: list, max_tokens: int = 1000):
         "stream": True,
     }
     try:
-        with requests.post(GROQ_API_URL, headers=GROQ_HEADERS,
+        with requests.post(GROQ_API_URL, headers=_groq_headers(),
                            json=payload, timeout=60, stream=True) as resp:
             if not resp.ok:
                 try:
@@ -750,41 +770,60 @@ Razones: {"; ".join(info["razones"])}
 # BACKTESTING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: int = -1, comision_pct: float = 0.1) -> dict:
+def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: int = -1,
+                        comision_pct: float = 0.1, usar_sl_tp: bool = True,
+                        mult_sl: float = 2.0, mult_tp: float = 3.0) -> dict:
     """
     comision_pct: % cobrado por lado (entrada + salida = 2x).
     Ejemplo: Binance 0.1% → 0.2% por operación completa.
+
+    usar_sl_tp: simula los mismos SL/TP por ATR que muestra la señal en vivo
+    (SL = entrada − mult_sl·ATR, TP = entrada + mult_tp·ATR), con detección
+    intrabar usando High/Low. Si SL y TP se tocan en la misma vela, se asume
+    SL primero (criterio conservador).
+
+    El scoring usa calcular_puntos() — la MISMA función de la señal en vivo,
+    incluido el filtro ADX.
     """
     resultados = []
     en_posicion = False
     precio_entrada = 0.0
     fecha_entrada  = None
     senal_entrada  = ""
+    idx_entrada    = -1
+    sl_nivel = None
+    tp_nivel = None
 
     puntos_serie = []
     for i in range(len(df)):
         if i < 50:
             puntos_serie.append(0)
             continue
-        fila = df.iloc[i]
-        p = 0
         try:
-            if float(fila['Close']) > float(fila['EMA50']): p += 1
-            else: p -= 1
-            rsi = float(fila['RSI'])
-            if rsi < 30:   p += 2
-            elif rsi > 70: p -= 2
-            elif 40 <= rsi <= 60: p += 1
-            if float(fila['MACD']) > float(fila['MACD_SIGNAL']): p += 1
-            else: p -= 1
-            if float(fila['Close']) < float(fila['BB_LOWER']):   p += 1
-            elif float(fila['Close']) > float(fila['BB_UPPER']): p -= 1
+            p, _, _, _ = calcular_puntos(df.iloc[i])
         except Exception:
-            pass
+            p = 0
         puntos_serie.append(p)
 
     df = df.copy()
     df['_puntos'] = puntos_serie
+
+    def _cerrar(precio_out, fecha_out, motivo):
+        retorno_bruto = (precio_out - precio_entrada) / precio_entrada * 100
+        retorno  = retorno_bruto - (comision_pct * 2)   # entrada + salida
+        duracion = (fecha_out - fecha_entrada).days if hasattr(fecha_out - fecha_entrada, 'days') else 1
+        resultados.append({
+            "Entrada":        fecha_entrada.strftime("%d/%m/%Y") if hasattr(fecha_entrada, 'strftime') else str(fecha_entrada),
+            "Salida":         fecha_out.strftime("%d/%m/%Y")     if hasattr(fecha_out,     'strftime') else str(fecha_out),
+            "Precio entrada": round(precio_entrada, 4),
+            "Precio salida":  round(precio_out, 4),
+            "Retorno bruto %": round(retorno_bruto, 2),
+            "Retorno %":      round(retorno, 2),
+            "Días":           duracion,
+            "Señal entrada":  senal_entrada,
+            "Salida por":     motivo,
+            "Resultado":      "✅ Ganada" if retorno > 0 else "❌ Perdida",
+        })
 
     for i in range(51, len(df) - 1):
         pts_hoy    = df['_puntos'].iloc[i]
@@ -797,22 +836,30 @@ def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: 
                 precio_entrada = precio_sig
                 fecha_entrada  = fecha_sig
                 senal_entrada  = f"+{pts_hoy}"
+                idx_entrada    = i + 1
+                sl_nivel = tp_nivel = None
+                if usar_sl_tp and 'ATR' in df.columns:
+                    atr_e = df['ATR'].iloc[i + 1]
+                    if not pd.isna(atr_e) and float(atr_e) > 0:
+                        sl_nivel = precio_entrada - mult_sl * float(atr_e)
+                        tp_nivel = precio_entrada + mult_tp * float(atr_e)
         else:
+            # 1) SL/TP intrabar en la vela actual (después de la vela de entrada)
+            if sl_nivel is not None and i > idx_entrada:
+                lo = float(df['Low'].iloc[i])
+                hi = float(df['High'].iloc[i])
+                if lo <= sl_nivel:
+                    _cerrar(sl_nivel, df.index[i], "🛑 Stop Loss")
+                    en_posicion = False
+                    continue
+                if hi >= tp_nivel:
+                    _cerrar(tp_nivel, df.index[i], "🎯 Take Profit")
+                    en_posicion = False
+                    continue
+            # 2) Señal contraria o fin de datos → cierre al close de la vela siguiente
             if pts_hoy <= umbral_venta or i == len(df) - 2:
-                retorno_bruto = (precio_sig - precio_entrada) / precio_entrada * 100
-                retorno  = retorno_bruto - (comision_pct * 2)   # entrada + salida
-                duracion = (fecha_sig - fecha_entrada).days if hasattr(fecha_sig - fecha_entrada, 'days') else 1
-                resultados.append({
-                    "Entrada":        fecha_entrada.strftime("%d/%m/%Y") if hasattr(fecha_entrada, 'strftime') else str(fecha_entrada),
-                    "Salida":         fecha_sig.strftime("%d/%m/%Y")     if hasattr(fecha_sig,      'strftime') else str(fecha_sig),
-                    "Precio entrada": round(precio_entrada, 4),
-                    "Precio salida":  round(precio_sig, 4),
-                    "Retorno bruto %": round(retorno_bruto, 2),
-                    "Retorno %":      round(retorno, 2),
-                    "Días":           duracion,
-                    "Señal entrada":  senal_entrada,
-                    "Resultado":      "✅ Ganada" if retorno > 0 else "❌ Perdida",
-                })
+                motivo = "📉 Señal contraria" if pts_hoy <= umbral_venta else "🏁 Fin de datos"
+                _cerrar(precio_sig, fecha_sig, motivo)
                 en_posicion = False
 
     if not resultados:
@@ -826,20 +873,20 @@ def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: 
     win_rate = round(ganadas / n_ops * 100, 1) if n_ops > 0 else 0
     ret_bh   = round((float(df['Close'].iloc[-1]) / float(df['Close'].iloc[50]) - 1) * 100, 2)
 
-    # Sharpe ratio (asume tasa libre de riesgo = 0, retornos por operación)
+    # Sharpe por operación (asume tasa libre de riesgo = 0)
     retornos = df_ops['Retorno %']
     sharpe = round(retornos.mean() / retornos.std() * np.sqrt(n_ops), 2) if retornos.std() > 0 else 0
 
-    # Max Drawdown sobre la curva de equity acumulada
-    equity   = retornos.cumsum()
-    peak     = equity.cummax()
-    drawdown = equity - peak
+    # Equity COMPUESTA (reinversión) — consistente con Buy & Hold
+    equity   = (1 + retornos / 100).cumprod()
+    ret_comp = round(float(equity.iloc[-1] - 1) * 100, 2)
+    drawdown = (equity / equity.cummax() - 1) * 100
     max_dd   = round(float(drawdown.min()), 2)
 
     return {
         "ops": df_ops,
         "win_rate": win_rate,
-        "retorno_total": round(retornos.sum(), 2),
+        "retorno_total": ret_comp,
         "retorno_bh": ret_bh,
         "n_ops": n_ops,
         "promedio_op": round(retornos.mean(), 2),
@@ -1360,13 +1407,14 @@ with st.sidebar:
         help="Gratis en twelvedata.com · 800 req/día · Sin tarjeta",
     )
     if td_key_input:
-        TD_API_KEY["key"] = td_key_input
+        st.session_state["td_api_key"] = td_key_input
         st.success("Twelve Data listo ✓", icon="📡")
     else:
         try:
-            TD_API_KEY["key"] = st.secrets["TD_API_KEY"]
+            st.session_state["td_api_key"] = st.secrets["TD_API_KEY"]
             st.success("Twelve Data desde secrets ✓", icon="📡")
         except Exception:
+            st.session_state["td_api_key"] = ""
             st.warning("Sin key → usando Yahoo Finance (fallback)", icon="⚠️")
             st.markdown("[Obtener key gratis →](https://twelvedata.com/register)")
 
@@ -1379,13 +1427,14 @@ with st.sidebar:
         help="Gratis en console.groq.com · Sin tarjeta de crédito",
     )
     if groq_key_input:
-        GROQ_HEADERS["Authorization"] = f"Bearer {groq_key_input}"
+        st.session_state["groq_api_key"] = groq_key_input
         st.success("Groq listo ✓", icon="🔑")
     else:
         try:
-            GROQ_HEADERS["Authorization"] = f"Bearer {st.secrets['GROQ_API_KEY']}"
+            st.session_state["groq_api_key"] = st.secrets["GROQ_API_KEY"]
             st.success("Groq desde secrets ✓", icon="🔑")
         except Exception:
+            st.session_state["groq_api_key"] = ""
             st.warning("Sin API key — IA desactivada", icon="⚠️")
             st.markdown("[Obtener clave gratis →](https://console.groq.com)")
 
@@ -1399,12 +1448,15 @@ with st.sidebar:
         st.info(f"♻️ Recargando cada {refresh_secs}s", icon="⏱️")
 
     st.markdown("---")
-    fuente = "Twelve Data" if TD_API_KEY.get("key") else "Yahoo Finance (fallback)"
+    fuente = "Twelve Data" if st.session_state.get("td_api_key") else "Yahoo Finance (fallback)"
     st.caption(f"Datos vía {fuente} · Caché 5 min")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATOS PRINCIPALES
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Key de Twelve Data de ESTA sesión (no global → no se filtra entre usuarios)
+TD_KEY = st.session_state.get("td_api_key", "")
 
 st.title("🛡️ QuantumShield Pro — Trading Terminal")
 
@@ -1446,7 +1498,7 @@ if not ticker:
 
 with st.spinner(f"Analizando {ticker}..."):
     try:
-        df = get_data(ticker, period)
+        df = get_data(ticker, period, td_key=TD_KEY)
     except Exception as e:
         nombre_e = type(e).__name__
         if "RateLimit" in nombre_e or "TooManyRequests" in nombre_e:
@@ -1501,7 +1553,7 @@ with tab1:
     es_crypto = ticker in BINANCE_SYMBOLS
     if es_crypto:
         st.success("📡 Datos en tiempo real vía **Binance** (sin delay)", icon="⚡")
-    elif TD_API_KEY.get("key"):
+    elif TD_KEY:
         st.info("📡 Datos vía **Twelve Data**", icon="📊")
     else:
         st.warning("📡 Datos vía **Yahoo Finance** (posible delay de 1 día) — agrega Twelve Data key para acciones en tiempo real", icon="⚠️")
@@ -1782,7 +1834,7 @@ with tab2:
     def _fetch_fila(nm_sym):
         nm, sym = nm_sym
         try:
-            d = get_data(sym, period)
+            d = get_data(sym, period, td_key=TD_KEY)
             if d.empty or len(d) < 30:
                 return None
             inf = generar_senal(d)
@@ -1951,8 +2003,8 @@ with tab3:
     bench_usado = bench_input if bench_input else benchmark
 
     with st.spinner("Cargando comparación..."):
-        s_activo = get_close_only(ticker,      period)
-        s_bench  = get_close_only(bench_usado, period)
+        s_activo = get_close_only(ticker,      period, td_key=TD_KEY)
+        s_bench  = get_close_only(bench_usado, period, td_key=TD_KEY)
 
     if s_activo.empty or s_bench.empty:
         st.warning("No se pudieron obtener datos para la comparación.")
@@ -2007,7 +2059,7 @@ with tab4:
     with st.spinner("Calculando correlaciones..."):
         series_list = []
         for nm, sym in preset_corr.items():
-            s = get_close_only(sym, period)
+            s = get_close_only(sym, period, td_key=TD_KEY)
             if not s.empty:
                 s.name = nm.split("(")[0].strip()
                 series_list.append(s)
@@ -2339,13 +2391,20 @@ with tab7:
             format="%.2f",
         )
 
+    bt_usar_sltp = st.checkbox(
+        "Simular Stop Loss / Take Profit por ATR (SL = 2×ATR · TP = 3×ATR, igual que la señal en vivo)",
+        value=True,
+        help="Detección intrabar con High/Low. Si SL y TP se tocan en la misma vela, se asume SL primero (conservador).",
+    )
+
     if st.button("▶️ Ejecutar Backtest", type="primary"):
         with st.spinner("Simulando estrategia..."):
-            df_bt = get_data(ticker, bt_period_sel)
+            df_bt = get_data(ticker, bt_period_sel, td_key=TD_KEY)
             if df_bt.empty or len(df_bt) < 60:
                 st.warning("No hay suficientes datos para el backtest (mínimo 60 velas).")
             else:
-                bt = backtest_estrategia(df_bt, bt_umbral_compra, bt_umbral_venta, bt_comision)
+                bt = backtest_estrategia(df_bt, bt_umbral_compra, bt_umbral_venta,
+                                         bt_comision, usar_sl_tp=bt_usar_sltp)
 
                 if bt['n_ops'] == 0:
                     st.info("La estrategia no generó ninguna operación. Prueba ajustando los umbrales.")
@@ -2361,7 +2420,7 @@ with tab7:
                     b5.metric("Mejor operación",  f"{bt['max_ganancia']:+.2f}%")
                     b6.metric("Peor operación",   f"{bt['max_perdida']:+.2f}%")
                     sharpe_color = "normal" if bt['sharpe'] >= 1 else "inverse"
-                    b7.metric("Sharpe Ratio",     f"{bt['sharpe']:.2f}",
+                    b7.metric("Sharpe (por op.)", f"{bt['sharpe']:.2f}",
                               delta="Bueno ✅" if bt['sharpe'] >= 1 else ("Aceptable ⚠️" if bt['sharpe'] >= 0.5 else "Bajo ❌"),
                               delta_color=sharpe_color)
                     b8.metric("Max Drawdown",     f"{bt['max_drawdown']:+.2f}%",
@@ -2369,7 +2428,7 @@ with tab7:
 
                     st.markdown("---")
                     df_ops = bt['ops'].copy()
-                    df_ops['Retorno acumulado %'] = df_ops['Retorno %'].cumsum()
+                    df_ops['Retorno acumulado %'] = ((1 + df_ops['Retorno %'] / 100).cumprod() - 1) * 100
                     df_ops['Op'] = range(1, len(df_ops) + 1)
 
                     fig_eq = go.Figure()
@@ -2454,7 +2513,9 @@ with tab7:
                     st.caption(
                         f"⚠️ Resultados con comisión de **{bt_comision}% por lado** ({bt_comision*2}% por operación completa) · "
                         f"Costo total: **{costo_total:.2f}%** · "
-                        "No garantiza rendimientos futuros. Ejecución asumida al cierre del día siguiente."
+                        "No garantiza rendimientos futuros. Ejecución asumida al cierre del día siguiente. "
+                        "Retorno y drawdown calculados con capitalización compuesta. "
+                        + ("SL/TP simulados intrabar (si SL y TP caen en la misma vela, se asume SL primero)." if bt_usar_sltp else "Salidas solo por señal contraria (sin SL/TP).")
                     )
     else:
         st.info("Configura los parámetros y haz clic en **▶️ Ejecutar Backtest** para simular la estrategia.")
@@ -2643,7 +2704,7 @@ with tab9:
         def _scan(nm_sym):
             nm, sym = nm_sym
             try:
-                d = get_data(sym, "3mo")
+                d = get_data(sym, "3mo", td_key=TD_KEY)
                 if d.empty or len(d) < 30:
                     return None
                 inf = generar_senal(d)
@@ -2907,7 +2968,7 @@ with tab11:
             def _scan_patron(nm_sym):
                 nm, sym = nm_sym
                 try:
-                    d = get_data(sym, "3mo")
+                    d = get_data(sym, "3mo", td_key=TD_KEY)
                     if d.empty or len(d) < 30:
                         return []
                     pats = detectar_patrones(d)
@@ -3003,7 +3064,7 @@ with tab12:
         with st.spinner("Actualizando precios del portafolio..."):
             for sym in tickers_port:
                 try:
-                    d = get_data(sym, "1mo")
+                    d = get_data(sym, "1mo", td_key=TD_KEY)
                     if not d.empty:
                         precios_port[sym] = float(d['Close'].iloc[-1])
                 except Exception:
@@ -3164,7 +3225,7 @@ with tab12:
             st.markdown("#### 🎯 Señal Actual por Posición")
             for sym in tickers_port:
                 try:
-                    d = get_data(sym, "3mo")
+                    d = get_data(sym, "3mo", td_key=TD_KEY)
                     if d.empty: continue
                     inf = generar_senal(d)
                     st.markdown(f"`{sym}` → **{inf['senal']}** (pts: {inf['puntos']:+d})")
