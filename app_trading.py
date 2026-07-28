@@ -41,6 +41,27 @@ ACCIONES = {
     "JPMorgan (JPM)":     "JPM",
     "S&P 500 ETF (SPY)":  "SPY",
     "IPSA Chile (^IPSA)": "^IPSA",
+    # ── Value / estilo Warren Buffett (Berkshire holdings + clásicos) ──
+    "Berkshire Hathaway (BRK-B)": "BRK-B",
+    "Coca-Cola (KO)":     "KO",
+    "American Express (AXP)": "AXP",
+    "Bank of America (BAC)": "BAC",
+    "Chevron (CVX)":      "CVX",
+    "Occidental Petroleum (OXY)": "OXY",
+    "Kraft Heinz (KHC)":  "KHC",
+    "Moody's (MCO)":      "MCO",
+    "Visa (V)":           "V",
+    "Mastercard (MA)":    "MA",
+    "Johnson & Johnson (JNJ)": "JNJ",
+    "Procter & Gamble (PG)": "PG",
+    "Walmart (WMT)":      "WMT",
+    "Home Depot (HD)":    "HD",
+    "McDonald's (MCD)":   "MCD",
+    "Colgate-Palmolive (CL)": "CL",
+    "PepsiCo (PEP)":      "PEP",
+    "Chubb Limited (CB)": "CB",
+    "UnitedHealth (UNH)": "UNH",
+    "Verizon (VZ)":       "VZ",
 }
 
 CRYPTOS = {
@@ -972,6 +993,110 @@ def finviz_scrape(ticker: str) -> dict:
         return result
     except Exception:
         return result
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANÁLISIS FUNDAMENTAL — Filtro estilo Warren Buffett (Value Investing)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_finviz_num(val: str):
+    """Convierte un valor string de Finviz ('24.5', '35.2%', '1.2B', '-') a float o None."""
+    if not val or val == "-":
+        return None
+    v = val.strip().replace("%", "")
+    mult = 1.0
+    if v and v[-1] in ("B", "M", "K"):
+        mult = {"B": 1e9, "M": 1e6, "K": 1e3}[v[-1]]
+        v = v[:-1]
+    try:
+        return float(v) * mult
+    except (ValueError, TypeError):
+        return None
+
+
+def analizar_buffett(fundamentals: dict) -> dict:
+    """
+    Evalúa un set de fundamentales (dict crudo de finviz_scrape) según criterios
+    clásicos de Warren Buffett / value investing:
+      - Valuación razonable (P/E)
+      - Rentabilidad sobre el patrimonio (ROE) — proxy de "moat"/ventaja competitiva
+      - Bajo apalancamiento (Debt/Eq)
+      - Márgenes de utilidad saludables (Profit Margin)
+    Devuelve métricas parseadas + un score 0-100 + veredicto.
+    """
+    pe      = _parse_finviz_num(fundamentals.get("P/E", "-"))
+    roe     = _parse_finviz_num(fundamentals.get("ROE", "-"))
+    deuda   = _parse_finviz_num(fundamentals.get("Debt/Eq", "-"))
+    margen  = _parse_finviz_num(fundamentals.get("Profit Margin", "-"))
+
+    score = 0
+
+    # P/E — valuación (30 pts): Buffett evita pagar de más por una acción
+    if pe is None or pe <= 0:
+        pe_pts = 0
+    elif pe < 15:
+        pe_pts = 30
+    elif pe < 25:
+        pe_pts = 20
+    elif pe < 35:
+        pe_pts = 10
+    else:
+        pe_pts = 0
+    score += pe_pts
+
+    # ROE — calidad del negocio / posible "moat" (30 pts)
+    if roe is None:
+        roe_pts = 0
+    elif roe >= 20:
+        roe_pts = 30
+    elif roe >= 15:
+        roe_pts = 20
+    elif roe >= 10:
+        roe_pts = 10
+    else:
+        roe_pts = 0
+    score += roe_pts
+
+    # Debt/Equity — bajo apalancamiento (20 pts)
+    if deuda is None:
+        deuda_pts = 0
+    elif deuda <= 0.3:
+        deuda_pts = 20
+    elif deuda <= 0.5:
+        deuda_pts = 15
+    elif deuda <= 1.0:
+        deuda_pts = 5
+    else:
+        deuda_pts = 0
+    score += deuda_pts
+
+    # Profit Margin — eficiencia / poder de fijar precios (20 pts)
+    if margen is None:
+        margen_pts = 0
+    elif margen >= 20:
+        margen_pts = 20
+    elif margen >= 10:
+        margen_pts = 10
+    elif margen >= 0:
+        margen_pts = 5
+    else:
+        margen_pts = 0
+    score += margen_pts
+
+    if score >= 70:
+        veredicto = "🏛️ Cumple criterios Buffett"
+    elif score >= 40:
+        veredicto = "🟡 Parcialmente sólido"
+    else:
+        veredicto = "🔴 No cumple"
+
+    return {
+        "P/E":            pe,
+        "ROE %":          roe,
+        "Deuda/Patrim.":  deuda,
+        "Margen Neto %":  margen,
+        "Score Buffett":  score,
+        "Veredicto":      veredicto,
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FIBONACCI — Niveles de retroceso automáticos
@@ -2686,6 +2811,21 @@ with tab9:
         filtro_tipo = st.radio("Tipo de activo", ["Todos", "Solo Acciones", "Solo Crypto"],
                                horizontal=True)
 
+    with st.expander("🏛️ Filtro Fundamental — estilo Warren Buffett (solo acciones USA)"):
+        aplicar_buffett = st.checkbox(
+            "Aplicar filtro fundamental",
+            value=False,
+            help="Descarta cripto e índices (sin fundamentales). Usa datos de Finviz.",
+        )
+        col_bf1, col_bf2, col_bf3 = st.columns(3)
+        with col_bf1:
+            bf_pe_max = st.number_input("P/E máximo", min_value=0.0, value=25.0, step=1.0)
+        with col_bf2:
+            bf_roe_min = st.number_input("ROE mínimo (%)", min_value=0.0, value=15.0, step=1.0)
+        with col_bf3:
+            bf_deuda_max = st.number_input("Deuda/Patrimonio máximo", min_value=0.0, value=0.5, step=0.1)
+        bf_score_min = st.slider("Score Buffett mínimo (0-100)", 0, 100, 40)
+
     ejecutar_screener = st.button("▶️ Ejecutar Screener", type="primary")
 
     if ejecutar_screener:
@@ -2746,6 +2886,29 @@ with tab9:
             if filtro_adx > 0:
                 df_sc = df_sc[df_sc["ADX"] >= filtro_adx]
 
+            # Filtro fundamental estilo Buffett (solo aplica a acciones USA con datos Finviz)
+            if aplicar_buffett and not df_sc.empty:
+                with st.spinner("Analizando fundamentales (estilo Buffett)..."):
+                    buffett_rows = {}
+                    for tk in df_sc["Ticker"]:
+                        if "-USD" in tk or tk.startswith("^"):
+                            continue  # crypto/índices sin fundamentales
+                        fv_bf = finviz_scrape(tk)
+                        if fv_bf["ok"] and fv_bf["fundamentals"]:
+                            buffett_rows[tk] = analizar_buffett(fv_bf["fundamentals"])
+
+                if buffett_rows:
+                    df_bf = pd.DataFrame.from_dict(buffett_rows, orient="index")
+                    df_sc = df_sc.merge(df_bf, left_on="Ticker", right_index=True, how="inner")
+                    df_sc = df_sc[
+                        (df_sc["P/E"].notna())      & (df_sc["P/E"] <= bf_pe_max) &
+                        (df_sc["ROE %"].notna())    & (df_sc["ROE %"] >= bf_roe_min) &
+                        (df_sc["Deuda/Patrim."].notna()) & (df_sc["Deuda/Patrim."] <= bf_deuda_max) &
+                        (df_sc["Score Buffett"] >= bf_score_min)
+                    ]
+                else:
+                    df_sc = df_sc.iloc[0:0]  # sin datos fundamentales disponibles -> vaciar
+
             df_sc = df_sc.sort_values("Puntos", ascending=False)
 
             if df_sc.empty:
@@ -2767,11 +2930,17 @@ with tab9:
                         return ""
 
                 _cm = "map" if hasattr(df_sc.style, "map") else "applymap"
-                styled_sc = df_sc.style.format({
+                fmt_dict = {
                     "Precio": "{:,.4f}", "Cambio %": "{:+.2f}%",
                     "RSI": "{:.1f}", "ADX": "{:.1f}",
                     "SL": "{:,.4f}", "TP": "{:,.4f}",
-                })
+                }
+                if "Score Buffett" in df_sc.columns:
+                    fmt_dict.update({
+                        "P/E": "{:.1f}", "ROE %": "{:.1f}%",
+                        "Deuda/Patrim.": "{:.2f}", "Score Buffett": "{:.0f}",
+                    })
+                styled_sc = df_sc.style.format(fmt_dict)
                 styled_sc = getattr(styled_sc, _cm)(_css_senal, subset=["Señal"])
                 styled_sc = getattr(styled_sc, _cm)(_css_num, subset=["Cambio %", "Puntos"])
                 st.dataframe(styled_sc, use_container_width=True, height=500)
