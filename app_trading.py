@@ -957,7 +957,7 @@ def analizar_buffett(fundamentals: dict) -> dict:
     return {"P/E": pe, "ROE %": roe, "Deuda/Patrim.": deuda, "Margen Neto %": margen, "Score Buffett": score, "Veredicto": veredicto}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ANÁLISIS DE PATRONES CHARTISTAS Y DIVERGENCIAS
+# ANÁLISIS DE PATRONES CHARTISTAS Y DIVERGENCIAS (FECHAS FORMATEADAS)
 # ══════════════════════════════════════════════════════════════════════════════
 def calcular_fibonacci(df: pd.DataFrame) -> dict:
     maximo, minimo = float(df['High'].max()), float(df['Low'].min())
@@ -1035,10 +1035,21 @@ def _linreg(y: np.ndarray):
     return m, b
 
 def detectar_patrones(df: pd.DataFrame) -> list:
-    if len(df) < 30: return []
-    close, high, low, idx = df["Close"].values.astype(float), df["High"].values.astype(float), df["Low"].values.astype(float), df.index
-    n, orden = len(close), max(5, len(close) // 20)
+    if len(df) < 30: 
+        return []
+    
+    close = df["Close"].values.astype(float)
+    high  = df["High"].values.astype(float)
+    low   = df["Low"].values.astype(float)
+    idx   = df.index
+    n     = len(close)
+    orden = max(5, n // 20)
     patrones = []
+
+    def fmt_fecha(ts):
+        if hasattr(ts, 'strftime'):
+            return ts.strftime("%d/%m/%Y")
+        return str(ts).split()[0]
 
     idx_max = argrelextrema(close, np.greater, order=orden)[0]
     idx_min = argrelextrema(close, np.less, order=orden)[0]
@@ -1047,22 +1058,46 @@ def detectar_patrones(df: pd.DataFrame) -> list:
         t1, t2 = idx_max[-2], idx_max[-1]
         if abs(close[t1] - close[t2]) / close[t1] < 0.03 and t2 - t1 > orden:
             if (close[t1] - close[t1:t2].min()) / close[t1] > 0.04:
-                patrones.append({"patron": "Double Top", "confianza": "Alta", "desc": f"Dos techos en ${close[t1]:,.2f} y ${close[t2]:,.2f}.", "fecha_ini": idx[t1], "fecha_fin": idx[t2]})
+                patrones.append({
+                    "patron": "Double Top", 
+                    "confianza": "Alta", 
+                    "desc": f"Dos techos en ${close[t1]:,.2f} y ${close[t2]:,.2f}.", 
+                    "fecha_ini": fmt_fecha(idx[t1]), 
+                    "fecha_fin": fmt_fecha(idx[t2])
+                })
 
     if len(idx_min) >= 2:
         b1, b2 = idx_min[-2], idx_min[-1]
         if abs(close[b1] - close[b2]) / close[b1] < 0.03 and b2 - b1 > orden:
             if (close[b1:b2].max() - close[b1]) / close[b1] > 0.04:
-                patrones.append({"patron": "Double Bottom", "confianza": "Alta", "desc": f"Dos suelos en ${close[b1]:,.2f} y ${close[b2]:,.2f}.", "fecha_ini": idx[b1], "fecha_fin": idx[b2]})
+                patrones.append({
+                    "patron": "Double Bottom", 
+                    "confianza": "Alta", 
+                    "desc": f"Dos suelos en ${close[b1]:,.2f} y ${close[b2]:,.2f}.", 
+                    "fecha_ini": fmt_fecha(idx[b1]), 
+                    "fecha_fin": fmt_fecha(idx[b2])
+                })
 
     ventana = min(60, n)
     mh, _ = _linreg(high[-ventana:])
     ml, _ = _linreg(low[-ventana:])
     if (high[-ventana:].mean() - low[-ventana:].mean()) / close[-ventana:].mean() < 0.15:
         if mh > 0.001 and ml > 0.001:
-            patrones.append({"patron": "Channel Up", "confianza": "Media", "desc": "Canal alcista estructurado.", "fecha_ini": idx[-ventana], "fecha_fin": idx[-1]})
+            patrones.append({
+                "patron": "Channel Up", 
+                "confianza": "Media", 
+                "desc": "Canal alcista estructurado.", 
+                "fecha_ini": fmt_fecha(idx[-ventana]), 
+                "fecha_fin": fmt_fecha(idx[-1])
+            })
         elif mh < -0.001 and ml < -0.001:
-            patrones.append({"patron": "Channel Down", "confianza": "Media", "desc": "Canal bajista estructurado.", "fecha_ini": idx[-ventana], "fecha_fin": idx[-1]})
+            patrones.append({
+                "patron": "Channel Down", 
+                "confianza": "Media", 
+                "desc": "Canal bajista estructurado.", 
+                "fecha_ini": fmt_fecha(idx[-ventana]), 
+                "fecha_fin": fmt_fecha(idx[-1])
+            })
 
     return patrones
 
@@ -1378,14 +1413,52 @@ with tab10:
     if data_fv["ok"]:
         st.json(data_fv["fundamentals"])
 
-# ── TAB 11: PATRONES CHARTISTAS ───────────────────────────────────────────────
+# ── TAB 11: PATRONES CHARTISTAS (VISUALIZACIÓN CORREGIDA) ─────────────────────
 with tab11:
-    st.subheader("🕯️ Reconocimiento de Patrones Tecnológicos")
-    pats = detectar_patrones(df)
-    if pats:
-        st.write(pats)
-    else:
-        st.info("Sin patrones complejos detectados en la ventana actual.")
+    st.subheader(f"🕯️ Reconocimiento de Patrones — {ticker}")
+    st.caption("Detección algorítmica sobre la estructura de precios.")
+
+    col_p1, col_p2 = st.columns([3, 2])
+
+    with col_p1:
+        pats = detectar_patrones(df)
+        if not pats:
+            st.info("Sin patrones complejos detectados en la ventana actual.")
+        else:
+            for p in pats:
+                nombre = p["patron"]
+                info_p = PATTERN_INFO.get(nombre, {})
+                bias   = info_p.get("bias", "neutro")
+                color_p = PATTERN_BIAS_COLOR.get(bias, "#aaaaaa")
+                emoji_p = info_p.get("emoji", "📌")
+                conf_col = {"Alta": "#00ff88", "Media": "#ffd700", "Baja": "#ff8c00"}.get(p["confianza"], "#aaa")
+
+                st.markdown(f"""
+                <div style="background:#1a1a2e; border-left:4px solid {color_p}; border-radius:0 8px 8px 0; padding:12px 16px; margin-bottom:12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-size:1.1rem; font-weight:bold; color:{color_p};">
+                            {emoji_p} {nombre}
+                        </span>
+                        <span style="font-size:0.8rem; background:#0d1117; padding:2px 8px; border-radius:10px; color:{conf_col}; border:1px solid {conf_col}44;">
+                            Confianza: {p['confianza']}
+                        </span>
+                    </div>
+                    <div style="color:#e0e0e0; font-size:0.9rem; margin-top:6px;">
+                        {p['desc']}
+                    </div>
+                    <div style="color:#888; font-size:0.8rem; margin-top:4px;">
+                        📅 Período: {p['fecha_ini']} ➔ {p['fecha_fin']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                if info_p.get("accion"):
+                    st.caption(f"💡 **Estrategia sugerida:** {info_p['accion']}")
+
+    with col_p2:
+        st.markdown("#### 📚 Leyenda de Sesgos")
+        for bias_type, color in PATTERN_BIAS_COLOR.items():
+            st.markdown(f"<span style='color:{color}; font-weight:bold;'>■ {bias_type.upper()}</span>", unsafe_allow_html=True)
 
 # ── TAB 12: PORTAFOLIO CONSOLIDADO Y RIESGO (VaR) ────────────────────────────
 with tab12:
