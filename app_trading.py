@@ -126,36 +126,13 @@ def guardar_portfolio() -> bool:
             "paper_trades":   st.session_state.get("paper_trades", []),
             "notas":          st.session_state.get("notas", {}),
             "signal_history": st.session_state.get("signal_history", {}),
-            "guardado_en":     datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "guardado_en":    datetime.now().strftime("%d/%m/%Y %H:%M"),
         }
         with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2, default=str)
         return True
     except OSError:
         return False
-
-def portfolio_a_json() -> str:
-    data = {
-        "paper_trades":   st.session_state.get("paper_trades", []),
-        "notas":          st.session_state.get("notas", {}),
-        "signal_history": st.session_state.get("signal_history", {}),
-        "exportado_en":   datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "version":        "QuantumShield Pro 2.0 Pro",
-    }
-    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
-
-def importar_portfolio_json(contenido: str) -> tuple:
-    try:
-        data = json.loads(contenido)
-        if "paper_trades" not in data:
-            return False, "Archivo inválido: formato no reconocido."
-        st.session_state.paper_trades   = data.get("paper_trades", [])
-        st.session_state.notas          = data.get("notas", {})
-        st.session_state.signal_history = data.get("signal_history", {})
-        guardar_portfolio()
-        return True, f"Importado: {len(st.session_state.paper_trades)} posiciones, {len(st.session_state.notas)} notas."
-    except json.JSONDecodeError as e:
-        return False, f"Error de formato JSON: {e}"
 
 _datos_guardados = _cargar_portfolio()
 for key, val in [
@@ -245,6 +222,20 @@ def calcular_stoch_rsi(serie: pd.Series, periodo_rsi=14, periodo_stoch=14, suavi
     d       = k.rolling(suavizado_d).mean()
     return k, d
 
+def calcular_sma(serie: pd.Series, periodo: int) -> pd.Series:
+    return serie.rolling(window=periodo).mean()
+
+def calcular_vwap(df: pd.DataFrame) -> pd.Series:
+    if 'Volume' not in df.columns or df['Volume'].sum() == 0:
+        return pd.Series(np.nan, index=df.index)
+    precio_tipico = (df['High'] + df['Low'] + df['Close']) / 3
+    vwap = (precio_tipico * df['Volume']).cumsum() / df['Volume'].cumsum()
+    return vwap
+
+def calcular_adr(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
+    rango_diario_pct = ((df['High'] / df['Low']) - 1) * 100
+    return rango_diario_pct.rolling(window=periodo).mean()
+
 def calcular_sortino_ratio(retornos: pd.Series, rf_rate: float = 0.0) -> float:
     retornos_limpios = retornos.dropna()
     if len(retornos_limpios) == 0:
@@ -281,102 +272,6 @@ def calcular_criterio_kelly(win_rate_pct: float, avg_win: float, avg_loss: float
     b = abs(avg_win / avg_loss)
     kelly = (b * p - q) / b
     return round(float(max(0.0, kelly * 100.0)), 2)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODELO MACHINE LEARNING DE PROBABILIDAD DE ACIERTO
-# ══════════════════════════════════════════════════════════════════════════════
-def predecir_probabilidad_ml(df: pd.DataFrame) -> tuple:
-    if not ML_OK or len(df) < 60:
-        return None, "ML no disponible o datos insuficientes."
-
-    df_ml = df.copy()
-    df_ml['Retorno_Futuro'] = (df_ml['Close'].shift(-3) - df_ml['Close']) / df_ml['Close']
-    df_ml['Target'] = (df_ml['Retorno_Futuro'] > 0.01).astype(int)
-
-    features = ['RSI', 'ADX', 'MACD_HIST', 'ATR']
-    df_ml['EMA_DIFF'] = (df_ml['Close'] - df_ml['EMA50']) / df_ml['EMA50']
-    features.append('EMA_DIFF')
-
-    df_ml.dropna(subset=features + ['Target'], inplace=True)
-    if len(df_ml) < 40:
-        return None, "Insuficientes muestras limpias."
-
-    X = df_ml[features].values[:-1]
-    y = df_ml['Target'].values[:-1]
-    X_actual = df_ml[features].values[-1:]
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_act_scaled = scaler.transform(X_actual)
-
-    clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
-    clf.fit(X_scaled, y)
-
-    prob = clf.predict_proba(X_act_scaled)[0][1] * 100.0
-    return round(float(prob), 1), "Modelo IA RandomForest calibrado ✓"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DETECCIÓN DE PATRONES DE VELAS Y ESTRUCTURA DE PRECIO
-# ══════════════════════════════════════════════════════════════════════════════
-def detectar_velas_japonesas(df: pd.DataFrame) -> list:
-    if len(df) < 5:
-        return []
-    patrones = []
-    o = df['Open'].values.astype(float)
-    h = df['High'].values.astype(float)
-    l = df['Low'].values.astype(float)
-    c = df['Close'].values.astype(float)
-    idx = df.index
-
-    for i in range(max(1, len(df)-5), len(df)):
-        cuerpo     = abs(c[i] - o[i])
-        rango_v    = h[i] - l[i]
-        if rango_v == 0: 
-            continue
-        sombra_sup = h[i] - max(c[i], o[i])
-        sombra_inf = min(c[i], o[i]) - l[i]
-        alcista    = c[i] > o[i]
-        rel_cuerpo = cuerpo / rango_v
-
-        if rel_cuerpo < 0.1:
-            patrones.append({"nombre": "Doji", "fecha": idx[i], "tipo": "neutro",
-                "desc": "Apertura y cierre casi iguales. Indecisión del mercado.",
-                "accion": "Esperar confirmación en la siguiente vela."})
-            continue
-
-        if sombra_inf > cuerpo * 2 and sombra_sup < cuerpo * 0.5 and i > 0 and c[i-1] < o[i-1]:
-            patrones.append({"nombre": "Hammer 🔨", "fecha": idx[i], "tipo": "alcista",
-                "desc": "Sombra inferior larga tras tendencia bajista. Compradores rechazaron mínimos.",
-                "accion": "Señal de reversión alcista. Buscar entrada LONG."})
-
-        elif sombra_sup > cuerpo * 2 and sombra_inf < cuerpo * 0.5 and i > 0 and c[i-1] > o[i-1]:
-            patrones.append({"nombre": "Shooting Star ⭐", "fecha": idx[i], "tipo": "bajista",
-                "desc": "Sombra superior larga tras tendencia alcista. Vendedores rechazaron máximos.",
-                "accion": "Señal de reversión bajista. Vigilar entrada SHORT."})
-
-        elif alcista and rel_cuerpo > 0.9:
-            patrones.append({"nombre": "Marubozu Alcista", "fecha": idx[i], "tipo": "alcista",
-                "desc": "Vela sin sombras. Dominio total comprador.",
-                "accion": "Continuación probable. Mantener LONG."})
-
-        elif not alcista and rel_cuerpo > 0.9:
-            patrones.append({"nombre": "Marubozu Bajista", "fecha": idx[i], "tipo": "bajista",
-                "desc": "Vela sin sombras. Dominio total vendedor.",
-                "accion": "Continuación probable. Evitar compras."})
-
-        if i > 0 and alcista and not (c[i-1] > o[i-1]):
-            if c[i] > o[i-1] and o[i] < c[i-1]:
-                patrones.append({"nombre": "Engulfing Alcista", "fecha": idx[i], "tipo": "alcista",
-                    "desc": "Vela alcista envuelve la bajista anterior.",
-                    "accion": "Alta probabilidad de reversión LONG."})
-
-        elif i > 0 and not alcista and (c[i-1] > o[i-1]):
-            if o[i] > c[i-1] and c[i] < o[i-1]:
-                patrones.append({"nombre": "Engulfing Bajista", "fecha": idx[i], "tipo": "bajista",
-                    "desc": "Vela bajista envuelve la alcista anterior.",
-                    "accion": "Alta probabilidad de reversión SHORT."})
-
-    return patrones[-6:]
 
 def calcular_volume_profile(df: pd.DataFrame, bins: int = 20) -> pd.DataFrame:
     if 'Volume' not in df.columns or df['Volume'].sum() == 0:
@@ -416,10 +311,32 @@ def volumen_anomalo(df: pd.DataFrame, factor: float = 2.0) -> pd.Series:
     vol_media = df['Volume'].rolling(20).mean()
     return df['Volume'] > (factor * vol_media)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SISTEMA DE PUNTUACIÓN Y SEÑALES
+# ══════════════════════════════════════════════════════════════════════════════
 def calcular_puntos(fila) -> tuple:
     puntos  = 0
     razones = []
 
+    # VWAP Check
+    if 'VWAP' in fila.index and not pd.isna(fila['VWAP']):
+        if float(fila['Close']) > float(fila['VWAP']):
+            puntos += 1
+            razones.append("✅ Precio sobre VWAP")
+        else:
+            puntos -= 1
+            razones.append("❌ Precio bajo VWAP")
+
+    # SMA200 Check (Tendencia Macro)
+    if 'SMA200' in fila.index and not pd.isna(fila['SMA200']):
+        if float(fila['Close']) > float(fila['SMA200']):
+            puntos += 1
+            razones.append("✅ Tendencia macro alcista (>SMA200)")
+        else:
+            puntos -= 1
+            razones.append("❌ Tendencia macro bajista (<SMA200)")
+
+    # EMA Check
     if float(fila['Close']) > float(fila['EMA50']):
         puntos += 1
         razones.append("✅ Precio sobre EMA50 (alcista)")
@@ -427,6 +344,7 @@ def calcular_puntos(fila) -> tuple:
         puntos -= 1
         razones.append("❌ Precio bajo EMA50 (bajista)")
 
+    # RSI Check
     rsi_val = float(fila['RSI'])
     if rsi_val < 30:
         puntos += 2
@@ -438,13 +356,15 @@ def calcular_puntos(fila) -> tuple:
         puntos += 1
         razones.append(f"✅ RSI neutral ({rsi_val:.1f})")
 
+    # MACD Check
     if float(fila['MACD']) > float(fila['MACD_SIGNAL']):
         puntos += 1
-        razones.append("✅ MACD sobre señal (alcista)")
+        razones.append("✅ MACD sobre señal")
     else:
         puntos -= 1
-        razones.append("❌ MACD bajo señal (bajista)")
+        razones.append("❌ MACD bajo señal")
 
+    # Bollinger Check
     if float(fila['Close']) < float(fila['BB_LOWER']):
         puntos += 1
         razones.append("✅ Precio bajo BB inferior")
@@ -452,13 +372,14 @@ def calcular_puntos(fila) -> tuple:
         puntos -= 1
         razones.append("❌ Precio sobre BB superior")
 
+    # ADX Check
     adx_val = float(fila['ADX']) if 'ADX' in fila.index and not pd.isna(fila['ADX']) else 0
     if adx_val >= 25:
         razones.append(f"✅ ADX {adx_val:.1f} — tendencia fuerte")
     elif adx_val >= 15:
         razones.append(f"⚠️ ADX {adx_val:.1f} — tendencia moderada")
     else:
-        puntos = max(-1, min(1, puntos))
+        puntos = max(-1, min(1, puntos)) # Reduce impacto si no hay tendencia
         razones.append(f"⚠️ ADX {adx_val:.1f} — sin tendencia clara")
 
     return puntos, razones, rsi_val, adx_val
@@ -467,10 +388,10 @@ def generar_senal(df: pd.DataFrame) -> dict:
     ultima = df.iloc[-1]
     puntos, razones, rsi_val, adx_val = calcular_puntos(ultima)
 
-    if   puntos >= 3:  senal, color = "🟢 COMPRA FUERTE", "#00ff88"
-    elif puntos >= 1:  senal, color = "🟡 COMPRA DÉBIL",  "#ffd700"
-    elif puntos <= -3: senal, color = "🔴 VENTA FUERTE",  "#ff4444"
-    elif puntos <= -1: senal, color = "🟠 VENTA DÉBIL",   "#ff8c00"
+    if   puntos >= 4:  senal, color = "🟢 COMPRA FUERTE", "#00ff88"
+    elif puntos >= 2:  senal, color = "🟡 COMPRA DÉBIL",  "#ffd700"
+    elif puntos <= -4: senal, color = "🔴 VENTA FUERTE",  "#ff4444"
+    elif puntos <= -2: senal, color = "🟠 VENTA DÉBIL",   "#ff8c00"
     else:              senal, color = "⚪ NEUTRAL",        "#aaaaaa"
 
     atr_val = float(ultima['ATR']) if not pd.isna(ultima['ATR']) else 0
@@ -483,6 +404,39 @@ def generar_senal(df: pd.DataFrame) -> dict:
         "tp": precio + 3 * atr_val,
         "atr": atr_val, "rsi": rsi_val, "adx": adx_val,
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO MACHINE LEARNING DE PROBABILIDAD DE ACIERTO
+# ══════════════════════════════════════════════════════════════════════════════
+def predecir_probabilidad_ml(df: pd.DataFrame) -> tuple:
+    if not ML_OK or len(df) < 60:
+        return None, "ML no disponible o datos insuficientes."
+
+    df_ml = df.copy()
+    df_ml['Retorno_Futuro'] = (df_ml['Close'].shift(-3) - df_ml['Close']) / df_ml['Close']
+    df_ml['Target'] = (df_ml['Retorno_Futuro'] > 0.01).astype(int)
+
+    features = ['RSI', 'ADX', 'MACD_HIST', 'ATR']
+    df_ml['EMA_DIFF'] = (df_ml['Close'] - df_ml['EMA50']) / df_ml['EMA50']
+    features.append('EMA_DIFF')
+
+    df_ml.dropna(subset=features + ['Target'], inplace=True)
+    if len(df_ml) < 40:
+        return None, "Insuficientes muestras limpias."
+
+    X = df_ml[features].values[:-1]
+    y = df_ml['Target'].values[:-1]
+    X_actual = df_ml[features].values[-1:]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_act_scaled = scaler.transform(X_actual)
+
+    clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
+    clf.fit(X_scaled, y)
+
+    prob = clf.predict_proba(X_act_scaled)[0][1] * 100.0
+    return round(float(prob), 1), "Modelo IA RandomForest calibrado ✓"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA ENGINE - INGESTIÓN MULTIFUENTE & ORDER BOOK
@@ -537,15 +491,12 @@ def obtener_order_book_binance(ticker: str) -> pd.DataFrame:
     except requests.RequestException:
         return pd.DataFrame(), pd.DataFrame()
 
-def _ticker_td(ticker: str) -> str:
-    t = ticker.replace("-USD", "/USD").replace("-", "/")
-    return t[1:] if t.startswith("^") else t
-
 def _td_download(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
     key = (td_key or "").strip()
     if not key:
         return pd.DataFrame()
-    sym      = _ticker_td(ticker)
+    t = ticker.replace("-USD", "/USD").replace("-", "/")
+    sym = t[1:] if t.startswith("^") else t
     outsize  = PERIOD_OUTPUT.get(period, 190)
     params   = {"symbol": sym, "interval": "1day", "outputsize": outsize, "apikey": key, "format": "JSON", "order": "ASC"}
     try:
@@ -568,7 +519,7 @@ def _td_download(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
         return pd.DataFrame()
 
 def _yf_fallback(ticker: str, period: str) -> pd.DataFrame:
-    dias  = PERIOD_DAYS.get(period, 183)
+    dias = PERIOD_DAYS.get(period, 183)
     today = datetime.today()
     start = (today - pd.Timedelta(days=dias)).strftime("%Y-%m-%d")
     end   = (today + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
@@ -578,11 +529,10 @@ def _yf_fallback(ticker: str, period: str) -> pd.DataFrame:
             df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True, timeout=15)
             if not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
-                    nivel0 = df.columns.get_level_values(0).tolist()
-                    nivel1 = df.columns.get_level_values(1).tolist()
-                    campos = {"Open","High","Low","Close","Volume"}
-                    df.columns = nivel0 if set(nivel0) & campos else nivel1
-                return df
+                    df.columns = [col[0] for col in df.columns]
+                cols_validas = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+                return df[cols_validas]
+            
             df2 = yf.Ticker(ticker).history(start=start, end=end)
             if not df2.empty:
                 return df2
@@ -619,6 +569,9 @@ def get_data(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
     close = df["Close"]
     df["EMA20"]                                    = close.ewm(span=20, adjust=False).mean()
     df["EMA50"]                                    = close.ewm(span=50, adjust=False).mean()
+    df["SMA200"]                                   = calcular_sma(close, 200)
+    df["VWAP"]                                     = calcular_vwap(df)
+    df["ADR_PCT"]                                  = calcular_adr(df, 14)
     df["RSI"]                                      = calcular_rsi(close)
     df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = calcular_macd(close)
     df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"]   = calcular_bollinger(close)
@@ -662,11 +615,9 @@ def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
             raw = yf.download(ticker, period=yf_period, interval=yf_interval, progress=False, auto_adjust=True)
             if not raw.empty:
                 if isinstance(raw.columns, pd.MultiIndex):
-                    nivel0 = raw.columns.get_level_values(0).tolist()
-                    nivel1 = raw.columns.get_level_values(1).tolist()
-                    campos = {"Open","High","Low","Close","Volume"}
-                    raw.columns = nivel0 if set(nivel0) & campos else nivel1
-                df = raw[[c for c in ["Open","High","Low","Close","Volume"] if c in raw.columns]].dropna(subset=["Close"])
+                    raw.columns = [col[0] for col in raw.columns]
+                cols_validas = [c for c in ["Open","High","Low","Close","Volume"] if c in raw.columns]
+                df = raw[cols_validas].dropna(subset=["Close"])
         except Exception:
             pass
 
@@ -676,6 +627,9 @@ def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
     close = df["Close"]
     df["EMA20"]                                    = close.ewm(span=20, adjust=False).mean()
     df["EMA50"]                                    = close.ewm(span=50, adjust=False).mean()
+    df["SMA200"]                                   = calcular_sma(close, 200)
+    df["VWAP"]                                     = calcular_vwap(df)
+    df["ADR_PCT"]                                  = calcular_adr(df, 14)
     df["RSI"]                                      = calcular_rsi(close)
     df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = calcular_macd(close)
     df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"]   = calcular_bollinger(close)
@@ -717,39 +671,6 @@ def _groq(system: str, user: str, max_tokens: int = 1000) -> str:
     except requests.RequestException as e:
         return f"❌ Error de conexión: {e}"
 
-def _groq_stream(system: str, messages: list, max_tokens: int = 1000):
-    if not _ia_activa():
-        yield "❌ API key no configurada."
-        return
-    mensajes_limpios = [
-        {"role": m["role"], "content": str(m["content"])}
-        for m in messages if m.get("role") in ("user", "assistant") and m.get("content")
-    ]
-    payload = {
-        "model": GROQ_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "system", "content": system}] + mensajes_limpios,
-        "stream": True,
-    }
-    try:
-        with requests.post(GROQ_API_URL, headers=_groq_headers(), json=payload, timeout=60, stream=True) as resp:
-            if not resp.ok:
-                yield f"\n❌ Error {resp.status_code}"
-                return
-            for line in resp.iter_lines():
-                if not line: continue
-                line = line.decode("utf-8")
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]": break
-                    try:
-                        chunk = json.loads(data_str)
-                        yield chunk["choices"][0].get("delta", {}).get("content", "")
-                    except json.JSONDecodeError:
-                        continue
-    except requests.RequestException as e:
-        yield f"\n❌ Error de conexión: {e}"
-
 def _resumen_tecnico(ticker: str, df: pd.DataFrame, info: dict) -> str:
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else last
@@ -757,20 +678,20 @@ def _resumen_tecnico(ticker: str, df: pd.DataFrame, info: dict) -> str:
     return f"""
 Ticker: {ticker}
 Precio: ${float(last["Close"]):,.4f} ({chg:+.2f}% hoy)
+SMA200: {float(last.get("SMA200", 0)):,.4f} | VWAP: {float(last.get("VWAP", 0)):,.4f}
 EMA20: {float(last["EMA20"]):,.4f} | EMA50: {float(last["EMA50"]):,.4f}
+ADR(14): {float(last.get("ADR_PCT", 0)):.2f}% | ATR(14): {float(last["ATR"]):,.4f}
 RSI(14): {float(last["RSI"]):.1f} | ADX(14): {float(last["ADX"]):.1f}
 MACD: {float(last["MACD"]):.4f} | Señal: {float(last["MACD_SIGNAL"]):.4f}
-BB Sup: {float(last["BB_UPPER"]):,.4f} | BB Inf: {float(last["BB_LOWER"]):,.4f}
-ATR(14): {float(last["ATR"]):,.4f}
 SL sugerido: ${info["sl"]:,.4f} | TP sugerido: ${info["tp"]:,.4f}
-Señal: {info["senal"]} (puntuación: {info["puntos"]:+d})
+Señal de Sistema: {info["senal"]} (puntuación: {info["puntos"]:+d})
 Razones: {"; ".join(info["razones"])}
 """.strip()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MOTOR DE BACKTESTING
 # ══════════════════════════════════════════════════════════════════════════════
-def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 1, umbral_venta: int = -1,
+def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 2, umbral_venta: int = -2,
                         comision_pct: float = 0.1, usar_sl_tp: bool = True,
                         mult_sl: float = 2.0, mult_tp: float = 3.0) -> dict:
     resultados = []
@@ -1003,7 +924,6 @@ def registrar_senal(ticker: str, info: dict, precio: float):
         })
         st.session_state.signal_history[ticker] = hist[-50:]
         
-        # Disparar alerta automática de Telegram si la señal es fuerte
         if "FUERTE" in nueva_senal and st.session_state.get("auto_telegram_alerts", False):
             msg = f"🚨 *NUEVA SEÑAL CUANTITATIVA*\n\nActivo: `{ticker}`\nSeñal: *{nueva_senal}*\nPrecio: `${precio:,.4f}`\nRSI: `{info['rsi']:.1f}` | ADX: `{info['adx']:.1f}`"
             enviar_alerta_telegram(msg)
@@ -1136,14 +1056,16 @@ with st.sidebar:
     period = st.selectbox("Período", ["1mo","3mo","6mo","1y","2y"], index=2)
 
     st.markdown("---")
-    mostrar_bb      = st.checkbox("Bandas de Bollinger",  value=True)
-    mostrar_ema     = st.checkbox("EMA 20 / EMA 50",      value=True)
+    st.subheader("⚙️ Configuración de Gráfico")
+    mostrar_sma     = st.checkbox("SMA 200",               value=False)
+    mostrar_vwap    = st.checkbox("VWAP",                  value=True)
+    mostrar_ema     = st.checkbox("EMA 20 / EMA 50",       value=True)
+    mostrar_bb      = st.checkbox("Bandas de Bollinger",   value=True)
     mostrar_volumen = st.checkbox("Volumen",               value=True)
     mostrar_sr      = st.checkbox("Soporte/Resistencia",   value=True)
     mostrar_vanom   = st.checkbox("Volumen anómalo",       value=True)
     mostrar_fib     = st.checkbox("Fibonacci",             value=False)
     mostrar_divs    = st.checkbox("Divergencias RSI",      value=True)
-    mostrar_velas   = st.checkbox("Velas japonesas",       value=True)
     mostrar_stoch   = st.checkbox("Stochastic RSI",        value=True)
     mostrar_vp      = st.checkbox("Volume Profile",        value=False)
 
@@ -1224,7 +1146,7 @@ with tab1:
     k1.metric("Precio", f"${price:,.4f}", f"{chg:+.2f}%")
     k2.metric("RSI (14)", f"{info['rsi']:.1f}")
     k3.metric("ADX (14)", f"{info['adx']:.1f}")
-    k4.metric("ATR (14)", f"${info['atr']:,.4f}")
+    k4.metric("ADR (14)", f"{last.get('ADR_PCT', 0):.2f}%")
     k5.metric("Stop Loss", f"${info['sl']:,.4f}")
     k6.metric("Take Profit", f"${info['tp']:,.4f}")
     k7.metric("Prob. ML Acierto", f"{prob_ml}%" if prob_ml else "N/A", delta="RandomForest")
@@ -1237,23 +1159,74 @@ with tab1:
     rows_n = 3 + (1 if 'Volume' in df.columns and mostrar_volumen else 0) + (1 if mostrar_stoch else 0)
     fig = make_subplots(rows=rows_n, cols=1, shared_xaxes=True, vertical_spacing=0.02)
     
+    # 1. Gráfico de Precio Principal
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Precio"), row=1, col=1)
+    
+    if mostrar_sma and 'SMA200' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], line=dict(color="#ffffff", width=2, dash="dash"), name="SMA200"), row=1, col=1)
+
+    if mostrar_vwap and 'VWAP' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], line=dict(color="#00cfff", width=2), name="VWAP"), row=1, col=1)
+
     if mostrar_ema:
         fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], line=dict(color="#ffd700", width=1), name="EMA20"), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df['EMA50'], line=dict(color="#ff8c00", width=1), name="EMA50"), row=1, col=1)
 
+    if mostrar_bb:
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_UPPER'], line=dict(color="rgba(255,255,255,0.2)", width=1, dash="dot"), name="BB Sup"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOWER'], line=dict(color="rgba(255,255,255,0.2)", width=1, dash="dot"), fill='tonexty', fillcolor="rgba(255,255,255,0.05)", name="BB Inf"), row=1, col=1)
+
+    if mostrar_sr:
+        resistencias, soportes = detectar_soportes_resistencias(df)
+        for _, v in resistencias:
+            fig.add_hline(y=v, line_dash="dash", line_color="rgba(255, 68, 68, 0.4)", row=1, col=1)
+        for _, v in soportes:
+            fig.add_hline(y=v, line_dash="dash", line_color="rgba(0, 255, 136, 0.4)", row=1, col=1)
+
+    if mostrar_fib:
+        niveles = calcular_fibonacci(df)
+        for nivel, valor in niveles.items():
+            color = FIBONACCI_COLORES.get(nivel, "rgba(255,255,255,0.3)")
+            fig.add_hline(y=valor, line_dash="dot", line_color=color, annotation_text=f"Fib {nivel}", annotation_position="top right", row=1, col=1)
+
+    # 2. Subgráficos Dinámicos
     curr_row = 2
     if 'Volume' in df.columns and mostrar_volumen:
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="Volumen"), row=curr_row, col=1)
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="Volumen", marker_color='rgba(0, 207, 255, 0.6)'), row=curr_row, col=1)
         curr_row += 1
 
+    # RSI y Divergencias
     fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color="#c77dff"), name="RSI"), row=curr_row, col=1)
+    if mostrar_divs:
+        divs = detectar_divergencias(df)
+        for d in divs:
+            color_div = "#00ff88" if d["tipo"] == "alcista" else "#ff4444"
+            fig.add_trace(go.Scatter(x=[d["fecha1"], d["fecha2"]], y=[d["rsi1"], d["rsi2"]], mode="lines+markers", line=dict(color=color_div, width=2, dash="dot"), showlegend=False), row=curr_row, col=1)
     curr_row += 1
 
+    # MACD
     fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name="MACD Hist"), row=curr_row, col=1)
-    
-    fig.update_layout(template="plotly_dark", height=750, margin=dict(l=10, r=10, t=20, b=10))
+
+    # Stochastic RSI
+    if mostrar_stoch:
+        curr_row += 1
+        fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_K'], line=dict(color="#00ff88", width=1), name="Stoch %K"), row=curr_row, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_D'], line=dict(color="#ff4444", width=1), name="Stoch %D"), row=curr_row, col=1)
+        fig.add_hline(y=80, line_dash="dot", line_color="rgba(255,255,255,0.2)", row=curr_row, col=1)
+        fig.add_hline(y=20, line_dash="dot", line_color="rgba(255,255,255,0.2)", row=curr_row, col=1)
+
+    fig.update_layout(template="plotly_dark", height=850, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
+
+    # 3. Volume Profile Separado (Horizontal)
+    if mostrar_vp and 'Volume' in df.columns:
+        st.markdown("### 📊 Volume Profile (POC)")
+        vp_df = calcular_volume_profile(df)
+        if not vp_df.empty:
+            fig_vp = px.bar(vp_df, x='volumen', y='precio', orientation='h', template="plotly_dark")
+            fig_vp.update_traces(marker_color=np.where(vp_df['poc'], '#ff4444', '#00cfff'), opacity=0.7)
+            fig_vp.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig_vp, use_container_width=True)
 
     if ticker in BINANCE_SYMBOLS:
         st.markdown("### 📊 Profundidad de Mercado (Order Book - Binance)")
@@ -1262,7 +1235,7 @@ with tab1:
             fig_ob = go.Figure()
             fig_ob.add_trace(go.Scatter(x=bids['Precio'], y=bids['Acumulado'], fill='tozeroy', name='Bids (Compra)', line=dict(color='#00ff88')))
             fig_ob.add_trace(go.Scatter(x=asks['Precio'], y=asks['Acumulado'], fill='tozeroy', name='Asks (Venta)', line=dict(color='#ff4444')))
-            fig_ob.update_layout(template="plotly_dark", height=280, title="Profundidad de Órdenes en Tiempo Real", xaxis_title="Precio USD", yaxis_title="Volumen Acumulado")
+            fig_ob.update_layout(template="plotly_dark", height=280, xaxis_title="Precio USD", yaxis_title="Volumen Acumulado", margin=dict(l=10, r=10, t=10, b=10))
             st.plotly_chart(fig_ob, use_container_width=True)
 
 # ── TAB 2: SEÑALES ────────────────────────────────────────────────────────────
@@ -1356,19 +1329,27 @@ with tab5:
 # ── TAB 6: ASISTENTE IA ───────────────────────────────────────────────────────
 with tab6:
     st.subheader("🤖 Consultoría Algorítmica & Tesis")
+    st.caption("Solicita un resumen técnico automatizado utilizando el motor LLM de Groq.")
+    
     if _ia_activa():
-        if st.button("Generar Informe"):
-            res = _groq("Eres un analista cuant.", f"Analiza {ticker} con estos datos:\n{_resumen_tecnico(ticker, df, info)}")
-            st.markdown(res)
+        if st.button("Generar Informe Técnico", use_container_width=True):
+            with st.spinner("🧠 Procesando datos del mercado y generando tesis..."):
+                prompt_contexto = f"Analiza la siguiente estructura de precios para {ticker}:\n{_resumen_tecnico(ticker, df, info)}\nBasado en estos datos cuantitativos, proporciona una breve tesis de trading con escenarios alcistas y bajistas."
+                res = _groq(
+                    system="Eres un analista cuantitativo Senior. Responde de manera profesional, estructurada y directa. No des consejos financieros, solo análisis estadístico y de estructura de mercado.",
+                    user=prompt_contexto
+                )
+                st.info("Reporte Generado:")
+                st.markdown(res)
     else:
-        st.info("Agrega tu Groq Key en el menú lateral.")
+        st.warning("⚠️ API Key de Groq no configurada. Por favor, añádela en el panel lateral (sidebar) para activar el asistente.")
 
 # ── TAB 7: BACKTESTING & MÉTRICAS CUANT ──────────────────────────────────────
 with tab7:
     st.subheader("🧪 Simulación de Estrategia Cuantitativa")
     col1, col2 = st.columns(2)
-    u_c = col1.slider("Umbral Compra", 1, 4, 2)
-    u_v = col2.slider("Umbral Venta", -4, -1, -1)
+    u_c = col1.slider("Umbral Compra", 1, 6, 3)
+    u_v = col2.slider("Umbral Venta", -6, -1, -3)
     if st.button("Ejecutar Backtest"):
         bt = backtest_estrategia(df, umbral_compra=u_c, umbral_venta=u_v)
         
@@ -1413,7 +1394,7 @@ with tab10:
     if data_fv["ok"]:
         st.json(data_fv["fundamentals"])
 
-# ── TAB 11: PATRONES CHARTISTAS (VISUALIZACIÓN CORREGIDA) ─────────────────────
+# ── TAB 11: PATRONES CHARTISTAS ───────────────────────────────────────────────
 with tab11:
     st.subheader(f"🕯️ Reconocimiento de Patrones — {ticker}")
     st.caption("Detección algorítmica sobre la estructura de precios.")
