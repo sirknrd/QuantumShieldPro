@@ -379,7 +379,7 @@ def calcular_puntos(fila) -> tuple:
     elif adx_val >= 15:
         razones.append(f"⚠️ ADX {adx_val:.1f} — tendencia moderada")
     else:
-        puntos = max(-1, min(1, puntos)) # Reduce impacto si no hay tendencia
+        puntos = max(-1, min(1, puntos)) 
         razones.append(f"⚠️ ADX {adx_val:.1f} — sin tendencia clara")
 
     return puntos, razones, rsi_val, adx_val
@@ -563,6 +563,10 @@ def get_data(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     
+    # 🟢 CORRECCIÓN DE ZONA HORARIA (Evita TypeError en uniones)
+    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    
     df = df[[c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]].copy()
     df.dropna(subset=["Close"], inplace=True)
 
@@ -623,6 +627,10 @@ def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
 
     if df.empty:
         return pd.DataFrame()
+
+    # 🟢 CORRECCIÓN DE ZONA HORARIA
+    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
 
     close = df["Close"]
     df["EMA20"]                                    = close.ewm(span=20, adjust=False).mean()
