@@ -695,7 +695,9 @@ def obtener_radar_completo(period: str, td_key: str) -> pd.DataFrame:
 # SERVICIO IA - GROQ PROVIDER
 # ══════════════════════════════════════════════════════════════════════════════
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "llama-3.3-70b-versatile"
+# (fix: llama-3.3-70b-versatile fue deprecado por Groq el 17/06/2026 → causaba
+# el Error HTTP 404. Migrado al reemplazo recomendado por Groq.)
+GROQ_MODEL   = "openai/gpt-oss-120b"
 
 def _groq_headers() -> dict:
     h = {"Content-Type": "application/json"}
