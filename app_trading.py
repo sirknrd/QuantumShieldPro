@@ -101,15 +101,32 @@ BINANCE_SYMBOLS = {
 
 BENCHMARK_ACCIONES = "SPY"
 BENCHMARK_CRYPTO   = "BTC-USD"
-PORTFOLIO_FILE     = "qsp_portfolio.json"
+PORTFOLIO_DIR       = "qsp_data"
+os.makedirs(PORTFOLIO_DIR, exist_ok=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERSISTENCIA LOCAL Y GESTIÓN DE SESIÓN
+# PERSISTENCIA LOCAL AISLADA POR SESIÓN (fix: antes era un único archivo global
+# compartido por TODOS los usuarios del deploy, mezclando portafolios. Ahora se
+# namespacea por session_id de Streamlit. Para producción multiusuario real,
+# migrar a Supabase sigue siendo lo correcto — esto es un parche, no la solución
+# definitiva.)
 # ══════════════════════════════════════════════════════════════════════════════
+def _session_id() -> str:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        return ctx.session_id if ctx else "default"
+    except Exception:
+        return "default"
+
+def _portfolio_path() -> str:
+    return os.path.join(PORTFOLIO_DIR, f"portfolio_{_session_id()}.json")
+
 def _cargar_portfolio() -> dict:
-    if os.path.exists(PORTFOLIO_FILE):
+    path = _portfolio_path()
+    if os.path.exists(path):
         try:
-            with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return {
                     "paper_trades":   data.get("paper_trades", []),
@@ -128,7 +145,7 @@ def guardar_portfolio() -> bool:
             "signal_history": st.session_state.get("signal_history", {}),
             "guardado_en":    datetime.now().strftime("%d/%m/%Y %H:%M"),
         }
-        with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+        with open(_portfolio_path(), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2, default=str)
         return True
     except OSError:
@@ -165,11 +182,13 @@ def enviar_alerta_telegram(mensaje: str) -> bool:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICADORES TÉCNICOS Y MÉTRICAS CUANTITATIVAS AVANZADAS
+# (fix: RSI/ATR/ADX ahora usan suavizado de Wilder — antes usaban media móvil
+# simple, lo que producía valores distintos a los de TradingView/Bloomberg)
 # ══════════════════════════════════════════════════════════════════════════════
 def calcular_rsi(serie: pd.Series, periodo: int = 14) -> pd.Series:
     delta    = serie.diff()
-    ganancia = delta.clip(lower=0).rolling(periodo).mean()
-    perdida  = (-delta.clip(upper=0)).rolling(periodo).mean()
+    ganancia = delta.clip(lower=0).ewm(alpha=1/periodo, min_periods=periodo, adjust=False).mean()
+    perdida  = (-delta.clip(upper=0)).ewm(alpha=1/periodo, min_periods=periodo, adjust=False).mean()
     rs       = ganancia / perdida.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
@@ -188,29 +207,30 @@ def calcular_bollinger(serie: pd.Series, periodo=20, desv=2):
 def calcular_atr(df: pd.DataFrame, periodo=14) -> pd.Series:
     h, l, c = df['High'], df['Low'], df['Close'].shift(1)
     tr = pd.concat([(h - l), (h - c).abs(), (l - c).abs()], axis=1).max(axis=1)
-    return tr.rolling(periodo).mean()
+    return tr.ewm(alpha=1/periodo, min_periods=periodo, adjust=False).mean()
 
 def calcular_adx(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
     high, low, close = df['High'], df['Low'], df['Close']
     plus_dm  = high.diff().clip(lower=0)
     minus_dm = (-low.diff()).clip(lower=0)
-    
+
     mask = plus_dm < minus_dm
     plus_dm[mask] = 0
     mask2 = minus_dm < plus_dm
     minus_dm[mask2] = 0
-    
+
     tr = pd.concat([
         (high - low),
         (high - close.shift()).abs(),
         (low  - close.shift()).abs()
     ], axis=1).max(axis=1)
-    
-    atr_s    = tr.rolling(periodo).mean()
-    plus_di  = 100 * (plus_dm.rolling(periodo).mean() / atr_s.replace(0, np.nan))
-    minus_di = 100 * (minus_dm.rolling(periodo).mean() / atr_s.replace(0, np.nan))
+
+    alpha    = 1 / periodo
+    atr_s    = tr.ewm(alpha=alpha, min_periods=periodo, adjust=False).mean()
+    plus_di  = 100 * (plus_dm.ewm(alpha=alpha, min_periods=periodo, adjust=False).mean() / atr_s.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.ewm(alpha=alpha, min_periods=periodo, adjust=False).mean() / atr_s.replace(0, np.nan))
     dx       = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
-    return dx.rolling(periodo).mean()
+    return dx.ewm(alpha=alpha, min_periods=periodo, adjust=False).mean()
 
 def calcular_stoch_rsi(serie: pd.Series, periodo_rsi=14, periodo_stoch=14, suavizado_k=3, suavizado_d=3):
     rsi     = calcular_rsi(serie, periodo_rsi)
@@ -280,7 +300,7 @@ def calcular_volume_profile(df: pd.DataFrame, bins: int = 20) -> pd.DataFrame:
     precio_max = float(df['High'].max())
     rangos     = np.linspace(precio_min, precio_max, bins + 1)
     vol_por_nivel = np.zeros(bins)
-    
+
     for _, row in df.iterrows():
         idx_low  = np.searchsorted(rangos, float(row['Low']),  side='left')
         idx_high = np.searchsorted(rangos, float(row['High']), side='right')
@@ -288,7 +308,7 @@ def calcular_volume_profile(df: pd.DataFrame, bins: int = 20) -> pd.DataFrame:
         idx_high = max(0, min(idx_high, bins))
         n_niveles = max(1, idx_high - idx_low)
         vol_por_nivel[idx_low:idx_high] += float(row['Volume']) / n_niveles
-        
+
     precio_mid = (rangos[:-1] + rangos[1:]) / 2
     poc_idx    = np.argmax(vol_por_nivel)
     return pd.DataFrame({
@@ -318,7 +338,6 @@ def calcular_puntos(fila) -> tuple:
     puntos  = 0
     razones = []
 
-    # VWAP Check
     if 'VWAP' in fila.index and not pd.isna(fila['VWAP']):
         if float(fila['Close']) > float(fila['VWAP']):
             puntos += 1
@@ -327,7 +346,6 @@ def calcular_puntos(fila) -> tuple:
             puntos -= 1
             razones.append("❌ Precio bajo VWAP")
 
-    # SMA200 Check (Tendencia Macro)
     if 'SMA200' in fila.index and not pd.isna(fila['SMA200']):
         if float(fila['Close']) > float(fila['SMA200']):
             puntos += 1
@@ -336,7 +354,6 @@ def calcular_puntos(fila) -> tuple:
             puntos -= 1
             razones.append("❌ Tendencia macro bajista (<SMA200)")
 
-    # EMA Check
     if float(fila['Close']) > float(fila['EMA50']):
         puntos += 1
         razones.append("✅ Precio sobre EMA50 (alcista)")
@@ -344,7 +361,6 @@ def calcular_puntos(fila) -> tuple:
         puntos -= 1
         razones.append("❌ Precio bajo EMA50 (bajista)")
 
-    # RSI Check
     rsi_val = float(fila['RSI'])
     if rsi_val < 30:
         puntos += 2
@@ -356,7 +372,6 @@ def calcular_puntos(fila) -> tuple:
         puntos += 1
         razones.append(f"✅ RSI neutral ({rsi_val:.1f})")
 
-    # MACD Check
     if float(fila['MACD']) > float(fila['MACD_SIGNAL']):
         puntos += 1
         razones.append("✅ MACD sobre señal")
@@ -364,7 +379,6 @@ def calcular_puntos(fila) -> tuple:
         puntos -= 1
         razones.append("❌ MACD bajo señal")
 
-    # Bollinger Check
     if float(fila['Close']) < float(fila['BB_LOWER']):
         puntos += 1
         razones.append("✅ Precio bajo BB inferior")
@@ -372,14 +386,13 @@ def calcular_puntos(fila) -> tuple:
         puntos -= 1
         razones.append("❌ Precio sobre BB superior")
 
-    # ADX Check
     adx_val = float(fila['ADX']) if 'ADX' in fila.index and not pd.isna(fila['ADX']) else 0
     if adx_val >= 25:
         razones.append(f"✅ ADX {adx_val:.1f} — tendencia fuerte")
     elif adx_val >= 15:
         razones.append(f"⚠️ ADX {adx_val:.1f} — tendencia moderada")
     else:
-        puntos = max(-1, min(1, puntos)) 
+        puntos = max(-1, min(1, puntos))
         razones.append(f"⚠️ ADX {adx_val:.1f} — sin tendencia clara")
 
     return puntos, razones, rsi_val, adx_val
@@ -407,7 +420,10 @@ def generar_senal(df: pd.DataFrame) -> dict:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODELO MACHINE LEARNING DE PROBABILIDAD DE ACIERTO
+# (fix: ahora cacheado — antes se reentrenaba en CADA rerun de Streamlit,
+# incluso al tocar un checkbox del sidebar sin relación con el modelo)
 # ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=300, show_spinner=False)
 def predecir_probabilidad_ml(df: pd.DataFrame) -> tuple:
     if not ML_OK or len(df) < 60:
         return None, "ML no disponible o datos insuficientes."
@@ -523,7 +539,7 @@ def _yf_fallback(ticker: str, period: str) -> pd.DataFrame:
     today = datetime.today()
     start = (today - pd.Timedelta(days=dias)).strftime("%Y-%m-%d")
     end   = (today + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    
+
     for intento in range(3):
         try:
             df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True, timeout=15)
@@ -532,7 +548,7 @@ def _yf_fallback(ticker: str, period: str) -> pd.DataFrame:
                     df.columns = [col[0] for col in df.columns]
                 cols_validas = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
                 return df[cols_validas]
-            
+
             df2 = yf.Ticker(ticker).history(start=start, end=end)
             if not df2.empty:
                 return df2
@@ -554,22 +570,10 @@ def _descargar_raw(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
         df = _yf_fallback(ticker, period)
     return df
 
-@st.cache_data(ttl=300)
-def get_data(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
-    try:
-        df = _descargar_raw(ticker, period, td_key)
-    except Exception:
-        return pd.DataFrame()
-    if df.empty:
-        return pd.DataFrame()
-    
-    # 🟢 CORRECCIÓN DE ZONA HORARIA (Evita TypeError en uniones)
-    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    
-    df = df[[c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]].copy()
-    df.dropna(subset=["Close"], inplace=True)
-
+# (fix: función compartida para calcular indicadores — antes estaba duplicada
+# íntegramente en get_data() y get_data_mtf(), con riesgo de que ambas
+# copias se desincronizaran al modificar un indicador)
+def _agregar_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     close = df["Close"]
     df["EMA20"]                                    = close.ewm(span=20, adjust=False).mean()
     df["EMA50"]                                    = close.ewm(span=50, adjust=False).mean()
@@ -584,6 +588,23 @@ def get_data(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
     df["STOCH_K"], df["STOCH_D"]                   = calcular_stoch_rsi(close)
     if "Volume" in df.columns:
         df["VOL_ANOMALO"] = volumen_anomalo(df)
+    return df
+
+@st.cache_data(ttl=300)
+def get_data(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
+    try:
+        df = _descargar_raw(ticker, period, td_key)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    df = df[[c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]].copy()
+    df.dropna(subset=["Close"], inplace=True)
+    df = _agregar_indicadores(df)
     return df
 
 @st.cache_data(ttl=300)
@@ -628,22 +649,47 @@ def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # 🟢 CORRECCIÓN DE ZONA HORARIA
     if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
         df.index = df.index.tz_localize(None)
 
-    close = df["Close"]
-    df["EMA20"]                                    = close.ewm(span=20, adjust=False).mean()
-    df["EMA50"]                                    = close.ewm(span=50, adjust=False).mean()
-    df["SMA200"]                                   = calcular_sma(close, 200)
-    df["VWAP"]                                     = calcular_vwap(df)
-    df["ADR_PCT"]                                  = calcular_adr(df, 14)
-    df["RSI"]                                      = calcular_rsi(close)
-    df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = calcular_macd(close)
-    df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"]   = calcular_bollinger(close)
-    df["ATR"]                                      = calcular_atr(df)
-    df["ADX"]                                      = calcular_adx(df)
+    df = _agregar_indicadores(df)
     return df
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RADAR / SCREENER — FETCH COMPARTIDO Y CACHEADO
+# (fix: antes Tab "Señales" y Tab "Screener" duplicaban el mismo fetch masivo
+# de ~40 tickers sin compartir caché entre sí)
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=300, show_spinner=False)
+def obtener_radar_completo(period: str, td_key: str) -> pd.DataFrame:
+    todos = {**ACCIONES, **CRYPTOS}
+    filas = []
+
+    def _fetch_fila(item):
+        nm, sym = item
+        d = get_data(sym, period, td_key=td_key)
+        if d.empty:
+            return None
+        inf = generar_senal(d)
+        p = float(d['Close'].iloc[-1])
+        pv = float(d['Close'].iloc[-2]) if len(d) > 1 else p
+        return {
+            "Activo": nm, "Ticker": sym, "Precio": p,
+            "Cambio %": round(((p / pv) - 1) * 100, 2), "RSI": round(float(d['RSI'].iloc[-1]), 1),
+            "ADX": round(float(d['ADX'].iloc[-1]), 1) if 'ADX' in d.columns else 0,
+            "Señal": inf['senal'], "Puntos": inf['puntos']
+        }
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_fetch_fila, item) for item in todos.items()]
+        for f in as_completed(futures):
+            r = f.result()
+            if r:
+                filas.append(r)
+
+    if not filas:
+        return pd.DataFrame()
+    return pd.DataFrame(filas).sort_values("Puntos", ascending=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SERVICIO IA - GROQ PROVIDER
@@ -798,6 +844,8 @@ def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 2, umbral_venta: 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCRAPING EN FINVIZ CON RESILIENCIA HTTP
+# (fix: except ampliado — el parseo de BeautifulSoup puede lanzar excepciones
+# que no son requests.RequestException, y antes esas tumbaban el tab)
 # ══════════════════════════════════════════════════════════════════════════════
 FINVIZ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -855,7 +903,7 @@ def finviz_scrape(ticker: str) -> dict:
         result["fundamentals"] = fundamentals
         result["ok"] = bool(fundamentals or noticias)
         return result
-    except requests.RequestException:
+    except (requests.RequestException, Exception):
         return result
 
 def _parse_finviz_num(val: str):
@@ -886,7 +934,7 @@ def analizar_buffett(fundamentals: dict) -> dict:
     return {"P/E": pe, "ROE %": roe, "Deuda/Patrim.": deuda, "Margen Neto %": margen, "Score Buffett": score, "Veredicto": veredicto}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ANÁLISIS DE PATRONES CHARTISTAS Y DIVERGENCIAS (FECHAS FORMATEADAS)
+# ANÁLISIS DE PATRONES CHARTISTAS Y DIVERGENCIAS
 # ══════════════════════════════════════════════════════════════════════════════
 def calcular_fibonacci(df: pd.DataFrame) -> dict:
     maximo, minimo = float(df['High'].max()), float(df['Low'].min())
@@ -931,7 +979,7 @@ def registrar_senal(ticker: str, info: dict, precio: float):
             "RSI": round(info["rsi"], 1), "ADX": round(info["adx"], 1),
         })
         st.session_state.signal_history[ticker] = hist[-50:]
-        
+
         if "FUERTE" in nueva_senal and st.session_state.get("auto_telegram_alerts", False):
             msg = f"🚨 *NUEVA SEÑAL CUANTITATIVA*\n\nActivo: `{ticker}`\nSeñal: *{nueva_senal}*\nPrecio: `${precio:,.4f}`\nRSI: `{info['rsi']:.1f}` | ADX: `{info['adx']:.1f}`"
             enviar_alerta_telegram(msg)
@@ -963,9 +1011,9 @@ def _linreg(y: np.ndarray):
     return m, b
 
 def detectar_patrones(df: pd.DataFrame) -> list:
-    if len(df) < 30: 
+    if len(df) < 30:
         return []
-    
+
     close = df["Close"].values.astype(float)
     high  = df["High"].values.astype(float)
     low   = df["Low"].values.astype(float)
@@ -987,10 +1035,10 @@ def detectar_patrones(df: pd.DataFrame) -> list:
         if abs(close[t1] - close[t2]) / close[t1] < 0.03 and t2 - t1 > orden:
             if (close[t1] - close[t1:t2].min()) / close[t1] > 0.04:
                 patrones.append({
-                    "patron": "Double Top", 
-                    "confianza": "Alta", 
-                    "desc": f"Dos techos en ${close[t1]:,.2f} y ${close[t2]:,.2f}.", 
-                    "fecha_ini": fmt_fecha(idx[t1]), 
+                    "patron": "Double Top",
+                    "confianza": "Alta",
+                    "desc": f"Dos techos en ${close[t1]:,.2f} y ${close[t2]:,.2f}.",
+                    "fecha_ini": fmt_fecha(idx[t1]),
                     "fecha_fin": fmt_fecha(idx[t2])
                 })
 
@@ -999,10 +1047,10 @@ def detectar_patrones(df: pd.DataFrame) -> list:
         if abs(close[b1] - close[b2]) / close[b1] < 0.03 and b2 - b1 > orden:
             if (close[b1:b2].max() - close[b1]) / close[b1] > 0.04:
                 patrones.append({
-                    "patron": "Double Bottom", 
-                    "confianza": "Alta", 
-                    "desc": f"Dos suelos en ${close[b1]:,.2f} y ${close[b2]:,.2f}.", 
-                    "fecha_ini": fmt_fecha(idx[b1]), 
+                    "patron": "Double Bottom",
+                    "confianza": "Alta",
+                    "desc": f"Dos suelos en ${close[b1]:,.2f} y ${close[b2]:,.2f}.",
+                    "fecha_ini": fmt_fecha(idx[b1]),
                     "fecha_fin": fmt_fecha(idx[b2])
                 })
 
@@ -1012,18 +1060,18 @@ def detectar_patrones(df: pd.DataFrame) -> list:
     if (high[-ventana:].mean() - low[-ventana:].mean()) / close[-ventana:].mean() < 0.15:
         if mh > 0.001 and ml > 0.001:
             patrones.append({
-                "patron": "Channel Up", 
-                "confianza": "Media", 
-                "desc": "Canal alcista estructurado.", 
-                "fecha_ini": fmt_fecha(idx[-ventana]), 
+                "patron": "Channel Up",
+                "confianza": "Media",
+                "desc": "Canal alcista estructurado.",
+                "fecha_ini": fmt_fecha(idx[-ventana]),
                 "fecha_fin": fmt_fecha(idx[-1])
             })
         elif mh < -0.001 and ml < -0.001:
             patrones.append({
-                "patron": "Channel Down", 
-                "confianza": "Media", 
-                "desc": "Canal bajista estructurado.", 
-                "fecha_ini": fmt_fecha(idx[-ventana]), 
+                "patron": "Channel Down",
+                "confianza": "Media",
+                "desc": "Canal bajista estructurado.",
+                "fecha_ini": fmt_fecha(idx[-ventana]),
                 "fecha_fin": fmt_fecha(idx[-1])
             })
 
@@ -1035,6 +1083,41 @@ def validar_ticker(t: str) -> tuple:
     if not t: return False, "Ticker vacío."
     if not TICKER_REGEX.match(t): return False, f"Ticker inválido: '{t}'."
     return True, ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAPER TRADING — ACTUALIZACIÓN DE ESTADO Y PNL EN VIVO
+# (fix: antes las posiciones se guardaban con Estado="🟡 Abierta" para siempre.
+# No había cálculo de PnL, ni verificación de SL/TP contra el precio actual,
+# ni cierre automático. Ahora se recalcula en cada carga de los tabs 5 y 12.)
+# ══════════════════════════════════════════════════════════════════════════════
+def actualizar_paper_trades(td_key: str):
+    cambios = False
+    for t in st.session_state.paper_trades:
+        if t.get("Estado", "").startswith("🟡"):
+            precio_actual = get_close_only(t["Ticker"], "1mo", td_key=td_key)
+            if precio_actual.empty:
+                continue
+            p_now = float(precio_actual.iloc[-1])
+            entrada, sl, tp, lado = t["Entrada"], t["SL"], t["TP"], t.get("Lado", "LONG")
+
+            if lado == "LONG":
+                pnl_pct = (p_now - entrada) / entrada * 100 if entrada else 0.0
+                if p_now <= sl:
+                    t["Estado"] = "🔴 Cerrada (SL)"; cambios = True
+                elif p_now >= tp:
+                    t["Estado"] = "🟢 Cerrada (TP)"; cambios = True
+            else:
+                pnl_pct = (entrada - p_now) / entrada * 100 if entrada else 0.0
+                if p_now >= sl:
+                    t["Estado"] = "🔴 Cerrada (SL)"; cambios = True
+                elif p_now <= tp:
+                    t["Estado"] = "🟢 Cerrada (TP)"; cambios = True
+
+            t["Precio actual"] = round(p_now, 4)
+            t["PnL % actual"] = round(pnl_pct, 2)
+        cambios = cambios or ("PnL % actual" in t)
+    if cambios:
+        guardar_portfolio()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERFAZ SIDEBAR
@@ -1149,7 +1232,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.t
 # ── TAB 1: ANÁLISIS TÉCNICO & ML ──────────────────────────────────────────────
 with tab1:
     registrar_senal(ticker, info, price)
-    
+
     k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     k1.metric("Precio", f"${price:,.4f}", f"{chg:+.2f}%")
     k2.metric("RSI (14)", f"{info['rsi']:.1f}")
@@ -1166,10 +1249,9 @@ with tab1:
 
     rows_n = 3 + (1 if 'Volume' in df.columns and mostrar_volumen else 0) + (1 if mostrar_stoch else 0)
     fig = make_subplots(rows=rows_n, cols=1, shared_xaxes=True, vertical_spacing=0.02)
-    
-    # 1. Gráfico de Precio Principal
+
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Precio"), row=1, col=1)
-    
+
     if mostrar_sma and 'SMA200' in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], line=dict(color="#ffffff", width=2, dash="dash"), name="SMA200"), row=1, col=1)
 
@@ -1197,13 +1279,23 @@ with tab1:
             color = FIBONACCI_COLORES.get(nivel, "rgba(255,255,255,0.3)")
             fig.add_hline(y=valor, line_dash="dot", line_color=color, annotation_text=f"Fib {nivel}", annotation_position="top right", row=1, col=1)
 
-    # 2. Subgráficos Dinámicos
+    # (fix: antes el checkbox "Volumen anómalo" no hacía nada — no se ploteaba
+    # ninguna marca aunque VOL_ANOMALO ya estaba calculada en el DataFrame)
+    if mostrar_vanom and 'VOL_ANOMALO' in df.columns:
+        anomalos = df[df['VOL_ANOMALO'] == True]
+        if not anomalos.empty:
+            fig.add_trace(go.Scatter(
+                x=anomalos.index, y=anomalos['High'] * 1.01,
+                mode='markers', marker=dict(symbol='triangle-down', size=10, color='#ffd700', line=dict(width=1, color='#000')),
+                name="Volumen anómalo", showlegend=False
+            ), row=1, col=1)
+
     curr_row = 2
     if 'Volume' in df.columns and mostrar_volumen:
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="Volumen", marker_color='rgba(0, 207, 255, 0.6)'), row=curr_row, col=1)
+        colores_vol = np.where(df.get('VOL_ANOMALO', False), '#ffd700', 'rgba(0, 207, 255, 0.6)')
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="Volumen", marker_color=colores_vol), row=curr_row, col=1)
         curr_row += 1
 
-    # RSI y Divergencias
     fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color="#c77dff"), name="RSI"), row=curr_row, col=1)
     if mostrar_divs:
         divs = detectar_divergencias(df)
@@ -1212,10 +1304,8 @@ with tab1:
             fig.add_trace(go.Scatter(x=[d["fecha1"], d["fecha2"]], y=[d["rsi1"], d["rsi2"]], mode="lines+markers", line=dict(color=color_div, width=2, dash="dot"), showlegend=False), row=curr_row, col=1)
     curr_row += 1
 
-    # MACD
     fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name="MACD Hist"), row=curr_row, col=1)
 
-    # Stochastic RSI
     if mostrar_stoch:
         curr_row += 1
         fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_K'], line=dict(color="#00ff88", width=1), name="Stoch %K"), row=curr_row, col=1)
@@ -1226,7 +1316,6 @@ with tab1:
     fig.update_layout(template="plotly_dark", height=850, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    # 3. Volume Profile Separado (Horizontal)
     if mostrar_vp and 'Volume' in df.columns:
         st.markdown("### 📊 Volume Profile (POC)")
         vp_df = calcular_volume_profile(df)
@@ -1249,31 +1338,8 @@ with tab1:
 # ── TAB 2: SEÑALES ────────────────────────────────────────────────────────────
 with tab2:
     st.subheader("🌐 Radar Global de Mercado")
-    todos = {**ACCIONES, **CRYPTOS}
-    filas = []
-
-    def _fetch_fila(item):
-        nm, sym = item
-        d = get_data(sym, period, td_key=TD_KEY)
-        if d.empty: return None
-        inf = generar_senal(d)
-        p = float(d['Close'].iloc[-1])
-        pv = float(d['Close'].iloc[-2]) if len(d) > 1 else p
-        return {
-            "Activo": nm, "Ticker": sym, "Precio": p,
-            "Cambio %": round(((p/pv)-1)*100, 2), "RSI": round(float(d['RSI'].iloc[-1]), 1),
-            "ADX": round(float(d['ADX'].iloc[-1]), 1) if 'ADX' in d.columns else 0,
-            "Señal": inf['senal'], "Puntos": inf['puntos']
-        }
-
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = [ex.submit(_fetch_fila, item) for item in todos.items()]
-        for f in as_completed(futures):
-            r = f.result()
-            if r: filas.append(r)
-
-    if filas:
-        df_radar = pd.DataFrame(filas).sort_values("Puntos", ascending=False)
+    df_radar = obtener_radar_completo(period, TD_KEY)
+    if not df_radar.empty:
         st.dataframe(df_radar, use_container_width=True)
 
 # ── TAB 3: COMPARATIVA RELATIVA ───────────────────────────────────────────────
@@ -1304,7 +1370,8 @@ with tab4:
 # ── TAB 5: PAPER TRADING & KELLY ──────────────────────────────────────────────
 with tab5:
     st.subheader("📒 Gestión de Posiciones Simuladas")
-    
+    actualizar_paper_trades(TD_KEY)
+
     col_pt1, col_pt2 = st.columns([3, 2])
     with col_pt1:
         with st.form("trade_form"):
@@ -1322,7 +1389,7 @@ with tab5:
                 })
                 guardar_portfolio()
                 st.success("Posición agregada.")
-    
+
     with col_pt2:
         st.markdown("#### 📐 Cálculo de Tamaño de Posición (Kelly)")
         win_rate_input = st.slider("Win Rate Estimado %", 10, 90, 55)
@@ -1338,7 +1405,7 @@ with tab5:
 with tab6:
     st.subheader("🤖 Consultoría Algorítmica & Tesis")
     st.caption("Solicita un resumen técnico automatizado utilizando el motor LLM de Groq.")
-    
+
     if _ia_activa():
         if st.button("Generar Informe Técnico", use_container_width=True):
             with st.spinner("🧠 Procesando datos del mercado y generando tesis..."):
@@ -1360,7 +1427,7 @@ with tab7:
     u_v = col2.slider("Umbral Venta", -6, -1, -3)
     if st.button("Ejecutar Backtest"):
         bt = backtest_estrategia(df, umbral_compra=u_c, umbral_venta=u_v)
-        
+
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Win Rate", f"{bt['win_rate']}%")
         m2.metric("Retorno Total", f"{bt['retorno_total']}%")
@@ -1387,13 +1454,9 @@ with tab8:
 with tab9:
     st.subheader("🔍 Escáner Filtro Cuantitativo")
     if st.button("Lanzar Escáner"):
-        res = []
-        for nm, sym in {**ACCIONES, **CRYPTOS}.items():
-            d = get_data(sym, "3mo", td_key=TD_KEY)
-            if not d.empty:
-                inf = generar_senal(d)
-                res.append({"Activo": nm, "Ticker": sym, "Señal": inf['senal'], "Puntos": inf['puntos']})
-        st.dataframe(pd.DataFrame(res).sort_values("Puntos", ascending=False), use_container_width=True)
+        df_screen = obtener_radar_completo("3mo", TD_KEY)
+        if not df_screen.empty:
+            st.dataframe(df_screen, use_container_width=True)
 
 # ── TAB 10: NOTICIAS Y FUNDAMENTALES ──────────────────────────────────────────
 with tab10:
@@ -1401,6 +1464,8 @@ with tab10:
     data_fv = finviz_scrape(ticker)
     if data_fv["ok"]:
         st.json(data_fv["fundamentals"])
+    else:
+        st.info("Sin datos disponibles de Finviz para este ticker (activos como cripto o índices no aplican).")
 
 # ── TAB 11: PATRONES CHARTISTAS ───────────────────────────────────────────────
 with tab11:
@@ -1440,7 +1505,7 @@ with tab11:
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                
+
                 if info_p.get("accion"):
                     st.caption(f"💡 **Estrategia sugerida:** {info_p['accion']}")
 
@@ -1452,23 +1517,42 @@ with tab11:
 # ── TAB 12: PORTAFOLIO CONSOLIDADO Y RIESGO (VaR) ────────────────────────────
 with tab12:
     st.subheader("💼 Resumen Global de Portafolio & Análisis de Riesgo")
+    actualizar_paper_trades(TD_KEY)
+
     if st.session_state.paper_trades:
         df_p = pd.DataFrame(st.session_state.paper_trades)
         cap_total = df_p['Capital'].sum()
-        
-        # Cálculo de VaR
-        retornos_p = df['Close'].pct_change() * 100
-        var_pct, var_usd = calcular_var_95(retornos_p, cap_total)
-        
-        p1, p2, p3 = st.columns(3)
+
+        # (fix: VaR ahora se calcula como retorno ponderado por posición real de
+        # cada ticker del portafolio, en vez de aplicar la volatilidad del
+        # activo actualmente seleccionado en el sidebar al capital total)
+        retornos_pond = []
+        for _, fila in df_p.iterrows():
+            s = get_close_only(fila['Ticker'], period, td_key=TD_KEY)
+            if s.empty or cap_total == 0:
+                continue
+            r = s.pct_change().dropna() * 100
+            peso = fila['Capital'] / cap_total
+            retornos_pond.append(r * peso)
+
+        if retornos_pond:
+            retornos_portfolio = pd.concat(retornos_pond, axis=1).sum(axis=1)
+        else:
+            retornos_portfolio = pd.Series(dtype=float)
+
+        var_pct, var_usd = calcular_var_95(retornos_portfolio, cap_total)
+
+        p1, p2, p3, p4 = st.columns(4)
         p1.metric("Total Invertido", f"${cap_total:,.2f}")
         p2.metric("Value at Risk (VaR 95% Diario)", f"${var_usd:,.2f}", f"-{var_pct}% del portafolio")
-        p3.metric("Posiciones Activas", len(df_p))
-        
+        p3.metric("Posiciones Activas", int((df_p['Estado'].astype(str).str.startswith('🟡')).sum()))
+        pnl_abierto = df_p.loc[df_p['Estado'].astype(str).str.startswith('🟡'), 'PnL % actual'] if 'PnL % actual' in df_p.columns else pd.Series(dtype=float)
+        p4.metric("PnL % Prom. Posiciones Abiertas", f"{pnl_abierto.mean():.2f}%" if not pnl_abierto.empty else "N/A")
+
         st.dataframe(df_p, use_container_width=True)
-        
+
         st.markdown("#### 📄 Exportación de Reporte de Portafolio")
-        reporte_str = f"REPORTE INSTITUCIONAL QUANTUMSHIELD PRO\nFecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}\nCapital Total: ${cap_total:,.2f}\nVaR 95%: ${var_usd:,.2f} ({var_pct}%)\nPosiciones:\n" + df_p.to_string()
+        reporte_str = f"REPORTE INSTITUCIONAL QUANTUMSHIELD PRO\nFecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}\nCapital Total: ${cap_total:,.2f}\nVaR 95% (ponderado por posición): ${var_usd:,.2f} ({var_pct}%)\nPosiciones:\n" + df_p.to_string()
         st.download_button("Descargar Reporte (TXT / PDF Ready)", data=reporte_str, file_name=f"Reporte_QuantumShield_{datetime.now().strftime('%Y%m%d')}.txt", mime="text/plain")
     else:
         st.info("No hay activos en el portafolio.")
