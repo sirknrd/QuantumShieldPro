@@ -9,12 +9,12 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timezone
 from scipy.signal import argrelextrema
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 
-# Dependencias Opcionales con Fallbacks
+# Dependencias Opcionales
 try:
     from bs4 import BeautifulSoup
     BS4_OK = True
@@ -24,92 +24,308 @@ except ImportError:
 try:
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import accuracy_score
     ML_OK = True
 except ImportError:
     ML_OK = False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURACIÓN DE PÁGINA
+# CONFIGURACIÓN DE PÁGINA (SIN SIDEBAR — FULL WORKSTATION MODE)
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="QuantumShield Pro — Quant Terminal",
+    page_title="QSP // QUANT WORKSTATION",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRESETS DE ACTIVOS
+# MOTOR GRÁFICO CSS — ESTÉTICA KOYFIN / BLOOMBERG WORKSTATION
+# ══════════════════════════════════════════════════════════════════════════════
+WORKSTATION_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+    --bg-main: #06080c;
+    --bg-panel: #0b0e14;
+    --bg-header: #0f131c;
+    --border: #1c222d;
+    --border-bright: #2a3241;
+    --text-primary: #e2e8f0;
+    --text-muted: #64748b;
+    --accent-amber: #f59e0b;
+    --accent-blue: #3b82f6;
+    --bull: #10b981;
+    --bear: #f43f5e;
+}
+
+html, body, .stApp {
+    background-color: var(--bg-main) !important;
+    color: var(--text-primary) !important;
+    font-family: 'Inter', -apple-system, sans-serif !important;
+}
+
+/* Eliminar cromado de Streamlit y márgenes desperdiciados */
+#MainMenu, footer, div[data-testid="stToolbar"], div[data-testid="stDecoration"] {
+    display: none !important;
+}
+header[data-testid="stHeader"] {
+    background: transparent !important;
+    height: 0px !important;
+}
+section[data-testid="stSidebar"] {
+    display: none !important;
+}
+.block-container {
+    padding: 0.4rem 0.8rem 1rem 0.8rem !important;
+    max-width: 100% !important;
+}
+
+/* Reducir espacio vertical entre bloques de Streamlit */
+div[data-testid="stVerticalBlock"] > div {
+    gap: 0.35rem !important;
+}
+
+/* Barra superior institucional */
+.ws-topbar {
+    background: var(--bg-header);
+    border: 1px solid var(--border);
+    border-top: 2px solid var(--accent-amber);
+    padding: 6px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    margin-bottom: 4px;
+}
+.ws-brand {
+    font-weight: 700;
+    color: #ffffff;
+    letter-spacing: 0.08em;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.ws-tag {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--accent-amber);
+    border: 1px solid rgba(245, 158, 11, 0.4);
+    padding: 1px 6px;
+    font-size: 0.65rem;
+    font-weight: 600;
+}
+
+/* Grilla densa de telemetría (reemplaza st.metric) */
+.kpi-strip {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    background: var(--border);
+    gap: 1px;
+    border: 1px solid var(--border);
+    margin-bottom: 6px;
+}
+.kpi-cell {
+    background: var(--bg-panel);
+    padding: 7px 12px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+.kpi-label {
+    font-family: 'Inter', sans-serif;
+    font-size: 0.63rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 2px;
+}
+.kpi-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.98rem;
+    font-weight: 700;
+    color: #f8fafc;
+    font-variant-numeric: tabular-nums;
+}
+.kpi-sub {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    font-variant-numeric: tabular-nums;
+    margin-top: 1px;
+}
+
+/* Paneles laterales y tablas */
+.ws-panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    padding: 10px 12px;
+    height: 100%;
+}
+.ws-panel-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.70rem;
+    font-weight: 700;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+}
+
+/* Filas de datos tipo Orderbook / Tearsheet */
+.data-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 0;
+    border-bottom: 1px solid #131822;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.73rem;
+}
+.data-row-label {
+    color: var(--text-muted);
+}
+.data-row-val {
+    color: var(--text-primary);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Tabs estilo Terminal */
+div[data-baseweb="tab-list"] {
+    background-color: var(--bg-panel) !important;
+    border: 1px solid var(--border) !important;
+    padding: 0 6px !important;
+    gap: 2px !important;
+}
+button[data-baseweb="tab"] {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.70rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+    color: var(--text-muted) !important;
+    padding: 7px 12px !important;
+    margin: 0 !important;
+    border-bottom: 2px solid transparent !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    color: var(--accent-amber) !important;
+    border-bottom: 2px solid var(--accent-amber) !important;
+    background-color: rgba(245, 158, 11, 0.06) !important;
+}
+
+/* Inputs compactos en la barra de comandos */
+div[data-baseweb="select"] > div,
+div[data-baseweb="input"] > div {
+    background-color: var(--bg-panel) !important;
+    border: 1px solid var(--border-bright) !important;
+    border-radius: 2px !important;
+    min-height: 32px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.76rem !important;
+}
+div[data-testid="stPopover"] > button {
+    background-color: var(--bg-panel) !important;
+    border: 1px solid var(--border-bright) !important;
+    border-radius: 2px !important;
+    min-height: 32px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.74rem !important;
+    color: var(--text-primary) !important;
+    width: 100%;
+}
+
+/* Botones de acción */
+.stButton > button {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.72rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+    border-radius: 2px !important;
+    border: 1px solid var(--border-bright) !important;
+    background-color: #131822 !important;
+    color: var(--text-primary) !important;
+    min-height: 32px !important;
+    padding: 2px 12px !important;
+}
+.stButton > button:hover {
+    border-color: var(--accent-amber) !important;
+    color: var(--accent-amber) !important;
+}
+.stButton > button[kind="primary"] {
+    background-color: var(--accent-amber) !important;
+    color: #06080c !important;
+    border-color: var(--accent-amber) !important;
+    font-weight: 700 !important;
+}
+</style>
+"""
+st.markdown(WORKSTATION_CSS, unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UNIVERSO DE ACTIVOS
 # ══════════════════════════════════════════════════════════════════════════════
 ACCIONES = {
-    "NVIDIA (NVDA)":      "NVDA",
-    "Apple (AAPL)":       "AAPL",
-    "Microsoft (MSFT)":   "MSFT",
-    "Tesla (TSLA)":       "TSLA",
-    "Amazon (AMZN)":      "AMZN",
-    "Meta (META)":        "META",
-    "Alphabet (GOOGL)":   "GOOGL",
-    "JPMorgan (JPM)":     "JPM",
-    "S&P 500 ETF (SPY)":  "SPY",
-    "IPSA Chile (^IPSA)": "^IPSA",
-    "Berkshire Hathaway (BRK-B)": "BRK-B",
-    "Coca-Cola (KO)":     "KO",
-    "American Express (AXP)": "AXP",
-    "Bank of America (BAC)": "BAC",
-    "Chevron (CVX)":      "CVX",
-    "Occidental Petroleum (OXY)": "OXY",
-    "Kraft Heinz (KHC)":  "KHC",
-    "Moody's (MCO)":      "MCO",
-    "Visa (V)":           "V",
-    "Mastercard (MA)":    "MA",
-    "Johnson & Johnson (JNJ)": "JNJ",
-    "Procter & Gamble (PG)": "PG",
-    "Walmart (WMT)":      "WMT",
-    "Home Depot (HD)":    "HD",
-    "McDonald's (MCD)":   "MCD",
-    "Colgate-Palmolive (CL)": "CL",
-    "PepsiCo (PEP)":      "PEP",
-    "Chubb Limited (CB)": "CB",
-    "UnitedHealth (UNH)": "UNH",
-    "Verizon (VZ)":       "VZ",
+    "NVDA — NVIDIA Corp":          "NVDA",
+    "AAPL — Apple Inc":            "AAPL",
+    "MSFT — Microsoft Corp":       "MSFT",
+    "TSLA — Tesla Inc":            "TSLA",
+    "AMZN — Amazon.com":           "AMZN",
+    "META — Meta Platforms":       "META",
+    "GOOGL — Alphabet Inc":        "GOOGL",
+    "JPM — JPMorgan Chase":        "JPM",
+    "SPY — S&P 500 ETF":           "SPY",
+    "IPSA — S&P CLX IPSA":         "^IPSA",
+    "BRK-B — Berkshire Hathaway":  "BRK-B",
+    "KO — Coca-Cola Co":           "KO",
+    "AXP — American Express":      "AXP",
+    "BAC — Bank of America":       "BAC",
+    "CVX — Chevron Corp":          "CVX",
+    "OXY — Occidental Petrol":     "OXY",
+    "MCO — Moody's Corp":          "MCO",
+    "V — Visa Inc":                "V",
+    "MA — Mastercard Inc":         "MA",
+    "JNJ — Johnson & Johnson":     "JNJ",
+    "PG — Procter & Gamble":       "PG",
+    "WMT — Walmart Inc":           "WMT",
+    "HD — Home Depot":             "HD",
+    "MCD — McDonald's Corp":       "MCD",
+    "PEP — PepsiCo Inc":           "PEP",
+    "UNH — UnitedHealth":          "UNH",
 }
 
 CRYPTOS = {
-    "Bitcoin (BTC)":      "BTC-USD",
-    "Ethereum (ETH)":     "ETH-USD",
-    "Solana (SOL)":       "SOL-USD",
-    "BNB (BNB)":          "BNB-USD",
-    "XRP (XRP)":          "XRP-USD",
-    "Cardano (ADA)":      "ADA-USD",
-    "Avalanche (AVAX)":   "AVAX-USD",
-    "Dogecoin (DOGE)":    "DOGE-USD",
-    "Chainlink (LINK)":   "LINK-USD",
-    "Polkadot (DOT)":     "DOT-USD",
+    "BTC — Bitcoin Spot":    "BTC-USD",
+    "ETH — Ethereum Spot":   "ETH-USD",
+    "SOL — Solana Spot":     "SOL-USD",
+    "BNB — Binance Coin":    "BNB-USD",
+    "XRP — Ripple Network":  "XRP-USD",
+    "ADA — Cardano Spot":    "ADA-USD",
+    "AVAX — Avalanche Spot": "AVAX-USD",
+    "DOGE — Dogecoin Spot":  "DOGE-USD",
+    "LINK — Chainlink Spot": "LINK-USD",
+    "DOT — Polkadot Spot":   "DOT-USD",
 }
 
 BINANCE_SYMBOLS = {
-    "BTC-USD":  "BTCUSDT",
-    "ETH-USD":  "ETHUSDT",
-    "SOL-USD":  "SOLUSDT",
-    "BNB-USD":  "BNBUSDT",
-    "XRP-USD":  "XRPUSDT",
-    "ADA-USD":  "ADAUSDT",
-    "AVAX-USD": "AVAXUSDT",
-    "DOGE-USD": "DOGEUSDT",
-    "LINK-USD": "LINKUSDT",
-    "DOT-USD":  "DOTUSDT",
+    "BTC-USD": "BTCUSDT", "ETH-USD": "ETHUSDT", "SOL-USD": "SOLUSDT",
+    "BNB-USD": "BNBUSDT", "XRP-USD": "XRPUSDT", "ADA-USD": "ADAUSDT",
+    "AVAX-USD": "AVAXUSDT", "DOGE-USD": "DOGEUSDT", "LINK-USD": "LINKUSDT", "DOT-USD": "DOTUSDT",
 }
 
 BENCHMARK_ACCIONES = "SPY"
 BENCHMARK_CRYPTO   = "BTC-USD"
-PORTFOLIO_DIR       = "qsp_data"
+PORTFOLIO_DIR      = "qsp_data"
 os.makedirs(PORTFOLIO_DIR, exist_ok=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERSISTENCIA LOCAL AISLADA POR SESIÓN (fix: antes era un único archivo global
-# compartido por TODOS los usuarios del deploy, mezclando portafolios. Ahora se
-# namespacea por session_id de Streamlit. Para producción multiusuario real,
-# migrar a Supabase sigue siendo lo correcto — esto es un parche, no la solución
-# definitiva.)
+# PERSISTENCIA POR SESIÓN
 # ══════════════════════════════════════════════════════════════════════════════
 def _session_id() -> str:
     try:
@@ -133,8 +349,8 @@ def _cargar_portfolio() -> dict:
                     "notas":          data.get("notas", {}),
                     "signal_history": data.get("signal_history", {}),
                 }
-        except (json.JSONDecodeError, OSError) as e:
-            st.error(f"Error al cargar archivo de portafolio local: {e}")
+        except Exception:
+            pass
     return {"paper_trades": [], "notas": {}, "signal_history": {}}
 
 def guardar_portfolio() -> bool:
@@ -143,7 +359,7 @@ def guardar_portfolio() -> bool:
             "paper_trades":   st.session_state.get("paper_trades", []),
             "notas":          st.session_state.get("notas", {}),
             "signal_history": st.session_state.get("signal_history", {}),
-            "guardado_en":    datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "guardado_en":    datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         with open(_portfolio_path(), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2, default=str)
@@ -157,33 +373,28 @@ for key, val in [
     ("notas", _datos_guardados["notas"]),
     ("signal_history", _datos_guardados["signal_history"]),
     ("chat_history", {}),
-    ("analisis_cache", {}),
-    ("noticias_cache", {}),
-    ("finviz_cache", {})
+    ("last_bt", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = val
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SERVICIO DE ALERTAS DE TELEGRAM
-# ══════════════════════════════════════════════════════════════════════════════
 def enviar_alerta_telegram(mensaje: str) -> bool:
     token = st.session_state.get("telegram_token", "").strip()
     chat_id = st.session_state.get("telegram_chat_id", "").strip()
     if not token or not chat_id:
         return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"}
     try:
-        resp = requests.post(url, json=payload, timeout=5)
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"},
+            timeout=5
+        )
         return resp.ok
     except requests.RequestException:
         return False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INDICADORES TÉCNICOS Y MÉTRICAS CUANTITATIVAS AVANZADAS
-# (fix: RSI/ATR/ADX ahora usan suavizado de Wilder — antes usaban media móvil
-# simple, lo que producía valores distintos a los de TradingView/Bloomberg)
+# MOTOR MATEMÁTICO E INDICADORES (SUAVIZADO DE WILDER)
 # ══════════════════════════════════════════════════════════════════════════════
 def calcular_rsi(serie: pd.Series, periodo: int = 14) -> pd.Series:
     delta    = serie.diff()
@@ -213,18 +424,9 @@ def calcular_adx(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
     high, low, close = df['High'], df['Low'], df['Close']
     plus_dm  = high.diff().clip(lower=0)
     minus_dm = (-low.diff()).clip(lower=0)
-
-    mask = plus_dm < minus_dm
-    plus_dm[mask] = 0
-    mask2 = minus_dm < plus_dm
-    minus_dm[mask2] = 0
-
-    tr = pd.concat([
-        (high - low),
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
-    ], axis=1).max(axis=1)
-
+    plus_dm[plus_dm < minus_dm] = 0
+    minus_dm[minus_dm < plus_dm] = 0
+    tr = pd.concat([(high - low), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     alpha    = 1 / periodo
     atr_s    = tr.ewm(alpha=alpha, min_periods=periodo, adjust=False).mean()
     plus_di  = 100 * (plus_dm.ewm(alpha=alpha, min_periods=periodo, adjust=False).mean() / atr_s.replace(0, np.nan))
@@ -237,250 +439,204 @@ def calcular_stoch_rsi(serie: pd.Series, periodo_rsi=14, periodo_stoch=14, suavi
     min_rsi = rsi.rolling(periodo_stoch).min()
     max_rsi = rsi.rolling(periodo_stoch).max()
     rango   = (max_rsi - min_rsi).replace(0, np.nan)
-    k_raw   = (rsi - min_rsi) / rango * 100
-    k       = k_raw.rolling(suavizado_k).mean()
+    k       = ((rsi - min_rsi) / rango * 100).rolling(suavizado_k).mean()
     d       = k.rolling(suavizado_d).mean()
     return k, d
-
-def calcular_sma(serie: pd.Series, periodo: int) -> pd.Series:
-    return serie.rolling(window=periodo).mean()
 
 def calcular_vwap(df: pd.DataFrame) -> pd.Series:
     if 'Volume' not in df.columns or df['Volume'].sum() == 0:
         return pd.Series(np.nan, index=df.index)
-    precio_tipico = (df['High'] + df['Low'] + df['Close']) / 3
-    vwap = (precio_tipico * df['Volume']).cumsum() / df['Volume'].cumsum()
-    return vwap
+    pt = (df['High'] + df['Low'] + df['Close']) / 3
+    return (pt * df['Volume']).cumsum() / df['Volume'].cumsum()
 
 def calcular_adr(df: pd.DataFrame, periodo: int = 14) -> pd.Series:
-    rango_diario_pct = ((df['High'] / df['Low']) - 1) * 100
-    return rango_diario_pct.rolling(window=periodo).mean()
+    return (((df['High'] / df['Low']) - 1) * 100).rolling(window=periodo).mean()
 
-def calcular_sortino_ratio(retornos: pd.Series, rf_rate: float = 0.0) -> float:
-    retornos_limpios = retornos.dropna()
-    if len(retornos_limpios) == 0:
-        return 0.0
-    retorno_medio = retornos_limpios.mean() - rf_rate
-    retornos_negativos = retornos_limpios[retornos_limpios < 0]
-    downside_std = retornos_negativos.std()
-    if downside_std == 0 or np.isnan(downside_std):
-        return 0.0
-    return round(float(retorno_medio / downside_std * np.sqrt(len(retornos_limpios))), 2)
+def calcular_sortino_ratio(retornos: pd.Series, rf_rate: float = 0.0, factor_anual: float = 252.0) -> float:
+    r = retornos.dropna()
+    if len(r) < 2: return 0.0
+    ret_med = r.mean() - rf_rate
+    neg = r[r < 0]
+    if len(neg) == 0: return 99.0 if ret_med > 0 else 0.0
+    dd = np.sqrt((neg ** 2).mean())
+    return round(float((ret_med / dd) * np.sqrt(factor_anual)), 2) if dd > 0 else 0.0
 
-def calcular_var_95(retornos: pd.Series, capital: float = 10000.0) -> tuple:
-    retornos_limpios = retornos.dropna()
-    if len(retornos_limpios) < 5:
-        return 0.0, 0.0
-    var_pct = np.percentile(retornos_limpios, 5)
-    var_usd = abs(capital * (var_pct / 100.0))
-    return round(float(abs(var_pct)), 2), round(float(var_usd), 2)
+def calcular_var_cvar_95(retornos: pd.Series, capital: float = 10000.0) -> tuple:
+    r = retornos.dropna()
+    if len(r) < 5: return 0.0, 0.0, 0.0, 0.0
+    var_pct = np.percentile(r, 5)
+    cola = r[r <= var_pct]
+    cvar_pct = cola.mean() if len(cola) > 0 else var_pct
+    return (
+        round(float(abs(var_pct)), 2),
+        round(float(abs(capital * (var_pct / 100.0))), 2),
+        round(float(abs(cvar_pct)), 2),
+        round(float(abs(capital * (cvar_pct / 100.0))), 2),
+    )
 
 def calcular_profit_factor(df_ops: pd.DataFrame) -> float:
-    if df_ops.empty or 'Retorno %' not in df_ops.columns:
-        return 0.0
-    ganancias = df_ops[df_ops['Retorno %'] > 0]['Retorno %'].sum()
-    perdidas  = abs(df_ops[df_ops['Retorno %'] < 0]['Retorno %'].sum())
-    if perdidas == 0:
-        return round(float(ganancias), 2) if ganancias > 0 else 0.0
-    return round(float(ganancias / perdidas), 2)
+    if df_ops.empty or 'Retorno %' not in df_ops.columns: return 0.0
+    g = df_ops[df_ops['Retorno %'] > 0]['Retorno %'].sum()
+    p = abs(df_ops[df_ops['Retorno %'] < 0]['Retorno %'].sum())
+    return round(float(g / p), 2) if p > 0 else (round(float(g), 2) if g > 0 else 0.0)
 
 def calcular_criterio_kelly(win_rate_pct: float, avg_win: float, avg_loss: float) -> float:
-    if win_rate_pct <= 0 or avg_loss <= 0:
-        return 0.0
+    if win_rate_pct <= 0 or avg_loss <= 0 or avg_win <= 0: return 0.0
     p = win_rate_pct / 100.0
-    q = 1.0 - p
     b = abs(avg_win / avg_loss)
-    kelly = (b * p - q) / b
-    return round(float(max(0.0, kelly * 100.0)), 2)
+    return round(float(max(0.0, ((b * p - (1.0 - p)) / b) * 100.0)), 2)
 
-def calcular_volume_profile(df: pd.DataFrame, bins: int = 20) -> pd.DataFrame:
-    if 'Volume' not in df.columns or df['Volume'].sum() == 0:
-        return pd.DataFrame()
-    precio_min = float(df['Low'].min())
-    precio_max = float(df['High'].max())
-    rangos     = np.linspace(precio_min, precio_max, bins + 1)
-    vol_por_nivel = np.zeros(bins)
-
+def calcular_volume_profile(df: pd.DataFrame, bins: int = 24) -> pd.DataFrame:
+    if 'Volume' not in df.columns or df['Volume'].sum() == 0: return pd.DataFrame()
+    p_min, p_max = float(df['Low'].min()), float(df['High'].max())
+    rangos = np.linspace(p_min, p_max, bins + 1)
+    vol_nivel = np.zeros(bins)
     for _, row in df.iterrows():
-        idx_low  = np.searchsorted(rangos, float(row['Low']),  side='left')
-        idx_high = np.searchsorted(rangos, float(row['High']), side='right')
-        idx_low  = max(0, min(idx_low,  bins - 1))
-        idx_high = max(0, min(idx_high, bins))
-        n_niveles = max(1, idx_high - idx_low)
-        vol_por_nivel[idx_low:idx_high] += float(row['Volume']) / n_niveles
-
-    precio_mid = (rangos[:-1] + rangos[1:]) / 2
-    poc_idx    = np.argmax(vol_por_nivel)
-    return pd.DataFrame({
-        'precio': precio_mid,
-        'volumen': vol_por_nivel,
-        'poc': [i == poc_idx for i in range(bins)],
-    })
+        il = max(0, min(np.searchsorted(rangos, float(row['Low']), side='left'), bins - 1))
+        ih = max(0, min(np.searchsorted(rangos, float(row['High']), side='right'), bins))
+        vol_nivel[il:ih] += float(row['Volume']) / max(1, ih - il)
+    p_mid = (rangos[:-1] + rangos[1:]) / 2
+    poc_idx = np.argmax(vol_nivel)
+    return pd.DataFrame({'precio': p_mid, 'volumen': vol_nivel, 'poc': [i == poc_idx for i in range(bins)]})
 
 def detectar_soportes_resistencias(df: pd.DataFrame, orden: int = 10):
-    close    = df['Close'].values
-    idx_max  = argrelextrema(close, np.greater, order=orden)[0]
-    idx_min  = argrelextrema(close, np.less,    order=orden)[0]
-    resistencias = [(df.index[i], close[i]) for i in idx_max]
-    soportes     = [(df.index[i], close[i]) for i in idx_min]
-    return resistencias[-5:], soportes[-5:]
+    close = df['Close'].values
+    imax = argrelextrema(close, np.greater, order=orden)[0]
+    imin = argrelextrema(close, np.less, order=orden)[0]
+    return [(df.index[i], close[i]) for i in imax][-5:], [(df.index[i], close[i]) for i in imin][-5:]
 
 def volumen_anomalo(df: pd.DataFrame, factor: float = 2.0) -> pd.Series:
-    if 'Volume' not in df.columns:
-        return pd.Series(False, index=df.index)
-    vol_media = df['Volume'].rolling(20).mean()
-    return df['Volume'] > (factor * vol_media)
+    if 'Volume' not in df.columns: return pd.Series(False, index=df.index)
+    return df['Volume'] > (factor * df['Volume'].rolling(20).mean())
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SISTEMA DE PUNTUACIÓN Y SEÑALES
+# SISTEMA DE SEÑALES MULTIFACTOR
 # ══════════════════════════════════════════════════════════════════════════════
 def calcular_puntos(fila) -> tuple:
-    puntos  = 0
-    razones = []
-
+    puntos, razones = 0, []
     if 'VWAP' in fila.index and not pd.isna(fila['VWAP']):
         if float(fila['Close']) > float(fila['VWAP']):
-            puntos += 1
-            razones.append("✅ Precio sobre VWAP")
+            puntos += 1; razones.append(("VWAP Spread", "+1", "#10b981"))
         else:
-            puntos -= 1
-            razones.append("❌ Precio bajo VWAP")
+            puntos -= 1; razones.append(("VWAP Spread", "-1", "#f43f5e"))
 
     if 'SMA200' in fila.index and not pd.isna(fila['SMA200']):
         if float(fila['Close']) > float(fila['SMA200']):
-            puntos += 1
-            razones.append("✅ Tendencia macro alcista (>SMA200)")
+            puntos += 1; razones.append(("Macro > SMA200", "+1", "#10b981"))
         else:
-            puntos -= 1
-            razones.append("❌ Tendencia macro bajista (<SMA200)")
+            puntos -= 1; razones.append(("Macro < SMA200", "-1", "#f43f5e"))
 
     if float(fila['Close']) > float(fila['EMA50']):
-        puntos += 1
-        razones.append("✅ Precio sobre EMA50 (alcista)")
+        puntos += 1; razones.append(("Trend > EMA50", "+1", "#10b981"))
     else:
-        puntos -= 1
-        razones.append("❌ Precio bajo EMA50 (bajista)")
+        puntos -= 1; razones.append(("Trend < EMA50", "-1", "#f43f5e"))
 
     rsi_val = float(fila['RSI'])
     if rsi_val < 30:
-        puntos += 2
-        razones.append(f"✅ RSI sobrevendido ({rsi_val:.1f})")
+        puntos += 2; razones.append((f"RSI Oversold ({rsi_val:.1f})", "+2", "#10b981"))
     elif rsi_val > 70:
-        puntos -= 2
-        razones.append(f"❌ RSI sobrecomprado ({rsi_val:.1f})")
+        puntos -= 2; razones.append((f"RSI Overbought ({rsi_val:.1f})", "-2", "#f43f5e"))
     elif 40 <= rsi_val <= 60:
-        puntos += 1
-        razones.append(f"✅ RSI neutral ({rsi_val:.1f})")
+        puntos += 1; razones.append((f"RSI Neutral ({rsi_val:.1f})", "+1", "#3b82f6"))
 
     if float(fila['MACD']) > float(fila['MACD_SIGNAL']):
-        puntos += 1
-        razones.append("✅ MACD sobre señal")
+        puntos += 1; razones.append(("MACD Momentum", "+1", "#10b981"))
     else:
-        puntos -= 1
-        razones.append("❌ MACD bajo señal")
+        puntos -= 1; razones.append(("MACD Momentum", "-1", "#f43f5e"))
 
     if float(fila['Close']) < float(fila['BB_LOWER']):
-        puntos += 1
-        razones.append("✅ Precio bajo BB inferior")
+        puntos += 1; razones.append(("Bollinger -2σ", "+1", "#10b981"))
     elif float(fila['Close']) > float(fila['BB_UPPER']):
-        puntos -= 1
-        razones.append("❌ Precio sobre BB superior")
+        puntos -= 1; razones.append(("Bollinger +2σ", "-1", "#f43f5e"))
 
     adx_val = float(fila['ADX']) if 'ADX' in fila.index and not pd.isna(fila['ADX']) else 0
     if adx_val >= 25:
-        razones.append(f"✅ ADX {adx_val:.1f} — tendencia fuerte")
+        razones.append((f"ADX Trend ({adx_val:.1f})", "STRONG", "#10b981"))
     elif adx_val >= 15:
-        razones.append(f"⚠️ ADX {adx_val:.1f} — tendencia moderada")
+        razones.append((f"ADX Regime ({adx_val:.1f})", "MOD", "#f59e0b"))
     else:
         puntos = max(-1, min(1, puntos))
-        razones.append(f"⚠️ ADX {adx_val:.1f} — sin tendencia clara")
+        razones.append((f"ADX Chop ({adx_val:.1f})", "FLAT", "#64748b"))
 
     return puntos, razones, rsi_val, adx_val
 
 def generar_senal(df: pd.DataFrame) -> dict:
     ultima = df.iloc[-1]
     puntos, razones, rsi_val, adx_val = calcular_puntos(ultima)
-
-    if   puntos >= 4:  senal, color = "🟢 COMPRA FUERTE", "#00ff88"
-    elif puntos >= 2:  senal, color = "🟡 COMPRA DÉBIL",  "#ffd700"
-    elif puntos <= -4: senal, color = "🔴 VENTA FUERTE",  "#ff4444"
-    elif puntos <= -2: senal, color = "🟠 VENTA DÉBIL",   "#ff8c00"
-    else:              senal, color = "⚪ NEUTRAL",        "#aaaaaa"
+    if   puntos >= 4:  senal, color = "STRONG LONG",  "#10b981"
+    elif puntos >= 2:  senal, color = "ACCUMULATE",   "#3b82f6"
+    elif puntos <= -4: senal, color = "STRONG SHORT", "#f43f5e"
+    elif puntos <= -2: senal, color = "DISTRIBUTE",   "#f59e0b"
+    else:              senal, color = "NEUTRAL",      "#94a3b8"
 
     atr_val = float(ultima['ATR']) if not pd.isna(ultima['ATR']) else 0
     precio  = float(ultima['Close'])
-
     return {
-        "senal": senal, "color": color, "puntos": puntos,
-        "razones": razones,
-        "sl": precio - 2 * atr_val,
-        "tp": precio + 3 * atr_val,
+        "senal": senal, "color": color, "puntos": puntos, "razones": razones,
+        "sl": precio - 2 * atr_val, "tp": precio + 3 * atr_val,
         "atr": atr_val, "rsi": rsi_val, "adx": adx_val,
     }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MODELO MACHINE LEARNING DE PROBABILIDAD DE ACIERTO
-# (fix: ahora cacheado — antes se reentrenaba en CADA rerun de Streamlit,
-# incluso al tocar un checkbox del sidebar sin relación con el modelo)
-# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=300, show_spinner=False)
-def predecir_probabilidad_ml(df: pd.DataFrame) -> tuple:
+def predecir_probabilidad_ml(df: pd.DataFrame) -> dict:
     if not ML_OK or len(df) < 60:
-        return None, "ML no disponible o datos insuficientes."
-
+        return {"prob": None, "acc": None, "importances": {}, "msg": "Insufficient sample"}
     df_ml = df.copy()
     df_ml['Retorno_Futuro'] = (df_ml['Close'].shift(-3) - df_ml['Close']) / df_ml['Close']
     df_ml['Target'] = (df_ml['Retorno_Futuro'] > 0.01).astype(int)
-
-    features = ['RSI', 'ADX', 'MACD_HIST', 'ATR']
     df_ml['EMA_DIFF'] = (df_ml['Close'] - df_ml['EMA50']) / df_ml['EMA50']
-    features.append('EMA_DIFF')
+    df_ml['BB_WIDTH'] = (df_ml['BB_UPPER'] - df_ml['BB_LOWER']) / df_ml['BB_MID'].replace(0, np.nan)
+    df_ml['RET_5D']   = df_ml['Close'].pct_change(5)
 
-    df_ml.dropna(subset=features + ['Target'], inplace=True)
-    if len(df_ml) < 40:
-        return None, "Insuficientes muestras limpias."
+    features = ['RSI', 'ADX', 'MACD_HIST', 'ATR', 'EMA_DIFF', 'BB_WIDTH', 'RET_5D']
+    df_valid = df_ml.dropna(subset=features).copy()
+    if len(df_valid) < 45:
+        return {"prob": None, "acc": None, "importances": {}, "msg": "Insufficient clean rows"}
 
-    X = df_ml[features].values[:-1]
-    y = df_ml['Target'].values[:-1]
-    X_actual = df_ml[features].values[-1:]
+    X_actual = df_valid[features].values[-1:]
+    df_hist  = df_valid.iloc[:-3].dropna(subset=['Target'])
+    if len(df_hist) < 35:
+        return {"prob": None, "acc": None, "importances": {}, "msg": "Short history"}
 
+    X, y = df_hist[features].values, df_hist['Target'].values
+    split_idx = max(20, int(len(X) * 0.8))
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_act_scaled = scaler.transform(X_actual)
+    X_train_s = scaler.fit_transform(X[:split_idx])
+    X_test_s  = scaler.transform(X[split_idx:]) if len(X[split_idx:]) > 0 else X_train_s
 
-    clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
-    clf.fit(X_scaled, y)
+    clf = RandomForestClassifier(n_estimators=80, max_depth=4, min_samples_leaf=3, random_state=42)
+    clf.fit(X_train_s, y[:split_idx])
+    acc = round(float(accuracy_score(y[split_idx:], clf.predict(X_test_s)) * 100.0), 1) if len(y[split_idx:]) > 0 else 50.0
 
-    prob = clf.predict_proba(X_act_scaled)[0][1] * 100.0
-    return round(float(prob), 1), "Modelo IA RandomForest calibrado ✓"
+    X_all_s = scaler.fit_transform(X)
+    clf.fit(X_all_s, y)
+    X_act_s = scaler.transform(X_actual)
+    clases = list(clf.classes_)
+    prob = clf.predict_proba(X_act_s)[0][clases.index(1)] * 100.0 if 1 in clases else 0.0
+    importances = dict(zip(features, np.round(clf.feature_importances_ * 100, 1)))
+    return {"prob": round(float(prob), 1), "acc": acc, "importances": importances, "msg": f"OOS Acc: {acc}%"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA ENGINE - INGESTIÓN MULTIFUENTE & ORDER BOOK
+# DATA ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-PERIOD_DAYS     = {"1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 732}
-PERIOD_OUTPUT   = {"1mo": 35, "3mo": 95, "6mo": 190, "1y": 370, "2y": 740}
-TD_BASE_URL     = "https://api.twelvedata.com/time_series"
-BINANCE_BASE    = "https://api.binance.com/api/v3/klines"
+PERIOD_DAYS       = {"1mo": 31, "3mo": 92, "6mo": 183, "1y": 366, "2y": 732}
+PERIOD_OUTPUT     = {"1mo": 35, "3mo": 95, "6mo": 190, "1y": 370, "2y": 740}
+TD_BASE_URL       = "https://api.twelvedata.com/time_series"
+BINANCE_BASE      = "https://api.binance.com/api/v3/klines"
 BINANCE_INTERVALS = {"1mo": ("1d", 35), "3mo": ("1d", 95), "6mo": ("1d", 190), "1y": ("1d", 370), "2y": ("1d", 740)}
-BINANCE_MTF = {"4H": ("4h", 180), "1D": ("1d", 200), "1W": ("1w", 104)}
-YF_MTF      = {"4H": ("4h", "60d"), "1D": ("1d", "1y"), "1W": ("1wk", "2y")}
+BINANCE_MTF       = {"4H": ("4h", 180), "1D": ("1d", 200), "1W": ("1w", 104)}
+YF_MTF            = {"4H": ("4h", "60d"), "1D": ("1d", "1y"), "1W": ("1wk", "2y")}
 
 def _binance_download(ticker: str, period: str) -> pd.DataFrame:
     sym = BINANCE_SYMBOLS.get(ticker)
-    if not sym:
-        return pd.DataFrame()
+    if not sym: return pd.DataFrame()
     interval, limit = BINANCE_INTERVALS.get(period, ("1d", 190))
     try:
         resp = requests.get(BINANCE_BASE, params={"symbol": sym, "interval": interval, "limit": limit}, timeout=10)
-        if not resp.ok:
-            return pd.DataFrame()
+        if not resp.ok: return pd.DataFrame()
         raw = resp.json()
-        if not isinstance(raw, list) or not raw:
-            return pd.DataFrame()
-        df = pd.DataFrame(raw, columns=[
-            "open_time","Open","High","Low","Close","Volume",
-            "close_time","qav","trades","tbbav","tbqav","ignore"
-        ])
+        if not isinstance(raw, list) or not raw: return pd.DataFrame()
+        df = pd.DataFrame(raw, columns=["open_time","Open","High","Low","Close","Volume","close_time","qav","trades","tbbav","tbqav","ignore"])
         for c in ["Open","High","Low","Close","Volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df.index = pd.to_datetime(df["open_time"], unit="ms")
@@ -489,15 +645,12 @@ def _binance_download(ticker: str, period: str) -> pd.DataFrame:
     except requests.RequestException:
         return pd.DataFrame()
 
-def obtener_order_book_binance(ticker: str) -> pd.DataFrame:
+def obtener_order_book_binance(ticker: str) -> tuple:
     sym = BINANCE_SYMBOLS.get(ticker)
-    if not sym:
-        return pd.DataFrame(), pd.DataFrame()
+    if not sym: return pd.DataFrame(), pd.DataFrame()
     try:
-        url = f"https://api.binance.com/api/v3/depth?symbol={sym}&limit=20"
-        resp = requests.get(url, timeout=5)
-        if not resp.ok:
-            return pd.DataFrame(), pd.DataFrame()
+        resp = requests.get(f"https://api.binance.com/api/v3/depth?symbol={sym}&limit=15", timeout=5)
+        if not resp.ok: return pd.DataFrame(), pd.DataFrame()
         data = resp.json()
         bids = pd.DataFrame(data['bids'], columns=['Precio', 'Cantidad'], dtype=float)
         asks = pd.DataFrame(data['asks'], columns=['Precio', 'Cantidad'], dtype=float)
@@ -509,26 +662,21 @@ def obtener_order_book_binance(ticker: str) -> pd.DataFrame:
 
 def _td_download(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
     key = (td_key or "").strip()
-    if not key:
-        return pd.DataFrame()
+    if not key: return pd.DataFrame()
     t = ticker.replace("-USD", "/USD").replace("-", "/")
     sym = t[1:] if t.startswith("^") else t
-    outsize  = PERIOD_OUTPUT.get(period, 190)
-    params   = {"symbol": sym, "interval": "1day", "outputsize": outsize, "apikey": key, "format": "JSON", "order": "ASC"}
+    params = {"symbol": sym, "interval": "1day", "outputsize": PERIOD_OUTPUT.get(period, 190), "apikey": key, "format": "JSON", "order": "ASC"}
     try:
-        resp = requests.get(TD_BASE_URL, params=params, timeout=15)
-        if not resp.ok:
-            return pd.DataFrame()
+        resp = requests.get(TD_BASE_URL, params=params, timeout=12)
+        if not resp.ok: return pd.DataFrame()
         data = resp.json()
-        if data.get("status") == "error" or "values" not in data:
-            return pd.DataFrame()
+        if data.get("status") == "error" or "values" not in data: return pd.DataFrame()
         df = pd.DataFrame(data["values"])
         df["datetime"] = pd.to_datetime(df["datetime"])
         df.set_index("datetime", inplace=True)
         df.index.name = None
         for col in ["open", "high", "low", "close", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
         df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
         return df[["Open","High","Low","Close","Volume"]].dropna(subset=["Close"])
     except requests.RequestException:
@@ -539,89 +687,64 @@ def _yf_fallback(ticker: str, period: str) -> pd.DataFrame:
     today = datetime.today()
     start = (today - pd.Timedelta(days=dias)).strftime("%Y-%m-%d")
     end   = (today + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-
-    for intento in range(3):
+    for intento in range(2):
         try:
-            df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True, timeout=15)
+            df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True, timeout=12)
             if not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = [col[0] for col in df.columns]
-                cols_validas = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-                return df[cols_validas]
-
-            df2 = yf.Ticker(ticker).history(start=start, end=end)
-            if not df2.empty:
-                return df2
-            return pd.DataFrame()
-        except Exception as e:
-            if "RateLimit" in type(e).__name__ and intento < 2:
-                time.sleep(2 ** (intento + 1))
-                continue
-            break
+                return df[[c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]]
+        except Exception:
+            time.sleep(1)
     return pd.DataFrame()
 
-def _descargar_raw(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
-    if ticker in BINANCE_SYMBOLS:
-        df = _binance_download(ticker, period)
-        if not df.empty:
-            return df
-    df = _td_download(ticker, period, td_key)
-    if df.empty:
-        df = _yf_fallback(ticker, period)
-    return df
-
-# (fix: función compartida para calcular indicadores — antes estaba duplicada
-# íntegramente en get_data() y get_data_mtf(), con riesgo de que ambas
-# copias se desincronizaran al modificar un indicador)
 def _agregar_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     close = df["Close"]
-    df["EMA20"]                                    = close.ewm(span=20, adjust=False).mean()
-    df["EMA50"]                                    = close.ewm(span=50, adjust=False).mean()
-    df["SMA200"]                                   = calcular_sma(close, 200)
-    df["VWAP"]                                     = calcular_vwap(df)
-    df["ADR_PCT"]                                  = calcular_adr(df, 14)
-    df["RSI"]                                      = calcular_rsi(close)
+    df["EMA20"]  = close.ewm(span=20, adjust=False).mean()
+    df["EMA50"]  = close.ewm(span=50, adjust=False).mean()
+    df["SMA200"] = close.rolling(200).mean()
+    df["VWAP"]   = calcular_vwap(df)
+    df["ADR_PCT"]= calcular_adr(df, 14)
+    df["RSI"]    = calcular_rsi(close)
     df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = calcular_macd(close)
     df["BB_UPPER"], df["BB_MID"], df["BB_LOWER"]   = calcular_bollinger(close)
-    df["ATR"]                                      = calcular_atr(df)
-    df["ADX"]                                      = calcular_adx(df)
-    df["STOCH_K"], df["STOCH_D"]                   = calcular_stoch_rsi(close)
+    df["ATR"]    = calcular_atr(df)
+    df["ADX"]    = calcular_adx(df)
+    df["STOCH_K"], df["STOCH_D"] = calcular_stoch_rsi(close)
     if "Volume" in df.columns:
         df["VOL_ANOMALO"] = volumen_anomalo(df)
     return df
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_data(ticker: str, period: str, td_key: str = "") -> pd.DataFrame:
-    try:
-        df = _descargar_raw(ticker, period, td_key)
-    except Exception:
-        return pd.DataFrame()
+    df = pd.DataFrame()
+    if ticker in BINANCE_SYMBOLS:
+        df = _binance_download(ticker, period)
+    if df.empty:
+        df = _td_download(ticker, period, td_key)
+    if df.empty:
+        df = _yf_fallback(ticker, period)
     if df.empty:
         return pd.DataFrame()
-
     if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
         df.index = df.index.tz_localize(None)
-
     df = df[[c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]].copy()
     df.dropna(subset=["Close"], inplace=True)
-    df = _agregar_indicadores(df)
-    return df
+    return _agregar_indicadores(df)
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_close_only(ticker: str, period: str, td_key: str = "") -> pd.Series:
     df = get_data(ticker, period, td_key)
-    if df.empty:
-        return pd.Series(dtype=float, name=ticker)
-    return df["Close"].rename(ticker)
+    return df["Close"].rename(ticker) if not df.empty else pd.Series(dtype=float, name=ticker)
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=120, show_spinner=False)
 def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
     df = pd.DataFrame()
     if ticker in BINANCE_SYMBOLS:
         sym = BINANCE_SYMBOLS[ticker]
         interval, limit = BINANCE_MTF[tf]
         try:
-            resp = requests.get(BINANCE_BASE, params={"symbol": sym, "interval": interval, "limit": limit}, timeout=10)
+            resp = requests.get(BINANCE_BASE, params={"symbol": sym, "interval": interval, "limit": limit}, timeout=8)
             if resp.ok:
                 raw = resp.json()
                 if isinstance(raw, list) and raw:
@@ -629,11 +752,9 @@ def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
                     for col in ["Open","High","Low","Close","Volume"]:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
                     df.index = pd.to_datetime(df["open_time"], unit="ms")
-                    df.index.name = None
                     df = df[["Open","High","Low","Close","Volume"]].dropna(subset=["Close"])
         except requests.RequestException:
             pass
-
     if df.empty:
         yf_interval, yf_period = YF_MTF[tf]
         try:
@@ -641,920 +762,655 @@ def get_data_mtf(ticker: str, tf: str) -> pd.DataFrame:
             if not raw.empty:
                 if isinstance(raw.columns, pd.MultiIndex):
                     raw.columns = [col[0] for col in raw.columns]
-                cols_validas = [c for c in ["Open","High","Low","Close","Volume"] if c in raw.columns]
-                df = raw[cols_validas].dropna(subset=["Close"])
+                df = raw[[c for c in ["Open","High","Low","Close","Volume"] if c in raw.columns]].dropna(subset=["Close"])
         except Exception:
             pass
-
-    if df.empty:
-        return pd.DataFrame()
-
+    if df.empty: return pd.DataFrame()
     if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
         df.index = df.index.tz_localize(None)
+    return _agregar_indicadores(df)
 
-    df = _agregar_indicadores(df)
-    return df
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RADAR / SCREENER — FETCH COMPARTIDO Y CACHEADO
-# (fix: antes Tab "Señales" y Tab "Screener" duplicaban el mismo fetch masivo
-# de ~40 tickers sin compartir caché entre sí)
-# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=300, show_spinner=False)
 def obtener_radar_completo(period: str, td_key: str) -> pd.DataFrame:
     todos = {**ACCIONES, **CRYPTOS}
     filas = []
-
-    def _fetch_fila(item):
+    def _fetch(item):
         nm, sym = item
         d = get_data(sym, period, td_key=td_key)
-        if d.empty:
-            return None
+        if d.empty: return None
         inf = generar_senal(d)
         p = float(d['Close'].iloc[-1])
         pv = float(d['Close'].iloc[-2]) if len(d) > 1 else p
         return {
-            "Activo": nm, "Ticker": sym, "Precio": p,
-            "Cambio %": round(((p / pv) - 1) * 100, 2), "RSI": round(float(d['RSI'].iloc[-1]), 1),
-            "ADX": round(float(d['ADX'].iloc[-1]), 1) if 'ADX' in d.columns else 0,
-            "Señal": inf['senal'], "Puntos": inf['puntos']
+            "Instrument": nm, "Ticker": sym,
+            "Class": "CRYPTO" if sym in CRYPTOS.values() else "EQUITY",
+            "Last Px": round(p, 4),
+            "1D Chg %": round(((p / pv) - 1) * 100, 2),
+            "RSI(14)": round(float(d['RSI'].iloc[-1]), 1),
+            "ADX(14)": round(float(d['ADX'].iloc[-1]), 1) if 'ADX' in d.columns else 0,
+            "Stance": inf['senal'], "Score": inf['puntos']
         }
-
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = [ex.submit(_fetch_fila, item) for item in todos.items()]
-        for f in as_completed(futures):
+        for f in as_completed([ex.submit(_fetch, i) for i in todos.items()]):
             r = f.result()
-            if r:
-                filas.append(r)
+            if r: filas.append(r)
+    return pd.DataFrame(filas).sort_values("Score", ascending=False) if filas else pd.DataFrame()
 
-    if not filas:
-        return pd.DataFrame()
-    return pd.DataFrame(filas).sort_values("Puntos", ascending=False)
+@st.cache_data(ttl=600, show_spinner=False)
+def obtener_matriz_correlacion(tickers_tuple: tuple, period: str, td_key: str) -> pd.DataFrame:
+    series_l = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for f in as_completed([ex.submit(get_close_only, s, period, td_key) for s in tickers_tuple]):
+            s = f.result()
+            if not s.empty: series_l.append(s)
+    return pd.concat(series_l, axis=1).dropna().pct_change().corr() if series_l else pd.DataFrame()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SERVICIO IA - GROQ PROVIDER
-# ══════════════════════════════════════════════════════════════════════════════
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-# (fix: llama-3.3-70b-versatile fue deprecado por Groq el 17/06/2026 → causaba
-# el Error HTTP 404. Migrado al reemplazo recomendado por Groq.)
-GROQ_MODEL   = "openai/gpt-oss-120b"
-
-def _groq_headers() -> dict:
-    h = {"Content-Type": "application/json"}
-    k = st.session_state.get("groq_api_key", "").strip()
-    if k:
-        h["Authorization"] = f"Bearer {k}"
-    return h
-
-def _ia_activa() -> bool:
-    return bool(st.session_state.get("groq_api_key", "").strip())
-
-def _groq(system: str, user: str, max_tokens: int = 1000) -> str:
-    if not _ia_activa():
-        return "❌ API key no configurada."
-    payload = {
-        "model": GROQ_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+@st.cache_data(ttl=600, show_spinner=False)
+def optimizar_markowitz(tickers_tuple: tuple, period: str, td_key: str, rf_rate: float = 0.04, n_portfolios: int = 2500) -> dict:
+    series_dict = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(get_close_only, sym, period, td_key): sym for sym in tickers_tuple}
+        for f in as_completed(futures):
+            s = f.result()
+            if not s.empty: series_dict[futures[f]] = s
+    valid_tickers = [t for t in tickers_tuple if t in series_dict]
+    if len(valid_tickers) < 2:
+        return {"ok": False, "msg": "Select at least 2 valid instruments."}
+    df_prices = pd.DataFrame({t: series_dict[t] for t in valid_tickers}).dropna()
+    if len(df_prices) < 20:
+        return {"ok": False, "msg": "Insufficient overlapping price history."}
+    ret = df_prices.pct_change().dropna()
+    mean_ret = ret.mean().values * 252.0
+    cov_mat  = ret.cov().values * 252.0
+    rng = np.random.default_rng(42)
+    weights = rng.random((n_portfolios, len(valid_tickers)))
+    weights /= weights.sum(axis=1)[:, np.newaxis]
+    port_ret = np.dot(weights, mean_ret) * 100.0
+    port_vol = np.sqrt(np.einsum('ij,jk,ik->i', weights, cov_mat, weights)) * 100.0
+    port_sr  = np.where(port_vol > 0, (port_ret - rf_rate * 100.0) / port_vol, 0.0)
+    ims, imv = int(np.argmax(port_sr)), int(np.argmin(port_vol))
+    return {
+        "ok": True, "tickers": valid_tickers,
+        "nube": pd.DataFrame({"Volatilidad %": np.round(port_vol, 2), "Retorno Esperado %": np.round(port_ret, 2), "Sharpe": np.round(port_sr, 2)}),
+        "mean_ret": mean_ret * 100.0, "cov_mat": cov_mat * 10000.0,
+        "max_sharpe": {"weights": dict(zip(valid_tickers, np.round(weights[ims]*100, 2))), "retorno": round(float(port_ret[ims]), 2), "vol": round(float(port_vol[ims]), 2), "sharpe": round(float(port_sr[ims]), 2)},
+        "min_vol":    {"weights": dict(zip(valid_tickers, np.round(weights[imv]*100, 2))), "retorno": round(float(port_ret[imv]), 2), "vol": round(float(port_vol[imv]), 2), "sharpe": round(float(port_sr[imv]), 2)},
     }
-    try:
-        resp = requests.post(GROQ_API_URL, headers=_groq_headers(), json=payload, timeout=30)
-        if not resp.ok:
-            if resp.status_code == 401: return "❌ API key inválida."
-            if resp.status_code == 429: return "⚠️ Rate limit alcanzado."
-            return f"❌ Error HTTP {resp.status_code}"
-        return resp.json()["choices"][0]["message"]["content"]
-    except requests.RequestException as e:
-        return f"❌ Error de conexión: {e}"
-
-def _resumen_tecnico(ticker: str, df: pd.DataFrame, info: dict) -> str:
-    last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else last
-    chg  = ((float(last["Close"]) / float(prev["Close"])) - 1) * 100
-    return f"""
-Ticker: {ticker}
-Precio: ${float(last["Close"]):,.4f} ({chg:+.2f}% hoy)
-SMA200: {float(last.get("SMA200", 0)):,.4f} | VWAP: {float(last.get("VWAP", 0)):,.4f}
-EMA20: {float(last["EMA20"]):,.4f} | EMA50: {float(last["EMA50"]):,.4f}
-ADR(14): {float(last.get("ADR_PCT", 0)):.2f}% | ATR(14): {float(last["ATR"]):,.4f}
-RSI(14): {float(last["RSI"]):.1f} | ADX(14): {float(last["ADX"]):.1f}
-MACD: {float(last["MACD"]):.4f} | Señal: {float(last["MACD_SIGNAL"]):.4f}
-SL sugerido: ${info["sl"]:,.4f} | TP sugerido: ${info["tp"]:,.4f}
-Señal de Sistema: {info["senal"]} (puntuación: {info["puntos"]:+d})
-Razones: {"; ".join(info["razones"])}
-""".strip()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MOTOR DE BACKTESTING
+# BACKTESTER, FINVIZ, PATRONES & GROQ
 # ══════════════════════════════════════════════════════════════════════════════
 def backtest_estrategia(df: pd.DataFrame, umbral_compra: int = 2, umbral_venta: int = -2,
-                        comision_pct: float = 0.1, usar_sl_tp: bool = True,
-                        mult_sl: float = 2.0, mult_tp: float = 3.0) -> dict:
-    resultados = []
-    en_posicion = False
+                        comision_pct: float = 0.1, usar_sl_tp: bool = True, es_crypto: bool = False) -> dict:
+    resultados, en_posicion = [], False
     precio_entrada, fecha_entrada, senal_entrada, idx_entrada = 0.0, None, "", -1
     sl_nivel, tp_nivel = None, None
-
-    puntos_serie = []
-    for i in range(len(df)):
-        if i < 50:
-            puntos_serie.append(0)
-            continue
-        try:
-            p, _, _, _ = calcular_puntos(df.iloc[i])
-        except Exception:
-            p = 0
-        puntos_serie.append(p)
-
+    pts = [calcular_puntos(df.iloc[i])[0] if i >= 50 else 0 for i in range(len(df))]
     df = df.copy()
-    df['_puntos'] = puntos_serie
+    df['_puntos'] = pts
 
-    def _cerrar(precio_out, fecha_out, motivo):
-        retorno_bruto = (precio_out - precio_entrada) / precio_entrada * 100
-        retorno  = retorno_bruto - (comision_pct * 2)
-        duracion = (fecha_out - fecha_entrada).days if hasattr(fecha_out - fecha_entrada, 'days') else 1
+    def _cerrar(p_out, f_out, motivo):
+        rb = (p_out - precio_entrada) / precio_entrada * 100
+        r  = rb - (comision_pct * 2)
+        d  = max(1, (f_out - fecha_entrada).days) if hasattr(f_out - fecha_entrada, 'days') else 1
         resultados.append({
-            "Entrada": fecha_entrada.strftime("%d/%m/%Y") if hasattr(fecha_entrada, 'strftime') else str(fecha_entrada),
-            "Salida": fecha_out.strftime("%d/%m/%Y") if hasattr(fecha_out, 'strftime') else str(fecha_out),
-            "Precio entrada": round(precio_entrada, 4),
-            "Precio salida": round(precio_out, 4),
-            "Retorno bruto %": round(retorno_bruto, 2),
-            "Retorno %": round(retorno, 2),
-            "Días": duracion,
-            "Señal entrada": senal_entrada,
-            "Salida por": motivo,
-            "Resultado": "✅ Ganada" if retorno > 0 else "❌ Perdida",
+            "Entry Date": fecha_entrada.strftime("%Y-%m-%d") if hasattr(fecha_entrada, 'strftime') else str(fecha_entrada),
+            "Exit Date": f_out.strftime("%Y-%m-%d") if hasattr(f_out, 'strftime') else str(f_out),
+            "Fecha_Salida_DT": f_out, "Entry Px": round(precio_entrada, 4), "Exit Px": round(p_out, 4),
+            "Gross %": round(rb, 2), "Retorno %": round(r, 2), "Days": d,
+            "Score": senal_entrada, "Trigger": motivo, "Result": "WIN" if r > 0 else "LOSS"
         })
 
     for i in range(51, len(df) - 1):
-        pts_hoy    = df['_puntos'].iloc[i]
-        precio_sig = float(df['Close'].iloc[i + 1])
-        fecha_sig  = df.index[i + 1]
-
+        ph, psig, fsig = df['_puntos'].iloc[i], float(df['Open'].iloc[i + 1]), df.index[i + 1]
         if not en_posicion:
-            if pts_hoy >= umbral_compra:
-                en_posicion = True
-                precio_entrada = precio_sig
-                fecha_entrada  = fecha_sig
-                senal_entrada  = f"+{pts_hoy}"
-                idx_entrada    = i + 1
+            if ph >= umbral_compra:
+                en_posicion, precio_entrada, fecha_entrada, senal_entrada, idx_entrada = True, psig, fsig, f"{ph:+d}", i + 1
                 sl_nivel = tp_nivel = None
                 if usar_sl_tp and 'ATR' in df.columns:
-                    atr_e = df['ATR'].iloc[i + 1]
-                    if not pd.isna(atr_e) and float(atr_e) > 0:
-                        sl_nivel = precio_entrada - mult_sl * float(atr_e)
-                        tp_nivel = precio_entrada + mult_tp * float(atr_e)
+                    atr_p = df['ATR'].iloc[i]
+                    if not pd.isna(atr_p) and float(atr_p) > 0:
+                        sl_nivel, tp_nivel = precio_entrada - 2.0 * float(atr_p), precio_entrada + 3.0 * float(atr_p)
         else:
-            if sl_nivel is not None and i > idx_entrada:
+            if sl_nivel is not None and i >= idx_entrada:
                 lo, hi = float(df['Low'].iloc[i]), float(df['High'].iloc[i])
-                if lo <= sl_nivel:
-                    _cerrar(sl_nivel, df.index[i], "🛑 Stop Loss")
-                    en_posicion = False
-                    continue
-                if hi >= tp_nivel:
-                    _cerrar(tp_nivel, df.index[i], "🎯 Take Profit")
-                    en_posicion = False
-                    continue
-            if pts_hoy <= umbral_venta or i == len(df) - 2:
-                motivo = "📉 Señal contraria" if pts_hoy <= umbral_venta else "🏁 Fin de datos"
-                _cerrar(precio_sig, fecha_sig, motivo)
-                en_posicion = False
+                if lo <= sl_nivel: _cerrar(sl_nivel, df.index[i], "STOP_LOSS"); en_posicion = False; continue
+                if hi >= tp_nivel: _cerrar(tp_nivel, df.index[i], "TAKE_PROFIT"); en_posicion = False; continue
+            if ph <= umbral_venta or i == len(df) - 2:
+                _cerrar(psig, fsig, "REVERSAL" if ph <= umbral_venta else "END_SAMPLE"); en_posicion = False
 
     if not resultados:
-        return {"ops": pd.DataFrame(), "win_rate": 0, "retorno_total": 0, "retorno_bh": 0, "n_ops": 0, "promedio_op": 0, "max_ganancia": 0, "max_perdida": 0, "sharpe": 0, "sortino": 0, "profit_factor": 0, "max_drawdown": 0}
+        return {"ops": pd.DataFrame(), "equity_df": pd.DataFrame(), "win_rate": 0, "retorno_total": 0, "retorno_bh": 0, "n_ops": 0, "sharpe": 0, "sortino": 0, "calmar": 0, "profit_factor": 0, "max_drawdown": 0}
 
-    df_ops   = pd.DataFrame(resultados)
-    n_ops    = len(df_ops)
-    ganadas  = (df_ops['Retorno %'] > 0).sum()
-    win_rate = round(ganadas / n_ops * 100, 1) if n_ops > 0 else 0
-    ret_bh   = round((float(df['Close'].iloc[-1]) / float(df['Close'].iloc[50]) - 1) * 100, 2)
-
+    df_ops = pd.DataFrame(resultados)
+    n_ops = len(df_ops)
+    win_rate = round((df_ops['Retorno %'] > 0).sum() / n_ops * 100, 1)
+    ret_bh = round((float(df['Close'].iloc[-1]) / float(df['Close'].iloc[50]) - 1) * 100, 2)
     retornos = df_ops['Retorno %']
-    sharpe   = round(retornos.mean() / retornos.std() * np.sqrt(n_ops), 2) if retornos.std() > 0 else 0
-    sortino  = calcular_sortino_ratio(retornos)
-    pfactor  = calcular_profit_factor(df_ops)
-    equity   = (1 + retornos / 100).cumprod()
+    dias_tot = max(1, (df.index[-1] - df.index[50]).days)
+    t_anio = max(1.0, n_ops * ((365.0 if es_crypto else 252.0) / dias_tot))
+    sharpe = round(float(retornos.mean() / retornos.std() * np.sqrt(t_anio)), 2) if len(retornos) > 1 and retornos.std() > 0 else 0.0
+    sortino = calcular_sortino_ratio(retornos, 0.0, t_anio)
+    pfactor = calcular_profit_factor(df_ops)
+    equity = (1 + retornos / 100).cumprod()
     ret_comp = round(float(equity.iloc[-1] - 1) * 100, 2)
-    drawdown = (equity / equity.cummax() - 1) * 100
-    max_dd   = round(float(drawdown.min()), 2)
+    max_dd = round(float(((equity / equity.cummax() - 1) * 100).min()), 2)
+    calmar = round(float(ret_comp / abs(max_dd)), 2) if max_dd < 0 else 0.0
 
+    eq_df = pd.DataFrame(index=df.index[50:])
+    eq_df["Buy & Hold"] = (df['Close'].iloc[50:] / float(df['Close'].iloc[50])) * 100.0
+    eq_s = pd.Series(index=df.index[50:], dtype=float)
+    eq_s.iloc[0] = 100.0
+    for idx_op, row_op in df_ops.iterrows():
+        if row_op["Fecha_Salida_DT"] in eq_s.index:
+            eq_s.loc[row_op["Fecha_Salida_DT"]] = float(equity.iloc[idx_op]) * 100.0
+    eq_df["Estrategia"] = eq_s.ffill().fillna(100.0)
+    eq_df["Drawdown %"] = (eq_df["Estrategia"] / eq_df["Estrategia"].cummax() - 1.0) * 100.0
     return {
-        "ops": df_ops, "win_rate": win_rate, "retorno_total": ret_comp, "retorno_bh": ret_bh,
-        "n_ops": n_ops, "promedio_op": round(retornos.mean(), 2), "max_ganancia": round(retornos.max(), 2),
-        "max_perdida": round(retornos.min(), 2), "sharpe": sharpe, "sortino": sortino, "profit_factor": pfactor, "max_drawdown": max_dd,
+        "ops": df_ops.drop(columns=["Fecha_Salida_DT"]), "equity_df": eq_df,
+        "win_rate": win_rate, "retorno_total": ret_comp, "retorno_bh": ret_bh, "n_ops": n_ops,
+        "sharpe": sharpe, "sortino": sortino, "calmar": calmar, "profit_factor": pfactor, "max_drawdown": max_dd
     }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SCRAPING EN FINVIZ CON RESILIENCIA HTTP
-# (fix: except ampliado — el parseo de BeautifulSoup puede lanzar excepciones
-# que no son requests.RequestException, y antes esas tumbaban el tab)
-# ══════════════════════════════════════════════════════════════════════════════
-FINVIZ_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
-
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def finviz_scrape(ticker: str) -> dict:
-    result = {"news": [], "fundamentals": {}, "ok": False}
-    if not BS4_OK or "-USD" in ticker or ticker.startswith("^"):
-        return result
+    res = {"news": [], "fundamentals": {}, "ok": False}
+    if not BS4_OK or "-USD" in ticker or ticker.startswith("^"): return res
     try:
-        url  = f"https://finviz.com/quote.ashx?t={ticker}&p=d"
-        resp = requests.get(url, headers=FINVIZ_HEADERS, timeout=10)
-        if not resp.ok:
-            return result
+        resp = requests.get(f"https://finviz.com/quote.ashx?t={ticker}&p=d", headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if not resp.ok: return res
         soup = BeautifulSoup(resp.text, "html.parser")
-
-        fundamentals = {}
-        tabla = soup.find("table", class_="snapshot-table2") or soup.find("table", {"class": lambda c: c and "snapshot" in c})
+        tabla = soup.find("table", class_="snapshot-table2")
         if tabla:
             celdas = tabla.find_all("td")
             for i in range(0, len(celdas) - 1, 2):
-                key = celdas[i].get_text(strip=True)
-                val = celdas[i+1].get_text(strip=True)
-                if key and val:
-                    fundamentals[key] = val
-
-        noticias = []
-        tabla_news = soup.find("table", id="news-table")
-        if tabla_news:
-            fecha_actual = ""
-            for fila in tabla_news.find_all("tr")[:20]:
-                celdas = fila.find_all("td")
-                if len(celdas) < 2: continue
-                fecha_td = celdas[0].get_text(strip=True)
-                if any(c.isalpha() for c in fecha_td):
-                    partes = fecha_td.split()
-                    fecha_actual = partes[0] if len(partes) > 1 else fecha_actual
-                    hora = partes[-1] if len(partes) > 1 else fecha_td
-                else:
-                    hora = fecha_td
-                enlace = celdas[1].find("a")
-                fuente = celdas[1].find("span")
-                if enlace:
-                    noticias.append({
-                        "fecha": f"{fecha_actual} {hora}".strip(),
-                        "titulo": enlace.get_text(strip=True),
-                        "url": enlace.get("href", "#"),
-                        "fuente": fuente.get_text(strip=True) if fuente else "",
-                    })
-
-        result["news"] = noticias
-        result["fundamentals"] = fundamentals
-        result["ok"] = bool(fundamentals or noticias)
-        return result
-    except (requests.RequestException, Exception):
-        return result
+                res["fundamentals"][celdas[i].get_text(strip=True)] = celdas[i+1].get_text(strip=True)
+        t_news = soup.find("table", id="news-table")
+        if t_news:
+            f_act = ""
+            for fila in t_news.find_all("tr")[:15]:
+                c = fila.find_all("td")
+                if len(c) < 2: continue
+                ft = c[0].get_text(strip=True)
+                if any(ch.isalpha() for ch in ft):
+                    p = ft.split()
+                    f_act = p[0] if len(p) > 1 else f_act
+                    hr = p[-1] if len(p) > 1 else ft
+                else: hr = ft
+                a = c[1].find("a")
+                sp = c[1].find("span")
+                if a:
+                    res["news"].append({"fecha": f"{f_act} {hr}".strip(), "titulo": a.get_text(strip=True), "url": a.get("href", "#"), "fuente": sp.get_text(strip=True) if sp else ""})
+        res["ok"] = bool(res["fundamentals"] or res["news"])
+        return res
+    except Exception:
+        return res
 
 def _parse_finviz_num(val: str):
     if not val or val == "-": return None
     v = val.strip().replace("%", "")
-    mult = 1.0
-    if v and v[-1] in ("B", "M", "K"):
-        mult = {"B": 1e9, "M": 1e6, "K": 1e3}[v[-1]]
-        v = v[:-1]
-    try:
-        return float(v) * mult
-    except (ValueError, TypeError):
-        return None
+    mult = {"B": 1e9, "M": 1e6, "K": 1e3}.get(v[-1], 1.0) if v else 1.0
+    if mult != 1.0: v = v[:-1]
+    try: return float(v) * mult
+    except Exception: return None
 
-def analizar_buffett(fundamentals: dict) -> dict:
-    pe     = _parse_finviz_num(fundamentals.get("P/E", "-"))
-    roe    = _parse_finviz_num(fundamentals.get("ROE", "-"))
-    deuda  = _parse_finviz_num(fundamentals.get("Debt/Eq", "-"))
-    margen = _parse_finviz_num(fundamentals.get("Profit Margin", "-"))
+def analizar_buffett(f: dict) -> dict:
+    pe, roe, deuda, margen = _parse_finviz_num(f.get("P/E", "-")), _parse_finviz_num(f.get("ROE", "-")), _parse_finviz_num(f.get("Debt/Eq", "-")), _parse_finviz_num(f.get("Profit Margin", "-"))
+    s = (30 if pe and 0 < pe < 15 else (20 if pe and pe < 25 else (10 if pe and pe < 35 else 0))) + \
+        (30 if roe and roe >= 20 else (20 if roe and roe >= 15 else (10 if roe and roe >= 10 else 0))) + \
+        (20 if deuda is not None and deuda <= 0.3 else (15 if deuda is not None and deuda <= 0.5 else 0)) + \
+        (20 if margen and margen >= 20 else (10 if margen and margen >= 10 else 0))
+    return {"P/E": pe, "ROE %": roe, "Deuda/Patrim.": deuda, "Margen Neto %": margen, "Score": s, "Tier": "TIER 1 // PRIME" if s >= 70 else ("TIER 2 // CORE" if s >= 40 else "TIER 3 // SPEC")}
 
-    score = 0
-    score += 30 if pe and 0 < pe < 15 else (20 if pe and pe < 25 else (10 if pe and pe < 35 else 0))
-    score += 30 if roe and roe >= 20 else (20 if roe and roe >= 15 else (10 if roe and roe >= 10 else 0))
-    score += 20 if deuda is not None and deuda <= 0.3 else (15 if deuda is not None and deuda <= 0.5 else (5 if deuda is not None and deuda <= 1.0 else 0))
-    score += 20 if margen and margen >= 20 else (10 if margen and margen >= 10 else (5 if margen and margen >= 0 else 0))
-
-    veredicto = "🏛️ Cumple criterios Buffett" if score >= 70 else ("🟡 Parcialmente sólido" if score >= 40 else "🔴 No cumple")
-    return {"P/E": pe, "ROE %": roe, "Deuda/Patrim.": deuda, "Margen Neto %": margen, "Score Buffett": score, "Veredicto": veredicto}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ANÁLISIS DE PATRONES CHARTISTAS Y DIVERGENCIAS
-# ══════════════════════════════════════════════════════════════════════════════
-def calcular_fibonacci(df: pd.DataFrame) -> dict:
-    maximo, minimo = float(df['High'].max()), float(df['Low'].min())
-    rango = maximo - minimo
-    return {
-        "0%": maximo, "23.6%": maximo - 0.236 * rango, "38.2%": maximo - 0.382 * rango,
-        "50%": maximo - 0.500 * rango, "61.8%": maximo - 0.618 * rango,
-        "78.6%": maximo - 0.786 * rango, "100%": minimo,
-    }
-
-FIBONACCI_COLORES = {
-    "0%": "rgba(255,255,255,0.5)", "23.6%": "rgba(255,215,0,0.6)", "38.2%": "rgba(0,207,255,0.6)",
-    "50%": "rgba(0,255,136,0.7)", "61.8%": "rgba(0,207,255,0.6)", "78.6%": "rgba(255,140,0,0.6)", "100%": "rgba(255,255,255,0.5)"
-}
-
-def detectar_divergencias(df: pd.DataFrame, ventana: int = 5) -> list:
-    if 'RSI' not in df.columns or len(df) < ventana * 3: return []
-    close, rsi, idx = df['Close'].values, df['RSI'].values, df.index
-    divs = []
-    idx_min_precio = argrelextrema(close, np.less, order=ventana)[0]
-    idx_max_precio = argrelextrema(close, np.greater, order=ventana)[0]
-
-    for i in range(1, len(idx_min_precio)):
-        i1, i2 = idx_min_precio[i-1], idx_min_precio[i]
-        if close[i2] < close[i1] and rsi[i2] > rsi[i1] and not np.isnan(rsi[i1]) and not np.isnan(rsi[i2]):
-            divs.append({"tipo": "alcista", "fecha1": idx[i1], "fecha2": idx[i2], "precio1": close[i1], "precio2": close[i2], "rsi1": rsi[i1], "rsi2": rsi[i2]})
-
-    for i in range(1, len(idx_max_precio)):
-        i1, i2 = idx_max_precio[i-1], idx_max_precio[i]
-        if close[i2] > close[i1] and rsi[i2] < rsi[i1] and not np.isnan(rsi[i1]) and not np.isnan(rsi[i2]):
-            divs.append({"tipo": "bajista", "fecha1": idx[i1], "fecha2": idx[i2], "precio1": close[i1], "precio2": close[i2], "rsi1": rsi[i1], "rsi2": rsi[i2]})
-
-    return [d for d in divs if d["tipo"] == "alcista"][-3:] + [d for d in divs if d["tipo"] == "bajista"][-3:]
-
-def registrar_senal(ticker: str, info: dict, precio: float):
-    hist = st.session_state.signal_history.setdefault(ticker, [])
-    nueva_senal = info["senal"]
-    if not hist or hist[-1]["Señal"] != nueva_senal:
-        hist.append({
-            "Fecha": datetime.now().strftime("%d/%m/%Y %H:%M"), "Ticker": ticker,
-            "Señal": nueva_senal, "Puntos": info["puntos"], "Precio": round(precio, 4),
-            "RSI": round(info["rsi"], 1), "ADX": round(info["adx"], 1),
-        })
-        st.session_state.signal_history[ticker] = hist[-50:]
-
-        if "FUERTE" in nueva_senal and st.session_state.get("auto_telegram_alerts", False):
-            msg = f"🚨 *NUEVA SEÑAL CUANTITATIVA*\n\nActivo: `{ticker}`\nSeñal: *{nueva_senal}*\nPrecio: `${precio:,.4f}`\nRSI: `{info['rsi']:.1f}` | ADX: `{info['adx']:.1f}`"
-            enviar_alerta_telegram(msg)
-
-PATTERN_INFO = {
-    "Trendline Supp.": {"emoji": "📈", "bias": "alcista", "desc": "Soporte dinámico ascendente.", "accion": "LONG cerca de la línea."},
-    "Trendline Resist.": {"emoji": "📉", "bias": "bajista", "desc": "Resistencia dinámica descendente.", "accion": "SHORT o venta."},
-    "Horizontal S/R": {"emoji": "↔️", "bias": "neutro", "desc": "Nivel horizontal clave.", "accion": "Esperar ruptura."},
-    "Wedge Up": {"emoji": "🔺", "bias": "bajista", "desc": "Cuña ascendente de agotamiento.", "accion": "Esperar ruptura inferior."},
-    "Wedge": {"emoji": "🔷", "bias": "neutro", "desc": "Compresión simétrica.", "accion": "Operar dirección de ruptura."},
-    "Wedge Down": {"emoji": "🔻", "bias": "alcista", "desc": "Cuña descendente de agotamiento.", "accion": "Esperar ruptura superior."},
-    "Triangle Asc.": {"emoji": "△", "bias": "alcista", "desc": "Resistencia horizontal y mínimos crecientes.", "accion": "LONG en ruptura."},
-    "Triangle Desc.": {"emoji": "▽", "bias": "bajista", "desc": "Soporte horizontal y máximos decrecientes.", "accion": "SHORT en ruptura."},
-    "Channel Up": {"emoji": "📊", "bias": "alcista", "desc": "Canal paralelo ascendente.", "accion": "LONG en soporte del canal."},
-    "Channel": {"emoji": "📊", "bias": "neutro", "desc": "Rango lateral.", "accion": "Comprar soporte, vender resistencia."},
-    "Channel Down": {"emoji": "📉", "bias": "bajista", "desc": "Canal paralelo descendente.", "accion": "Evitar compras."},
-    "Double Top": {"emoji": "🔔", "bias": "bajista", "desc": "Doble techo de inversión.", "accion": "SHORT en ruptura del cuello."},
-    "Multiple Top": {"emoji": "🔔🔔", "bias": "bajista", "desc": "Múltiples rechazos en resistencia.", "accion": "SHORT en resistencia."},
-    "Double Bottom": {"emoji": "🏔️", "bias": "alcista", "desc": "Doble suelo de inversión.", "accion": "LONG en ruptura del cuello."},
-    "Multiple Bottom": {"emoji": "🏔️🏔️", "bias": "alcista", "desc": "Múltiples soportes validados.", "accion": "LONG en soporte."},
-    "Head&Shoulders": {"emoji": "👤", "bias": "bajista", "desc": "Hombro-Cabeza-Hombro.", "accion": "SHORT en ruptura de línea de cuello."},
-}
-PATTERN_BIAS_COLOR = {"alcista": "#00ff88", "bajista": "#ff4444", "neutro": "#ffd700"}
-
-def _linreg(y: np.ndarray):
-    x = np.arange(len(y), dtype=float)
-    m = (len(x) * np.dot(x, y) - x.sum() * y.sum()) / (len(x) * (x**2).sum() - x.sum()**2 + 1e-12)
-    b = (y.sum() - m * x.sum()) / len(x)
-    return m, b
-
-def detectar_patrones(df: pd.DataFrame) -> list:
-    if len(df) < 30:
-        return []
-
-    close = df["Close"].values.astype(float)
-    high  = df["High"].values.astype(float)
-    low   = df["Low"].values.astype(float)
-    idx   = df.index
-    n     = len(close)
-    orden = max(5, n // 20)
-    patrones = []
-
-    def fmt_fecha(ts):
-        if hasattr(ts, 'strftime'):
-            return ts.strftime("%d/%m/%Y")
-        return str(ts).split()[0]
-
-    idx_max = argrelextrema(close, np.greater, order=orden)[0]
-    idx_min = argrelextrema(close, np.less, order=orden)[0]
-
-    if len(idx_max) >= 2:
-        t1, t2 = idx_max[-2], idx_max[-1]
-        if abs(close[t1] - close[t2]) / close[t1] < 0.03 and t2 - t1 > orden:
-            if (close[t1] - close[t1:t2].min()) / close[t1] > 0.04:
-                patrones.append({
-                    "patron": "Double Top",
-                    "confianza": "Alta",
-                    "desc": f"Dos techos en ${close[t1]:,.2f} y ${close[t2]:,.2f}.",
-                    "fecha_ini": fmt_fecha(idx[t1]),
-                    "fecha_fin": fmt_fecha(idx[t2])
-                })
-
-    if len(idx_min) >= 2:
-        b1, b2 = idx_min[-2], idx_min[-1]
-        if abs(close[b1] - close[b2]) / close[b1] < 0.03 and b2 - b1 > orden:
-            if (close[b1:b2].max() - close[b1]) / close[b1] > 0.04:
-                patrones.append({
-                    "patron": "Double Bottom",
-                    "confianza": "Alta",
-                    "desc": f"Dos suelos en ${close[b1]:,.2f} y ${close[b2]:,.2f}.",
-                    "fecha_ini": fmt_fecha(idx[b1]),
-                    "fecha_fin": fmt_fecha(idx[b2])
-                })
-
-    ventana = min(60, n)
-    mh, _ = _linreg(high[-ventana:])
-    ml, _ = _linreg(low[-ventana:])
-    if (high[-ventana:].mean() - low[-ventana:].mean()) / close[-ventana:].mean() < 0.15:
-        if mh > 0.001 and ml > 0.001:
-            patrones.append({
-                "patron": "Channel Up",
-                "confianza": "Media",
-                "desc": "Canal alcista estructurado.",
-                "fecha_ini": fmt_fecha(idx[-ventana]),
-                "fecha_fin": fmt_fecha(idx[-1])
-            })
-        elif mh < -0.001 and ml < -0.001:
-            patrones.append({
-                "patron": "Channel Down",
-                "confianza": "Media",
-                "desc": "Canal bajista estructurado.",
-                "fecha_ini": fmt_fecha(idx[-ventana]),
-                "fecha_fin": fmt_fecha(idx[-1])
-            })
-
-    return patrones
-
-TICKER_REGEX = re.compile(r'^[A-Z0-9\.\^\-]{1,12}$')
-def validar_ticker(t: str) -> tuple:
-    t = t.strip().upper()
-    if not t: return False, "Ticker vacío."
-    if not TICKER_REGEX.match(t): return False, f"Ticker inválido: '{t}'."
-    return True, ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAPER TRADING — ACTUALIZACIÓN DE ESTADO Y PNL EN VIVO
-# (fix: antes las posiciones se guardaban con Estado="🟡 Abierta" para siempre.
-# No había cálculo de PnL, ni verificación de SL/TP contra el precio actual,
-# ni cierre automático. Ahora se recalcula en cada carga de los tabs 5 y 12.)
-# ══════════════════════════════════════════════════════════════════════════════
 def actualizar_paper_trades(td_key: str):
     cambios = False
     for t in st.session_state.paper_trades:
-        if t.get("Estado", "").startswith("🟡"):
-            precio_actual = get_close_only(t["Ticker"], "1mo", td_key=td_key)
-            if precio_actual.empty:
-                continue
-            p_now = float(precio_actual.iloc[-1])
-            entrada, sl, tp, lado = t["Entrada"], t["SL"], t["TP"], t.get("Lado", "LONG")
+        if "OPEN" in str(t.get("Estado", "")) or str(t.get("Estado", "")).startswith("🟡"):
+            t["Estado"] = "OPEN"
+            s = get_close_only(t["Ticker"], "1mo", td_key=td_key)
+            if s.empty: continue
+            p_now = float(s.iloc[-1])
+            ent, sl, tp, lado = t["Entrada"], t["SL"], t["TP"], t.get("Lado", "LONG")
+            pnl = ((p_now - ent) / ent * 100) if lado == "LONG" else ((ent - p_now) / ent * 100)
+            if (lado == "LONG" and p_now <= sl) or (lado == "SHORT" and p_now >= sl): t["Estado"] = "CLOSED // SL"
+            elif (lado == "LONG" and p_now >= tp) or (lado == "SHORT" and p_now <= tp): t["Estado"] = "CLOSED // TP"
+            t["Precio actual"], t["PnL % actual"], t["PnL USD"] = round(p_now, 4), round(pnl, 2), round(t.get("Capital", 0.0) * (pnl / 100.0), 2)
+            cambios = True
+    if cambios: guardar_portfolio()
 
-            if lado == "LONG":
-                pnl_pct = (p_now - entrada) / entrada * 100 if entrada else 0.0
-                if p_now <= sl:
-                    t["Estado"] = "🔴 Cerrada (SL)"; cambios = True
-                elif p_now >= tp:
-                    t["Estado"] = "🟢 Cerrada (TP)"; cambios = True
-            else:
-                pnl_pct = (entrada - p_now) / entrada * 100 if entrada else 0.0
-                if p_now >= sl:
-                    t["Estado"] = "🔴 Cerrada (SL)"; cambios = True
-                elif p_now <= tp:
-                    t["Estado"] = "🟢 Cerrada (TP)"; cambios = True
-
-            t["Precio actual"] = round(p_now, 4)
-            t["PnL % actual"] = round(pnl_pct, 2)
-        cambios = cambios or ("PnL % actual" in t)
-    if cambios:
-        guardar_portfolio()
+def _groq(messages: list) -> str:
+    k = st.session_state.get("groq_api_key", "").strip()
+    if not k: return "AUTH_ERR // Configure Groq API Key in SYSTEM CONFIG."
+    try:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Content-Type": "application/json", "Authorization": f"Bearer {k}"}, json={"model": "openai/gpt-oss-120b", "max_tokens": 1100, "messages": messages}, timeout=25)
+        return r.json()["choices"][0]["message"]["content"] if r.ok else f"HTTP_ERR // {r.status_code}"
+    except Exception as e:
+        return f"NET_ERR // {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INTERFAZ SIDEBAR
+# 1. TOP INSTITUTIONAL STATUS BAR
 # ══════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("## 🛡️ QuantumShield Pro")
-    st.caption("Terminal Cuantitativo & IA")
-    st.markdown("---")
+utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+st.markdown(f"""
+<div class="ws-topbar">
+    <div class="ws-brand">
+        <span>QUANTUMSHIELD <span style="color:#f59e0b;">PRO</span></span>
+        <span class="ws-tag">INSTITUTIONAL DESK v4.0</span>
+        <span style="color:#64748b;">// MULTI-ASSET EXECUTION & RISK ENGINE</span>
+    </div>
+    <div style="color:#94a3b8; display:flex; gap:18px;">
+        <span>FEED: <strong style="color:#10b981;">ACTIVE</strong></span>
+        <span>ENGINE: <strong style="color:#e2e8f0;">WILDER-RF</strong></span>
+        <span>{utc_str}</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-    tipo = st.radio("Tipo de activo", ["📈 Acciones", "₿ Criptomonedas", "✏️ Ticker manual"])
-    if tipo == "📈 Acciones":
-        nombre = st.selectbox("Selecciona acción", list(ACCIONES.keys()))
-        ticker = ACCIONES[nombre]
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. COMMAND BAR INTEGRADA (REEMPLAZA EL SIDEBAR DE STREAMLIT)
+# ══════════════════════════════════════════════════════════════════════════════
+cmd1, cmd2, cmd3, cmd4, cmd5 = st.columns([1.3, 2.2, 1.0, 1.3, 1.2])
+
+with cmd1:
+    clase_activo = st.selectbox("ASSET CLASS", ["EQUITIES", "CRYPTO", "CUSTOM"], label_visibility="collapsed")
+
+with cmd2:
+    if clase_activo == "EQUITIES":
+        sel_nombre = st.selectbox("INSTRUMENT", list(ACCIONES.keys()), label_visibility="collapsed")
+        ticker = ACCIONES[sel_nombre]
         benchmark = BENCHMARK_ACCIONES
-    elif tipo == "₿ Criptomonedas":
-        nombre = st.selectbox("Selecciona crypto", list(CRYPTOS.keys()))
-        ticker = CRYPTOS[nombre]
+    elif clase_activo == "CRYPTO":
+        sel_nombre = st.selectbox("INSTRUMENT", list(CRYPTOS.keys()), label_visibility="collapsed")
+        ticker = CRYPTOS[sel_nombre]
         benchmark = BENCHMARK_CRYPTO
     else:
-        _ticker_raw = st.text_input("Ticker personalizado", value="NVDA").upper().strip()
-        _ok, _msg = validar_ticker(_ticker_raw)
-        ticker = _ticker_raw if _ok else "NVDA"
-        if not _ok: st.error(_msg)
-        benchmark = BENCHMARK_ACCIONES
+        ticker = st.text_input("SYMBOL", value="NVDA", label_visibility="collapsed").upper().strip() or "NVDA"
+        benchmark = BENCHMARK_CRYPTO if "-USD" in ticker else BENCHMARK_ACCIONES
 
-    st.markdown("---")
-    period = st.selectbox("Período", ["1mo","3mo","6mo","1y","2y"], index=2)
+with cmd3:
+    period = st.selectbox("HORIZON", ["1mo", "3mo", "6mo", "1y", "2y"], index=2, label_visibility="collapsed")
 
-    st.markdown("---")
-    st.subheader("⚙️ Configuración de Gráfico")
-    mostrar_sma     = st.checkbox("SMA 200",               value=False)
-    mostrar_vwap    = st.checkbox("VWAP",                  value=True)
-    mostrar_ema     = st.checkbox("EMA 20 / EMA 50",       value=True)
-    mostrar_bb      = st.checkbox("Bandas de Bollinger",   value=True)
-    mostrar_volumen = st.checkbox("Volumen",               value=True)
-    mostrar_sr      = st.checkbox("Soporte/Resistencia",   value=True)
-    mostrar_vanom   = st.checkbox("Volumen anómalo",       value=True)
-    mostrar_fib     = st.checkbox("Fibonacci",             value=False)
-    mostrar_divs    = st.checkbox("Divergencias RSI",      value=True)
-    mostrar_stoch   = st.checkbox("Stochastic RSI",        value=True)
-    mostrar_vp      = st.checkbox("Volume Profile",        value=False)
+with cmd4:
+    with st.popover("⚙️ CHART OVERLAYS"):
+        mostrar_vwap    = st.checkbox("VWAP Institutional", value=True)
+        mostrar_ema     = st.checkbox("EMA 20 / EMA 50", value=True)
+        mostrar_sma     = st.checkbox("SMA 200 Macro", value=False)
+        mostrar_bb      = st.checkbox("Bollinger Bands (2σ)", value=True)
+        mostrar_sr      = st.checkbox("Horizontal S/R Levels", value=True)
+        mostrar_volumen = st.checkbox("Volume & Spikes", value=True)
+        mostrar_stoch   = st.checkbox("Stochastic RSI", value=False)
+        mostrar_vp      = st.checkbox("Volume Profile (POC)", value=False)
 
-    st.markdown("---")
-    st.subheader("📡 Datos — Twelve Data")
-    td_key_input = st.text_input("API Key", type="password")
-    if td_key_input:
-        st.session_state["td_api_key"] = td_key_input
-    else:
-        st.session_state["td_api_key"] = st.secrets.get("TD_API_KEY", "")
+with cmd5:
+    with st.popover("🔑 API & TELEMETRY"):
+        td_in = st.text_input("Twelve Data Key", type="password")
+        gq_in = st.text_input("Groq LLM Key", type="password")
+        tg_tk = st.text_input("Telegram Bot Token", type="password")
+        tg_id = st.text_input("Telegram Chat ID")
+        if td_in: st.session_state["td_api_key"] = td_in
+        elif "td_api_key" not in st.session_state:
+            try: st.session_state["td_api_key"] = st.secrets.get("TD_API_KEY", "")
+            except Exception: st.session_state["td_api_key"] = ""
+        if gq_in: st.session_state["groq_api_key"] = gq_in
+        elif "groq_api_key" not in st.session_state:
+            try: st.session_state["groq_api_key"] = st.secrets.get("GROQ_API_KEY", "")
+            except Exception: st.session_state["groq_api_key"] = ""
+        if tg_tk: st.session_state["telegram_token"] = tg_tk
+        if tg_id: st.session_state["telegram_chat_id"] = tg_id
 
-    st.markdown("---")
-    st.subheader("🤖 IA — Groq")
-    groq_key_input = st.text_input("Groq Key", type="password")
-    if groq_key_input:
-        st.session_state["groq_api_key"] = groq_key_input
-    else:
-        st.session_state["groq_api_key"] = st.secrets.get("GROQ_API_KEY", "")
-
-    st.markdown("---")
-    st.subheader("📲 Alertas Telegram")
-    tg_token = st.text_input("Bot Token", type="password")
-    tg_chat  = st.text_input("Chat ID")
-    if tg_token: st.session_state["telegram_token"] = tg_token
-    if tg_chat:  st.session_state["telegram_chat_id"] = tg_chat
-    st.session_state["auto_telegram_alerts"] = st.checkbox("Alertas Auto en Compras/Ventas Fuertes", value=False)
-    if st.button("🔔 Probar Alerta Telegram"):
-        if enviar_alerta_telegram("🧪 Alerta de prueba desde *QuantumShield Pro* ✓"):
-            st.success("¡Alerta enviada!")
-        else:
-            st.error("Error al enviar alerta Telegram.")
-
-    st.markdown("---")
-    auto_refresh = st.checkbox("Activar auto-refresh", value=False)
-    refresh_secs = st.selectbox("Intervalo", [30, 60, 120, 300], index=1)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN RENDER & DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
 TD_KEY = st.session_state.get("td_api_key", "")
-st.title("🛡️ QuantumShield Pro — Terminal Quant & IA")
-
-if auto_refresh:
-    import streamlit.components.v1 as components
-    components.html(f"""
-    <script>
-      setTimeout(function(){{ window.location.reload(); }}, {refresh_secs * 1000});
-    </script>
-    <div style="color:#00cfff;font-family:monospace;">⏱️ Auto-refresh activo ({refresh_secs}s)</div>
-    """, height=30)
-
-with st.spinner(f"Cargando análisis para {ticker}..."):
-    df = get_data(ticker, period, td_key=TD_KEY)
-
+df = get_data(ticker, period, td_key=TD_KEY)
 if df.empty:
-    st.error(f"Sin datos accesibles para {ticker}.")
+    st.error(f"FEED_ERROR // Unable to retrieve market data for {ticker}.")
     st.stop()
 
-info  = generar_senal(df)
-last  = df.iloc[-1]
-prev  = df.iloc[-2] if len(df) > 1 else last
-price = float(last['Close'])
-chg   = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 else 0.0
+info   = generar_senal(df)
+last   = df.iloc[-1]
+prev   = df.iloc[-2] if len(df) > 1 else last
+price  = float(last['Close'])
+chg    = ((price / float(prev['Close'])) - 1) * 100 if float(prev['Close']) > 0 else 0.0
+ml_res = predecir_probabilidad_ml(df)
+vwap_v = float(last.get('VWAP', price))
+vwap_s = ((price / vwap_v) - 1) * 100 if vwap_v > 0 else 0.0
+chg_col = "#10b981" if chg >= 0 else "#f43f5e"
+ml_str  = f"{ml_res['prob']}%" if ml_res['prob'] is not None else "N/A"
+ml_sub  = ml_res['msg']
 
-prob_ml, msg_ml = predecir_probabilidad_ml(df)
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. DENSE 8-CELL TELEMETRY RIBBON (CERO TARJETAS NATIVAS DE STREAMLIT)
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown(f"""
+<div class="kpi-strip">
+    <div class="kpi-cell" style="border-left: 3px solid {chg_col};">
+        <span class="kpi-label">{ticker} // SPOT PX</span>
+        <span class="kpi-val">${price:,.4f}</span>
+        <span class="kpi-sub" style="color:{chg_col};">{chg:+.2f}% (1D)</span>
+    </div>
+    <div class="kpi-cell" style="border-left: 3px solid {info['color']};">
+        <span class="kpi-label">QUANT STANCE</span>
+        <span class="kpi-val" style="color:{info['color']};">{info['senal']}</span>
+        <span class="kpi-sub" style="color:#94a3b8;">CONVICTION: {info['puntos']:+d} PTS</span>
+    </div>
+    <div class="kpi-cell">
+        <span class="kpi-label">VWAP SPREAD</span>
+        <span class="kpi-val">${vwap_v:,.4f}</span>
+        <span class="kpi-sub" style="color:{'#10b981' if vwap_s>=0 else '#f43f5e'};">{vwap_s:+.2f}% VS SPOT</span>
+    </div>
+    <div class="kpi-cell">
+        <span class="kpi-label">RSI (14W) // ADX</span>
+        <span class="kpi-val">{info['rsi']:.1f} <span style="color:#64748b;font-weight:400;">/</span> {info['adx']:.1f}</span>
+        <span class="kpi-sub" style="color:#94a3b8;">{'TRENDING' if info['adx']>=25 else 'MEAN-REVERTING'}</span>
+    </div>
+    <div class="kpi-cell">
+        <span class="kpi-label">VOLATILITY (ATR / ADR)</span>
+        <span class="kpi-val">${info['atr']:,.3f}</span>
+        <span class="kpi-sub" style="color:#94a3b8;">ADR(14): {last.get('ADR_PCT', 0):.2f}%</span>
+    </div>
+    <div class="kpi-cell">
+        <span class="kpi-label">VOL STOP (-2 ATR)</span>
+        <span class="kpi-val" style="color:#f43f5e;">${info['sl']:,.4f}</span>
+        <span class="kpi-sub" style="color:#64748b;">RISK: {((info['sl']/price - 1)*100):.2f}%</span>
+    </div>
+    <div class="kpi-cell">
+        <span class="kpi-label">TARGET (+3 ATR)</span>
+        <span class="kpi-val" style="color:#10b981;">${info['tp']:,.4f}</span>
+        <span class="kpi-sub" style="color:#64748b;">UPSIDE: {((info['tp']/price - 1)*100):+.2f}%</span>
+    </div>
+    <div class="kpi-cell">
+        <span class="kpi-label">RF ML (+3D PROB)</span>
+        <span class="kpi-val" style="color:#f59e0b;">{ml_str}</span>
+        <span class="kpi-sub" style="color:#94a3b8;">{ml_sub}</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
-    "📊 Análisis", "🌐 Señales", "📉 Comparativa", "🔗 Correlación",
-    "📒 Paper Trading", "🤖 Asistente IA", "🧪 Backtest", "⏱️ Multi-TF",
-    "🔍 Screener", "📰 Noticias", "🕯️ Patrones", "💼 Portafolio"
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. WORKSTATION NAVIGATION TABS
+# ══════════════════════════════════════════════════════════════════════════════
+t_work, t_scan, t_bt, t_port, t_corr, t_fund, t_ai = st.tabs([
+    "01 // TRADING WORKSTATION",
+    "02 // ALPHA SCANNER & SCREENER",
+    "03 // BACKTEST ENGINE",
+    "04 // OMS & MARKOWITZ RISK",
+    "05 // RELVAL & CORRELATION",
+    "06 // FUNDAMENTALS & WIRE",
+    "07 // QUANT RESEARCH AI"
 ])
 
-# ── TAB 1: ANÁLISIS TÉCNICO & ML ──────────────────────────────────────────────
-with tab1:
-    registrar_senal(ticker, info, price)
+# ── TAB 01: TRADING WORKSTATION (SPLIT LAYOUT 72% CHART / 28% TEARSHEET) ─────
+with t_work:
+    col_chart, col_desk = st.columns([2.7, 1.0])
 
-    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-    k1.metric("Precio", f"${price:,.4f}", f"{chg:+.2f}%")
-    k2.metric("RSI (14)", f"{info['rsi']:.1f}")
-    k3.metric("ADX (14)", f"{info['adx']:.1f}")
-    k4.metric("ADR (14)", f"{last.get('ADR_PCT', 0):.2f}%")
-    k5.metric("Stop Loss", f"${info['sl']:,.4f}")
-    k6.metric("Take Profit", f"${info['tp']:,.4f}")
-    k7.metric("Prob. ML Acierto", f"{prob_ml}%" if prob_ml else "N/A", delta="RandomForest")
+    with col_chart:
+        rows_n = 3 + (1 if 'Volume' in df.columns and mostrar_volumen else 0) + (1 if mostrar_stoch else 0)
+        row_h  = [0.58, 0.14, 0.14, 0.14][:rows_n] if rows_n == 4 else ([0.52, 0.12, 0.12, 0.12, 0.12] if rows_n == 5 else [0.68, 0.16, 0.16])
+        fig = make_subplots(rows=rows_n, cols=1, shared_xaxes=True, vertical_spacing=0.015, row_heights=row_h)
 
-    st.markdown(f"""
-    <div style="background:#16213e;border:1px solid {info['color']};border-radius:8px;padding:12px;margin:10px 0;">
-      <h3 style="color:{info['color']};margin:0;">Señal: {info['senal']} ({info['puntos']:+d} pts)</h3>
-    </div>""", unsafe_allow_html=True)
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+            increasing_line_color='#10b981', decreasing_line_color='#f43f5e',
+            increasing_fillcolor='#10b981', decreasing_fillcolor='#f43f5e', name="PRICE"
+        ), row=1, col=1)
 
-    rows_n = 3 + (1 if 'Volume' in df.columns and mostrar_volumen else 0) + (1 if mostrar_stoch else 0)
-    fig = make_subplots(rows=rows_n, cols=1, shared_xaxes=True, vertical_spacing=0.02)
+        if mostrar_vwap and 'VWAP' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], line=dict(color="#3b82f6", width=1.4), name="VWAP"), row=1, col=1)
+        if mostrar_ema:
+            fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], line=dict(color="#f59e0b", width=1.1), name="EMA 20"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['EMA50'], line=dict(color="#a855f7", width=1.1), name="EMA 50"), row=1, col=1)
+        if mostrar_sma and 'SMA200' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], line=dict(color="#e2e8f0", width=1.3, dash="dash"), name="SMA 200"), row=1, col=1)
+        if mostrar_bb:
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_UPPER'], line=dict(color="rgba(148,163,184,0.25)", width=1, dash="dot"), name="BB +2σ"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOWER'], line=dict(color="rgba(148,163,184,0.25)", width=1, dash="dot"), fill='tonexty', fillcolor="rgba(148,163,184,0.03)", name="BB -2σ"), row=1, col=1)
+        if mostrar_sr:
+            res_l, sop_l = detectar_soportes_resistencias(df)
+            for _, v in res_l: fig.add_hline(y=v, line_dash="dot", line_color="rgba(244,63,94,0.35)", row=1, col=1)
+            for _, v in sop_l: fig.add_hline(y=v, line_dash="dot", line_color="rgba(16,185,129,0.35)", row=1, col=1)
 
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Precio"), row=1, col=1)
+        curr_r = 2
+        if 'Volume' in df.columns and mostrar_volumen:
+            c_vol = np.where(df.get('VOL_ANOMALO', False), '#f59e0b', np.where(df['Close'] >= df['Open'], 'rgba(16,185,129,0.45)', 'rgba(244,63,94,0.45)'))
+            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="VOL", marker_color=c_vol), row=curr_r, col=1)
+            curr_r += 1
 
-    if mostrar_sma and 'SMA200' in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA200'], line=dict(color="#ffffff", width=2, dash="dash"), name="SMA200"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color="#a855f7", width=1.2), name="RSI"), row=curr_r, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="rgba(244,63,94,0.3)", row=curr_r, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="rgba(16,185,129,0.3)", row=curr_r, col=1)
+        curr_r += 1
 
-    if mostrar_vwap and 'VWAP' in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], line=dict(color="#00cfff", width=2), name="VWAP"), row=1, col=1)
+        c_macd = np.where(df['MACD_HIST'] >= 0, 'rgba(16,185,129,0.6)', 'rgba(244,63,94,0.6)')
+        fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name="MACD", marker_color=c_macd), row=curr_r, col=1)
 
-    if mostrar_ema:
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], line=dict(color="#ffd700", width=1), name="EMA20"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA50'], line=dict(color="#ff8c00", width=1), name="EMA50"), row=1, col=1)
+        if mostrar_stoch:
+            curr_r += 1
+            fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_K'], line=dict(color="#10b981", width=1), name="STOCH K"), row=curr_r, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_D'], line=dict(color="#f43f5e", width=1), name="STOCH D"), row=curr_r, col=1)
 
-    if mostrar_bb:
-        fig.add_trace(go.Scatter(x=df.index, y=df['BB_UPPER'], line=dict(color="rgba(255,255,255,0.2)", width=1, dash="dot"), name="BB Sup"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['BB_LOWER'], line=dict(color="rgba(255,255,255,0.2)", width=1, dash="dot"), fill='tonexty', fillcolor="rgba(255,255,255,0.05)", name="BB Inf"), row=1, col=1)
+        fig.update_layout(
+            template="plotly_dark", paper_bgcolor="#0b0e14", plot_bgcolor="#06080c",
+            font=dict(family="JetBrains Mono, monospace", size=10, color="#64748b"),
+            height=640, margin=dict(l=8, r=52, t=24, b=8),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=10)),
+            xaxis_rangeslider_visible=False, hovermode="x unified"
+        )
+        fig.update_xaxes(showgrid=True, gridcolor="#111621", zeroline=False)
+        fig.update_yaxes(showgrid=True, gridcolor="#111621", zeroline=False, side="right")
+        st.plotly_chart(fig, use_container_width=True)
 
-    if mostrar_sr:
-        resistencias, soportes = detectar_soportes_resistencias(df)
-        for _, v in resistencias:
-            fig.add_hline(y=v, line_dash="dash", line_color="rgba(255, 68, 68, 0.4)", row=1, col=1)
-        for _, v in soportes:
-            fig.add_hline(y=v, line_dash="dash", line_color="rgba(0, 255, 136, 0.4)", row=1, col=1)
+    with col_desk:
+        # Panel Derecho: Factor Attribution & Niveles Clave
+        filas_factores = "".join([
+            f"<div class='data-row'><span class='data-row-label'>{lbl}</span><span class='data-row-val' style='color:{col};'>{val}</span></div>"
+            for lbl, val, col in info["razones"]
+        ])
+        fibs = calcular_volume_profile(df)
+        poc_px = float(fibs.loc[fibs['poc'], 'precio'].iloc[0]) if not fibs.empty and fibs['poc'].any() else price
 
-    if mostrar_fib:
-        niveles = calcular_fibonacci(df)
-        for nivel, valor in niveles.items():
-            color = FIBONACCI_COLORES.get(nivel, "rgba(255,255,255,0.3)")
-            fig.add_hline(y=valor, line_dash="dot", line_color=color, annotation_text=f"Fib {nivel}", annotation_position="top right", row=1, col=1)
+        st.markdown(f"""
+        <div class="ws-panel">
+            <div class="ws-panel-title"><span>QUANT FACTOR DECOMPOSITION</span><span>SCORE: {info['puntos']:+d}</span></div>
+            {filas_factores}
+            <div class="ws-panel-title" style="margin-top:14px;"><span>KEY INSTITUTIONAL LEVELS</span><span>SPOT: ${price:,.2f}</span></div>
+            <div class="data-row"><span class="data-row-label">Bollinger Upper (+2σ)</span><span class="data-row-val">${float(last['BB_UPPER']):,.4f}</span></div>
+            <div class="data-row"><span class="data-row-label">EMA 20 (Short Term)</span><span class="data-row-val">${float(last['EMA20']):,.4f}</span></div>
+            <div class="data-row"><span class="data-row-label">EMA 50 (Medium Term)</span><span class="data-row-val">${float(last['EMA50']):,.4f}</span></div>
+            <div class="data-row"><span class="data-row-label">SMA 200 (Macro Trend)</span><span class="data-row-val">${float(last.get('SMA200', 0)):,.4f}</span></div>
+            <div class="data-row"><span class="data-row-label">Volume POC Level</span><span class="data-row-val" style="color:#f59e0b;">${poc_px:,.4f}</span></div>
+            <div class="data-row"><span class="data-row-label">Bollinger Lower (-2σ)</span><span class="data-row-val">${float(last['BB_LOWER']):,.4f}</span></div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # (fix: antes el checkbox "Volumen anómalo" no hacía nada — no se ploteaba
-    # ninguna marca aunque VOL_ANOMALO ya estaba calculada en el DataFrame)
-    if mostrar_vanom and 'VOL_ANOMALO' in df.columns:
-        anomalos = df[df['VOL_ANOMALO'] == True]
-        if not anomalos.empty:
-            fig.add_trace(go.Scatter(
-                x=anomalos.index, y=anomalos['High'] * 1.01,
-                mode='markers', marker=dict(symbol='triangle-down', size=10, color='#ffd700', line=dict(width=1, color='#000')),
-                name="Volumen anómalo", showlegend=False
-            ), row=1, col=1)
-
-    curr_row = 2
-    if 'Volume' in df.columns and mostrar_volumen:
-        colores_vol = np.where(df.get('VOL_ANOMALO', False), '#ffd700', 'rgba(0, 207, 255, 0.6)')
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="Volumen", marker_color=colores_vol), row=curr_row, col=1)
-        curr_row += 1
-
-    fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color="#c77dff"), name="RSI"), row=curr_row, col=1)
-    if mostrar_divs:
-        divs = detectar_divergencias(df)
-        for d in divs:
-            color_div = "#00ff88" if d["tipo"] == "alcista" else "#ff4444"
-            fig.add_trace(go.Scatter(x=[d["fecha1"], d["fecha2"]], y=[d["rsi1"], d["rsi2"]], mode="lines+markers", line=dict(color=color_div, width=2, dash="dot"), showlegend=False), row=curr_row, col=1)
-    curr_row += 1
-
-    fig.add_trace(go.Bar(x=df.index, y=df['MACD_HIST'], name="MACD Hist"), row=curr_row, col=1)
-
-    if mostrar_stoch:
-        curr_row += 1
-        fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_K'], line=dict(color="#00ff88", width=1), name="Stoch %K"), row=curr_row, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['STOCH_D'], line=dict(color="#ff4444", width=1), name="Stoch %D"), row=curr_row, col=1)
-        fig.add_hline(y=80, line_dash="dot", line_color="rgba(255,255,255,0.2)", row=curr_row, col=1)
-        fig.add_hline(y=20, line_dash="dot", line_color="rgba(255,255,255,0.2)", row=curr_row, col=1)
-
-    fig.update_layout(template="plotly_dark", height=850, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-    if mostrar_vp and 'Volume' in df.columns:
-        st.markdown("### 📊 Volume Profile (POC)")
-        vp_df = calcular_volume_profile(df)
-        if not vp_df.empty:
-            fig_vp = px.bar(vp_df, x='volumen', y='precio', orientation='h', template="plotly_dark")
-            fig_vp.update_traces(marker_color=np.where(vp_df['poc'], '#ff4444', '#00cfff'), opacity=0.7)
-            fig_vp.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_vp, use_container_width=True)
-
-    if ticker in BINANCE_SYMBOLS:
-        st.markdown("### 📊 Profundidad de Mercado (Order Book - Binance)")
-        bids, asks = obtener_order_book_binance(ticker)
-        if not bids.empty and not asks.empty:
-            fig_ob = go.Figure()
-            fig_ob.add_trace(go.Scatter(x=bids['Precio'], y=bids['Acumulado'], fill='tozeroy', name='Bids (Compra)', line=dict(color='#00ff88')))
-            fig_ob.add_trace(go.Scatter(x=asks['Precio'], y=asks['Acumulado'], fill='tozeroy', name='Asks (Venta)', line=dict(color='#ff4444')))
-            fig_ob.update_layout(template="plotly_dark", height=280, xaxis_title="Precio USD", yaxis_title="Volumen Acumulado", margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_ob, use_container_width=True)
-
-# ── TAB 2: SEÑALES ────────────────────────────────────────────────────────────
-with tab2:
-    st.subheader("🌐 Radar Global de Mercado")
-    df_radar = obtener_radar_completo(period, TD_KEY)
-    if not df_radar.empty:
-        st.dataframe(df_radar, use_container_width=True)
-
-# ── TAB 3: COMPARATIVA RELATIVA ───────────────────────────────────────────────
-with tab3:
-    st.subheader(f"📉 Rendimiento Relativo vs {benchmark}")
-    s_act = get_close_only(ticker, period, td_key=TD_KEY)
-    s_ben = get_close_only(benchmark, period, td_key=TD_KEY)
-    if not s_act.empty and not s_ben.empty:
-        df_c = pd.DataFrame({ticker: s_act, benchmark: s_ben}).dropna()
-        df_n = df_c / df_c.iloc[0] * 100
-        fig_comp = px.line(df_n, template="plotly_dark", title="Rendimiento Normalizado (Base 100)")
-        st.plotly_chart(fig_comp, use_container_width=True)
-
-# ── TAB 4: CORRELACIÓN ────────────────────────────────────────────────────────
-with tab4:
-    st.subheader("🔗 Matriz de Correlaciones")
-    series_l = []
-    for nm, sym in ACCIONES.items():
-        s = get_close_only(sym, period, td_key=TD_KEY)
-        if not s.empty:
-            s.name = sym
-            series_l.append(s)
-    if series_l:
-        df_corr = pd.concat(series_l, axis=1).dropna().pct_change().corr()
-        fig_corr = px.imshow(df_corr, text_auto=".2f", template="plotly_dark")
-        st.plotly_chart(fig_corr, use_container_width=True)
-
-# ── TAB 5: PAPER TRADING & KELLY ──────────────────────────────────────────────
-with tab5:
-    st.subheader("📒 Gestión de Posiciones Simuladas")
-    actualizar_paper_trades(TD_KEY)
-
-    col_pt1, col_pt2 = st.columns([3, 2])
-    with col_pt1:
-        with st.form("trade_form"):
-            c1, c2, c3 = st.columns(3)
-            p_ent = c1.number_input("Precio Entrada", value=price)
-            p_sl  = c2.number_input("Stop Loss", value=info['sl'])
-            p_tp  = c3.number_input("Take Profit", value=info['tp'])
-            c_cap = st.number_input("Capital ($)", value=1000.0)
-            c_dir = st.selectbox("Dirección", ["LONG", "SHORT"])
-            if st.form_submit_button("Guardar Operación"):
-                st.session_state.paper_trades.append({
-                    "Fecha": datetime.now().strftime("%d/%m/%Y"), "Ticker": ticker,
-                    "Lado": c_dir, "Entrada": p_ent, "SL": p_sl, "TP": p_tp,
-                    "Capital": c_cap, "Estado": "🟡 Abierta"
-                })
-                guardar_portfolio()
-                st.success("Posición agregada.")
-
-    with col_pt2:
-        st.markdown("#### 📐 Cálculo de Tamaño de Posición (Kelly)")
-        win_rate_input = st.slider("Win Rate Estimado %", 10, 90, 55)
-        reward_ratio = abs(info['tp'] - price) / abs(price - info['sl']) if abs(price - info['sl']) > 0 else 1.5
-        f_kelly = calcular_criterio_kelly(win_rate_input, reward_ratio, 1.0)
-        st.metric("Criterio de Kelly (Óptimo)", f"{f_kelly}% del Capital")
-        st.caption("Recomendación de gestión de riesgo: Aplicar 'Half-Kelly' (mitad de la cifra) para reducir la volatilidad.")
-
-    if st.session_state.paper_trades:
-        st.dataframe(pd.DataFrame(st.session_state.paper_trades), use_container_width=True)
-
-# ── TAB 6: ASISTENTE IA ───────────────────────────────────────────────────────
-with tab6:
-    st.subheader("🤖 Consultoría Algorítmica & Tesis")
-    st.caption("Solicita un resumen técnico automatizado utilizando el motor LLM de Groq.")
-
-    if _ia_activa():
-        if st.button("Generar Informe Técnico", use_container_width=True):
-            with st.spinner("🧠 Procesando datos del mercado y generando tesis..."):
-                prompt_contexto = f"Analiza la siguiente estructura de precios para {ticker}:\n{_resumen_tecnico(ticker, df, info)}\nBasado en estos datos cuantitativos, proporciona una breve tesis de trading con escenarios alcistas y bajistas."
-                res = _groq(
-                    system="Eres un analista cuantitativo Senior. Responde de manera profesional, estructurada y directa. No des consejos financieros, solo análisis estadístico y de estructura de mercado.",
-                    user=prompt_contexto
-                )
-                st.info("Reporte Generado:")
-                st.markdown(res)
-    else:
-        st.warning("⚠️ API Key de Groq no configurada. Por favor, añádela en el panel lateral (sidebar) para activar el asistente.")
-
-# ── TAB 7: BACKTESTING & MÉTRICAS CUANT ──────────────────────────────────────
-with tab7:
-    st.subheader("🧪 Simulación de Estrategia Cuantitativa")
-    col1, col2 = st.columns(2)
-    u_c = col1.slider("Umbral Compra", 1, 6, 3)
-    u_v = col2.slider("Umbral Venta", -6, -1, -3)
-    if st.button("Ejecutar Backtest"):
-        bt = backtest_estrategia(df, umbral_compra=u_c, umbral_venta=u_v)
-
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Win Rate", f"{bt['win_rate']}%")
-        m2.metric("Retorno Total", f"{bt['retorno_total']}%")
-        m3.metric("Buy & Hold", f"{bt['retorno_bh']}%")
-        m4.metric("Sortino Ratio", f"{bt['sortino']}")
-        m5.metric("Profit Factor", f"{bt['profit_factor']}")
-        m6.metric("Max Drawdown", f"{bt['max_drawdown']}%")
-
-        if not bt['ops'].empty:
-            st.dataframe(bt['ops'], use_container_width=True)
-
-# ── TAB 8: MULTI-TIMEFRAME ────────────────────────────────────────────────────
-with tab8:
-    st.subheader("⏱️ Análisis Multitemporal (4H - 1D - 1W)")
-    cols = st.columns(3)
-    for i, tf in enumerate(["4H", "1D", "1W"]):
-        d_tf = get_data_mtf(ticker, tf)
-        with cols[i]:
-            if not d_tf.empty:
-                inf_tf = generar_senal(d_tf)
-                st.metric(f"Marco {tf}", inf_tf['senal'], f"{inf_tf['puntos']} pts")
-
-# ── TAB 9: SCREENER ───────────────────────────────────────────────────────────
-with tab9:
-    st.subheader("🔍 Escáner Filtro Cuantitativo")
-    if st.button("Lanzar Escáner"):
-        df_screen = obtener_radar_completo("3mo", TD_KEY)
-        if not df_screen.empty:
-            st.dataframe(df_screen, use_container_width=True)
-
-# ── TAB 10: NOTICIAS Y FUNDAMENTALES ──────────────────────────────────────────
-with tab10:
-    st.subheader("📰 Datos de Mercado y Sentimiento")
-    data_fv = finviz_scrape(ticker)
-    if data_fv["ok"]:
-        st.json(data_fv["fundamentals"])
-    else:
-        st.info("Sin datos disponibles de Finviz para este ticker (activos como cripto o índices no aplican).")
-
-# ── TAB 11: PATRONES CHARTISTAS ───────────────────────────────────────────────
-with tab11:
-    st.subheader(f"🕯️ Reconocimiento de Patrones — {ticker}")
-    st.caption("Detección algorítmica sobre la estructura de precios.")
-
-    col_p1, col_p2 = st.columns([3, 2])
-
-    with col_p1:
-        pats = detectar_patrones(df)
-        if not pats:
-            st.info("Sin patrones complejos detectados en la ventana actual.")
-        else:
-            for p in pats:
-                nombre = p["patron"]
-                info_p = PATTERN_INFO.get(nombre, {})
-                bias   = info_p.get("bias", "neutro")
-                color_p = PATTERN_BIAS_COLOR.get(bias, "#aaaaaa")
-                emoji_p = info_p.get("emoji", "📌")
-                conf_col = {"Alta": "#00ff88", "Media": "#ffd700", "Baja": "#ff8c00"}.get(p["confianza"], "#aaa")
-
+        if ml_res["importances"]:
+            st.markdown("<div class='ws-panel' style='margin-top:6px;'><div class='ws-panel-title'><span>RF FEATURE IMPORTANCE</span><span>WALK-FORWARD</span></div>", unsafe_allow_html=True)
+            for k_f, v_f in sorted(ml_res["importances"].items(), key=lambda x: x[1], reverse=True):
                 st.markdown(f"""
-                <div style="background:#1a1a2e; border-left:4px solid {color_p}; border-radius:0 8px 8px 0; padding:12px 16px; margin-bottom:12px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <span style="font-size:1.1rem; font-weight:bold; color:{color_p};">
-                            {emoji_p} {nombre}
-                        </span>
-                        <span style="font-size:0.8rem; background:#0d1117; padding:2px 8px; border-radius:10px; color:{conf_col}; border:1px solid {conf_col}44;">
-                            Confianza: {p['confianza']}
-                        </span>
-                    </div>
-                    <div style="color:#e0e0e0; font-size:0.9rem; margin-top:6px;">
-                        {p['desc']}
-                    </div>
-                    <div style="color:#888; font-size:0.8rem; margin-top:4px;">
-                        📅 Período: {p['fecha_ini']} ➔ {p['fecha_fin']}
+                <div style="margin-bottom:5px; font-family:'JetBrains Mono',monospace; font-size:0.68rem;">
+                    <div style="display:flex; justify-content:space-between; color:#94a3b8;"><span>{k_f}</span><span>{v_f}%</span></div>
+                    <div style="background:#131822; height:4px; width:100%; margin-top:2px;">
+                        <div style="background:#f59e0b; height:4px; width:{min(100, v_f*2.2)}%;"></div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-                if info_p.get("accion"):
-                    st.caption(f"💡 **Estrategia sugerida:** {info_p['accion']}")
+# ── TAB 02: ALPHA SCANNER & SCREENER ──────────────────────────────────────────
+with t_scan:
+    sc1, sc2, sc3, sc4, sc5 = st.columns([1.2, 1.5, 1.5, 1.5, 1.2])
+    f_cls = sc1.selectbox("CLASS FILTER", ["ALL", "EQUITY", "CRYPTO"])
+    f_rsi = sc2.slider("RSI BAND", 0, 100, (0, 100))
+    f_adx = sc3.slider("MIN ADX", 0, 60, 10)
+    f_pts = sc4.slider("MIN SCORE", -6, 6, -6)
+    if sc5.button("RUN UNIVERSE SCAN", type="primary", use_container_width=True):
+        with st.spinner("SCANNING 36 INSTRUMENTS..."):
+            st.session_state["radar_df"] = obtener_radar_completo(period, TD_KEY)
 
-    with col_p2:
-        st.markdown("#### 📚 Leyenda de Sesgos")
-        for bias_type, color in PATTERN_BIAS_COLOR.items():
-            st.markdown(f"<span style='color:{color}; font-weight:bold;'>■ {bias_type.upper()}</span>", unsafe_allow_html=True)
-
-# ── TAB 12: PORTAFOLIO CONSOLIDADO Y RIESGO (VaR) ────────────────────────────
-with tab12:
-    st.subheader("💼 Resumen Global de Portafolio & Análisis de Riesgo")
-    actualizar_paper_trades(TD_KEY)
-
-    if st.session_state.paper_trades:
-        df_p = pd.DataFrame(st.session_state.paper_trades)
-        cap_total = df_p['Capital'].sum()
-
-        # (fix: VaR ahora se calcula como retorno ponderado por posición real de
-        # cada ticker del portafolio, en vez de aplicar la volatilidad del
-        # activo actualmente seleccionado en el sidebar al capital total)
-        retornos_pond = []
-        for _, fila in df_p.iterrows():
-            s = get_close_only(fila['Ticker'], period, td_key=TD_KEY)
-            if s.empty or cap_total == 0:
-                continue
-            r = s.pct_change().dropna() * 100
-            peso = fila['Capital'] / cap_total
-            retornos_pond.append(r * peso)
-
-        if retornos_pond:
-            retornos_portfolio = pd.concat(retornos_pond, axis=1).sum(axis=1)
-        else:
-            retornos_portfolio = pd.Series(dtype=float)
-
-        var_pct, var_usd = calcular_var_95(retornos_portfolio, cap_total)
-
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Total Invertido", f"${cap_total:,.2f}")
-        p2.metric("Value at Risk (VaR 95% Diario)", f"${var_usd:,.2f}", f"-{var_pct}% del portafolio")
-        p3.metric("Posiciones Activas", int((df_p['Estado'].astype(str).str.startswith('🟡')).sum()))
-        pnl_abierto = df_p.loc[df_p['Estado'].astype(str).str.startswith('🟡'), 'PnL % actual'] if 'PnL % actual' in df_p.columns else pd.Series(dtype=float)
-        p4.metric("PnL % Prom. Posiciones Abiertas", f"{pnl_abierto.mean():.2f}%" if not pnl_abierto.empty else "N/A")
-
-        st.dataframe(df_p, use_container_width=True)
-
-        st.markdown("#### 📄 Exportación de Reporte de Portafolio")
-        reporte_str = f"REPORTE INSTITUCIONAL QUANTUMSHIELD PRO\nFecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}\nCapital Total: ${cap_total:,.2f}\nVaR 95% (ponderado por posición): ${var_usd:,.2f} ({var_pct}%)\nPosiciones:\n" + df_p.to_string()
-        st.download_button("Descargar Reporte (TXT / PDF Ready)", data=reporte_str, file_name=f"Reporte_QuantumShield_{datetime.now().strftime('%Y%m%d')}.txt", mime="text/plain")
+    df_r = st.session_state.get("radar_df", pd.DataFrame())
+    if not df_r.empty:
+        m = (df_r["RSI(14)"] >= f_rsi[0]) & (df_r["RSI(14)"] <= f_rsi[1]) & (df_r["ADX(14)"] >= f_adx) & (df_r["Score"] >= f_pts)
+        if f_cls != "ALL": m = m & (df_r["Class"] == f_cls)
+        st.dataframe(df_r[m], use_container_width=True, height=540)
     else:
-        st.info("No hay activos en el portafolio.")
+        st.info("READY // Click 'RUN UNIVERSE SCAN' to compute factor scores across all Equities & Crypto.")
+
+# ── TAB 03: BACKTEST ENGINE ───────────────────────────────────────────────────
+with t_bt:
+    b1, b2, b3, b4, b5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
+    u_c     = b1.slider("LONG ENTRY SCORE", 1, 6, 2)
+    u_v     = b2.slider("EXIT SCORE", -6, -1, -2)
+    com_pct = b3.number_input("FEE / SLIPPAGE (%)", value=0.10, step=0.05)
+    usar_sl = b4.checkbox("ATR VOLATILITY STOPS", value=True)
+    if b5.button("RUN SIMULATION", type="primary", use_container_width=True):
+        st.session_state["last_bt"][ticker] = backtest_estrategia(df, u_c, u_v, com_pct, usar_sl, "-USD" in ticker)
+
+    bt = st.session_state.get("last_bt", {}).get(ticker)
+    if bt and not bt["equity_df"].empty:
+        st.markdown(f"""
+        <div class="kpi-strip" style="grid-template-columns: repeat(7, 1fr);">
+            <div class="kpi-cell"><span class="kpi-label">WIN RATE</span><span class="kpi-val">{bt['win_rate']}%</span><span class="kpi-sub">N = {bt['n_ops']} TRADES</span></div>
+            <div class="kpi-cell"><span class="kpi-label">STRATEGY RETURN</span><span class="kpi-val" style="color:{'#10b981' if bt['retorno_total']>=0 else '#f43f5e'};">{bt['retorno_total']:+.2f}%</span><span class="kpi-sub">NET OF FEES</span></div>
+            <div class="kpi-cell"><span class="kpi-label">BUY & HOLD</span><span class="kpi-val">{bt['retorno_bh']:+.2f}%</span><span class="kpi-sub">BENCHMARK</span></div>
+            <div class="kpi-cell"><span class="kpi-label">SHARPE RATIO</span><span class="kpi-val">{bt['sharpe']}</span><span class="kpi-sub">ANNUALIZED</span></div>
+            <div class="kpi-cell"><span class="kpi-label">SORTINO RATIO</span><span class="kpi-val">{bt['sortino']}</span><span class="kpi-sub">DOWNSIDE RISK</span></div>
+            <div class="kpi-cell"><span class="kpi-label">PROFIT FACTOR</span><span class="kpi-val">{bt['profit_factor']}</span><span class="kpi-sub">GROSS W/L</span></div>
+            <div class="kpi-cell"><span class="kpi-label">MAX DRAWDOWN</span><span class="kpi-val" style="color:#f43f5e;">{bt['max_drawdown']}%</span><span class="kpi-sub">CALMAR: {bt['calmar']}</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        eq_df = bt["equity_df"]
+        fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.03)
+        fig_bt.add_trace(go.Scatter(x=eq_df.index, y=eq_df["Estrategia"], name="QUANT STRATEGY", line=dict(color="#10b981", width=1.8)), row=1, col=1)
+        fig_bt.add_trace(go.Scatter(x=eq_df.index, y=eq_df["Buy & Hold"], name="BUY & HOLD", line=dict(color="#3b82f6", width=1.2, dash="dot")), row=1, col=1)
+        fig_bt.add_trace(go.Scatter(x=eq_df.index, y=eq_df["Drawdown %"], name="DRAWDOWN %", fill="tozeroy", line=dict(color="#f43f5e", width=1)), row=2, col=1)
+        fig_bt.update_layout(template="plotly_dark", paper_bgcolor="#0b0e14", plot_bgcolor="#06080c", font=dict(family="JetBrains Mono, monospace", size=10), height=440, margin=dict(l=10, r=40, t=15, b=10))
+        st.plotly_chart(fig_bt, use_container_width=True)
+        st.dataframe(bt["ops"], use_container_width=True, height=240)
+
+# ── TAB 04: OMS & MARKOWITZ RISK ──────────────────────────────────────────────
+with t_port:
+    actualizar_paper_trades(TD_KEY)
+    om1, om2 = st.columns([1.2, 2.5])
+
+    with om1:
+        st.markdown("<div class='ws-panel'><div class='ws-panel-title'><span>ORDER ENTRY (OMS)</span><span>KELLY SIZING</span></div></div>", unsafe_allow_html=True)
+        with st.form("oms_form"):
+            f_side = st.selectbox("SIDE", ["LONG", "SHORT"])
+            f_ent  = st.number_input("ENTRY PX ($)", value=price, format="%.4f")
+            f_sl   = st.number_input("STOP LOSS ($)", value=info['sl'], format="%.4f")
+            f_tp   = st.number_input("TAKE PROFIT ($)", value=info['tp'], format="%.4f")
+            f_cap  = st.number_input("NOTIONAL ($)", value=10000.0, step=1000.0)
+            if st.form_submit_button("TRANSMIT ORDER", use_container_width=True):
+                st.session_state.paper_trades.append({
+                    "Fecha": datetime.now().strftime("%Y-%m-%d"), "Ticker": ticker, "Lado": f_side,
+                    "Entrada": f_ent, "SL": f_sl, "TP": f_tp, "Capital": f_cap, "Estado": "OPEN"
+                })
+                guardar_portfolio()
+                st.rerun()
+
+    with om2:
+        df_p = pd.DataFrame(st.session_state.paper_trades) if st.session_state.paper_trades else pd.DataFrame()
+        df_ab = df_p[df_p['Estado'].astype(str).str.contains('OPEN')] if not df_p.empty else pd.DataFrame()
+        cap_act = float(df_ab['Capital'].sum()) if not df_ab.empty else 0.0
+
+        ret_pond = []
+        for _, fila in df_ab.iterrows():
+            s = get_close_only(fila['Ticker'], period, td_key=TD_KEY)
+            if not s.empty and cap_act > 0:
+                sg = -1.0 if fila.get('Lado', 'LONG') == 'SHORT' else 1.0
+                ret_pond.append(s.pct_change().dropna() * 100.0 * sg * (float(fila['Capital']) / cap_act))
+        ret_port = pd.concat(ret_pond, axis=1).sum(axis=1) if ret_pond else pd.Series(dtype=float)
+        vpct, vusd, cvpct, cvusd = calcular_var_cvar_95(ret_port, cap_act)
+
+        st.markdown(f"""
+        <div class="kpi-strip" style="grid-template-columns: repeat(4, 1fr);">
+            <div class="kpi-cell"><span class="kpi-label">ACTIVE EXPOSURE</span><span class="kpi-val">${cap_act:,.2f}</span><span class="kpi-sub">OPEN POSITIONS: {len(df_ab)}</span></div>
+            <div class="kpi-cell"><span class="kpi-label">1D 95% VaR</span><span class="kpi-val" style="color:#f59e0b;">${vusd:,.2f}</span><span class="kpi-sub">-{vpct}% OF BOOK</span></div>
+            <div class="kpi-cell"><span class="kpi-label">1D 95% CVaR (TAIL)</span><span class="kpi-val" style="color:#f43f5e;">${cvusd:,.2f}</span><span class="kpi-sub">-{cvpct}% SHORTFALL</span></div>
+            <div class="kpi-cell"><span class="kpi-label">OPEN PNL AVG</span><span class="kpi-val">{df_ab['PnL % actual'].mean() if not df_ab.empty and 'PnL % actual' in df_ab.columns else 0.0:+.2f}%</span><span class="kpi-sub">MARK-TO-MARKET</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if not df_p.empty:
+            st.dataframe(df_p, use_container_width=True, height=210)
+            if st.button("PURGE OMS BLOTTER"):
+                st.session_state.paper_trades = []
+                guardar_portfolio()
+                st.rerun()
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    mk1, mk2 = st.columns([3, 1])
+    univ_all = {**ACCIONES, **CRYPTOS}
+    sel_mk = mk1.multiselect("MARKOWITZ EFFICIENT FRONTIER BASKET:", list(univ_all.values()), default=["NVDA", "AAPL", "MSFT", "SPY", "BTC-USD"])
+    if mk2.button("SOLVE FRONTIER (N=2,500)", type="primary", use_container_width=True) and len(sel_mk) >= 2:
+        st.session_state["mk_res"] = optimizar_markowitz(tuple(sel_mk), period, TD_KEY)
+
+    mk_r = st.session_state.get("mk_res")
+    if mk_r and mk_r.get("ok"):
+        ms, mv, n_df = mk_r["max_sharpe"], mk_r["min_vol"], mk_r["nube"]
+        c_ef1, c_ef2 = st.columns([1.8, 1.2])
+        with c_ef1:
+            fig_ef = go.Figure()
+            fig_ef.add_trace(go.Scatter(x=n_df["Volatilidad %"], y=n_df["Retorno Esperado %"], mode="markers", marker=dict(size=4, color=n_df["Sharpe"], colorscale="Cividis", showscale=True), name="SIMULATED"))
+            fig_ef.add_trace(go.Scatter(x=[ms["vol"]], y=[ms["retorno"]], mode="markers+text", text=["MAX SHARPE"], textposition="top center", marker=dict(symbol="star", size=14, color="#10b981"), name="MAX SHARPE"))
+            fig_ef.add_trace(go.Scatter(x=[mv["vol"]], y=[mv["retorno"]], mode="markers+text", text=["MIN VAR"], textposition="bottom center", marker=dict(symbol="diamond", size=12, color="#3b82f6"), name="MIN VAR"))
+            fig_ef.update_layout(template="plotly_dark", paper_bgcolor="#0b0e14", plot_bgcolor="#06080c", font=dict(family="JetBrains Mono, monospace", size=10), height=340, margin=dict(l=10, r=10, t=15, b=10), xaxis_title="Annualized Volatility (%)", yaxis_title="Expected Return (%)")
+            st.plotly_chart(fig_ef, use_container_width=True)
+        with c_ef2:
+            reb_rows = [{"Ticker": t, "Max Sharpe Wt %": ms["weights"][t], "Min Var Wt %": mv["weights"][t]} for t in mk_r["tickers"]]
+            st.dataframe(pd.DataFrame(reb_rows), use_container_width=True, height=340)
+
+# ── TAB 05: RELVAL & CORRELATION ──────────────────────────────────────────────
+with t_corr:
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        s_a = get_close_only(ticker, period, td_key=TD_KEY)
+        s_b = get_close_only(benchmark, period, td_key=TD_KEY)
+        if not s_a.empty and not s_b.empty:
+            df_c = pd.DataFrame({ticker: s_a, benchmark: s_b}).dropna()
+            df_n = df_c / df_c.iloc[0] * 100
+            fig_rv = px.line(df_n, template="plotly_dark", color_discrete_sequence=["#f59e0b", "#3b82f6"])
+            fig_rv.update_layout(paper_bgcolor="#0b0e14", plot_bgcolor="#06080c", font=dict(family="JetBrains Mono, monospace", size=10), height=460, title=f"RELATIVE PERFORMANCE // {ticker} VS {benchmark} (BASE 100)")
+            st.plotly_chart(fig_rv, use_container_width=True)
+    with rc2:
+        corr_syms = ("NVDA", "AAPL", "MSFT", "TSLA", "SPY", "BTC-USD", "ETH-USD", "^IPSA")
+        df_cm = obtener_matriz_correlacion(corr_syms, period, TD_KEY)
+        if not df_cm.empty:
+            fig_cm = px.imshow(df_cm, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, template="plotly_dark")
+            fig_cm.update_layout(paper_bgcolor="#0b0e14", plot_bgcolor="#06080c", font=dict(family="JetBrains Mono, monospace", size=10), height=460, title="CROSS-ASSET CORRELATION MATRIX")
+            st.plotly_chart(fig_cm, use_container_width=True)
+
+# ── TAB 06: FUNDAMENTALS & WIRE ───────────────────────────────────────────────
+with t_fund:
+    fv = finviz_scrape(ticker)
+    if fv["ok"]:
+        bf = analizar_buffett(fv["fundamentals"])
+        st.markdown(f"""
+        <div class="kpi-strip" style="grid-template-columns: repeat(5, 1fr);">
+            <div class="kpi-cell"><span class="kpi-label">QUALITY SCORE</span><span class="kpi-val" style="color:#f59e0b;">{bf['Score']}/100</span><span class="kpi-sub">{bf['Tier']}</span></div>
+            <div class="kpi-cell"><span class="kpi-label">P/E MULTIPLE</span><span class="kpi-val">{bf['P/E'] if bf['P/E'] else 'N/A'}</span><span class="kpi-sub">VALUATION</span></div>
+            <div class="kpi-cell"><span class="kpi-label">RETURN ON EQUITY</span><span class="kpi-val">{bf['ROE %'] if bf['ROE %'] else 'N/A'}%</span><span class="kpi-sub">PROFITABILITY</span></div>
+            <div class="kpi-cell"><span class="kpi-label">DEBT / EQUITY</span><span class="kpi-val">{bf['Deuda/Patrim.'] if bf['Deuda/Patrim.'] is not None else 'N/A'}x</span><span class="kpi-sub">LEVERAGE</span></div>
+            <div class="kpi-cell"><span class="kpi-label">NET MARGIN</span><span class="kpi-val">{bf['Margen Neto %'] if bf['Margen Neto %'] else 'N/A'}%</span><span class="kpi-sub">EFFICIENCY</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+        for n in fv["news"]:
+            st.markdown(f"<div class='data-row'><span style='color:#f59e0b;'>{n['fecha']}</span><a href='{n['url']}' target='_blank' style='color:#e2e8f0;text-decoration:none;'>{n['titulo']}</a><span style='color:#64748b;'>[{n['fuente']}]</span></div>", unsafe_allow_html=True)
+    else:
+        st.info("FUNDAMENTALS_UNAVAILABLE // Only US-listed equities support Finviz fundamental extraction.")
+
+# ── TAB 07: QUANT RESEARCH AI ─────────────────────────────────────────────────
+with t_ai:
+    sys_p = f"You are a Senior Quantitative Portfolio Manager at a Wall Street fund. Respond in Spanish with concise, institutional analysis. Current telemetry for {ticker}: Spot=${price:,.4f}, Stance={info['senal']} ({info['puntos']} pts), RSI={info['rsi']:.1f}, ADX={info['adx']:.1f}, VWAP=${vwap_v:,.4f}."
+    h_chat = st.session_state.chat_history.setdefault(ticker, [])
+    if st.button("GENERATE INSTITUTIONAL INVESTMENT MEMO", type="primary"):
+        h_chat.append({"role": "user", "content": f"Elabora un Investment Memo ejecutivo sobre {ticker} cubriendo estructura de mercado, escenarios Long/Short con niveles exactos y dimensionamiento de riesgo."})
+        h_chat.append({"role": "assistant", "content": _groq([{"role": "system", "content": sys_p}] + h_chat)})
+    for m in h_chat:
+        with st.chat_message(m["role"]): st.markdown(m["content"])
+    q_u = st.chat_input(f"Ask Quant Desk about {ticker}...")
+    if q_u:
+        h_chat.append({"role": "user", "content": q_u})
+        with st.chat_message("user"): st.markdown(q_u)
+        with st.chat_message("assistant"):
+            r_ai = _groq([{"role": "system", "content": sys_p}] + h_chat)
+            st.markdown(r_ai)
+            h_chat.append({"role": "assistant", "content": r_ai})
