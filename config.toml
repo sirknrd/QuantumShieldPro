@@ -1,14 +1,22 @@
 [theme]
-primaryColor = "#2F81F7"
-backgroundColor = "#0B0F14"
-secondaryBackgroundColor = "#0F1722"
-textColor = "#E6EDF3"
-font = "sans serif"
- 
+base = "dark"
+primaryColor = "#FF9900"            # Ámbar institucional estilo Bloomberg
+backgroundColor = "#07090E"         # Negro obsidiana de fondo principal
+secondaryBackgroundColor = "#0D1117"# Gris pizarra para sidebar, inputs y tablas
+textColor = "#E5E7EB"               # Blanco humo de alto contraste
+font = "monospace"                  # Fuerza números tabulares en DataFrames nativos
+
+[client]
+toolbarMode = "minimal"             # Oculta el botón "Deploy" y el menú de desarrollador
+showErrorDetails = false            # Evita mostrar tracebacks crudos en producción
+
+[ui]
+hideTopBar = true                   # Elimina la franja superior nativa de Streamlit
+
 [server]
 headless = true
-enableXsrfProtection = true
- 
+runOnSave = true
+maxUploadSize = 50
+
 [browser]
 gatherUsageStats = false
- 
